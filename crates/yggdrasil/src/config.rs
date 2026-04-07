@@ -1,6 +1,48 @@
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 
+/// Per-interface multicast discovery configuration.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MulticastInterfaceConfig {
+    /// Regex pattern to match network interface names.
+    #[serde(default = "default_multicast_regex")]
+    pub regex: String,
+    /// Whether to send beacons on matching interfaces.
+    #[serde(default = "default_true")]
+    pub beacon: bool,
+    /// Whether to listen for beacons on matching interfaces.
+    #[serde(default = "default_true")]
+    pub listen: bool,
+    /// TLS listener port for this interface (0 = auto-assign).
+    #[serde(default)]
+    pub port: u16,
+    /// Connection priority for peers discovered on this interface.
+    #[serde(default)]
+    pub priority: u8,
+    /// Password for authentication (must match on both sides).
+    #[serde(default)]
+    pub password: String,
+}
+
+fn default_multicast_regex() -> String {
+    ".*".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_multicast_interfaces() -> Vec<MulticastInterfaceConfig> {
+    vec![MulticastInterfaceConfig {
+        regex: ".*".to_string(),
+        beacon: true,
+        listen: true,
+        port: 0,
+        priority: 0,
+        password: String::new(),
+    }]
+}
+
 /// Yggdrasil node configuration.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
@@ -39,6 +81,10 @@ pub struct Config {
     /// If non-empty, only allow peering with these public keys (hex).
     #[serde(default)]
     pub allowed_public_keys: Vec<String>,
+
+    /// Multicast interface configurations for LAN peer discovery.
+    #[serde(default = "default_multicast_interfaces")]
+    pub multicast_interfaces: Vec<MulticastInterfaceConfig>,
 }
 
 fn default_if_name() -> String {
@@ -65,6 +111,7 @@ impl Default for Config {
             node_info: toml::Value::Table(toml::map::Map::new()),
             node_info_privacy: false,
             allowed_public_keys: Vec::new(),
+            multicast_interfaces: default_multicast_interfaces(),
         }
     }
 }

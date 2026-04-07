@@ -9,6 +9,7 @@ use yggdrasil::admin::AdminSocket;
 use yggdrasil::config::Config;
 use yggdrasil::core::Core;
 use yggdrasil::ipv6rwc::ReadWriteCloser;
+use yggdrasil::multicast::Multicast;
 use yggdrasil::tun::TunAdapter;
 
 #[cfg(windows)]
@@ -259,15 +260,7 @@ async fn run_node(
         let subnet_str = core.subnet().to_string();
         let tun_mtu = config.if_mtu.min(mtu).min(65535) as u16;
 
-        match TunAdapter::new(
-            &config.if_name,
-            rwc.clone(),
-            &addr_str,
-            &subnet_str,
-            tun_mtu,
-        )
-        .await
-        {
+        match TunAdapter::new(&config.if_name, rwc.clone(), &addr_str, &subnet_str, tun_mtu).await {
             Ok(tun) => {
                 tracing::info!("TUN adapter started");
                 Some(tun)
@@ -291,12 +284,33 @@ async fn run_node(
         }
     };
 
+    // Start multicast peer discovery
+    let multicast = if !config.multicast_interfaces.is_empty() {
+        match Multicast::new(core.clone(), config.multicast_interfaces.clone()).await {
+            Ok(m) => {
+                tracing::info!("Multicast peer discovery started");
+                let m = std::sync::Arc::new(m);
+                core.set_multicast(m.clone()).await;
+                Some(m)
+            }
+            Err(e) => {
+                tracing::warn!("Multicast peer discovery disabled: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Wait for shutdown signal
     tracing::info!("Yggdrasil NG started");
     shutdown_rx.changed().await.ok();
     tracing::info!("Shutting down...");
 
     // Cleanup
+    if let Some(m) = &multicast {
+        m.close();
+    }
     if let Some(admin) = &admin {
         admin.close();
     }
@@ -368,7 +382,7 @@ fn usage_string() -> String {
 fn print_ctl_commands() {
     println!("Commands (control mode):");
     println!("  Local queries:");
-    println!("    list, getSelf, getPeers, getTree, getPaths, getSessions, getTUN");
+    println!("    list, getSelf, getPeers, getTree, getPaths, getSessions, getTUN, getMulticastInterfaces");
     println!("  Debug:");
     println!("    getDebug  (routing stats: tree size, broken paths, queue depth, etc.)");
     println!("  Peer management:");

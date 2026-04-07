@@ -9,6 +9,7 @@ use crate::address::{addr_for_key, subnet_for_key, Address, Subnet};
 use crate::config::Config;
 use crate::ipv6rwc::ReadWriteCloser;
 use crate::links::{ActiveLinks, Links, LinkPeerInfo};
+use crate::multicast::Multicast;
 use crate::proto::ProtoHandler;
 use crate::tls_support;
 
@@ -38,6 +39,7 @@ pub struct Core {
     pub(crate) tls_client_config: Arc<RwLock<Arc<rustls::ClientConfig>>>,
     pub(crate) tls_cert_expiry: Arc<RwLock<time::OffsetDateTime>>,
     proto_tx: mpsc::Sender<(Addr, Vec<u8>)>,
+    pub(crate) multicast: Mutex<Option<Arc<Multicast>>>,
 }
 
 impl Core {
@@ -122,6 +124,7 @@ impl Core {
             tls_client_config,
             tls_cert_expiry,
             proto_tx,
+            multicast: Mutex::new(None),
         });
 
         // Spawn TLS certificate renewal task
@@ -406,6 +409,22 @@ impl Core {
         // TUN is always enabled in current implementation
         // Return (enabled, name, mtu)
         (true, "utun".to_string(), self.mtu())
+    }
+
+    /// Set the multicast module reference (called after construction).
+    pub async fn set_multicast(&self, m: Arc<Multicast>) {
+        let mut slot = self.multicast.lock().await;
+        *slot = Some(m);
+    }
+
+    /// Get multicast interface info for admin API.
+    pub async fn get_multicast_interfaces(&self) -> Vec<crate::multicast::MulticastInterfaceInfo> {
+        let slot = self.multicast.lock().await;
+        if let Some(m) = slot.as_ref() {
+            m.get_interfaces().await
+        } else {
+            Vec::new()
+        }
     }
 
     /// Get protocol handler (for admin debug commands).

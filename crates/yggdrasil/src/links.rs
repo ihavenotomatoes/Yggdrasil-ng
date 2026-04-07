@@ -18,7 +18,7 @@ use crate::core::Core;
 use crate::version::Metadata;
 
 /// Enum to handle both TCP and TLS streams uniformly.
-enum Stream {
+pub(crate) enum Stream {
     Tcp(TcpStream),
     Tls(tokio_rustls::server::TlsStream<TcpStream>),
     TlsClient(tokio_rustls::client::TlsStream<TcpStream>),
@@ -437,6 +437,12 @@ impl ActiveLinks {
     /// Subscribe to peer connect/disconnect events.
     pub fn subscribe(&self) -> broadcast::Receiver<PeerEvent> {
         self.peer_tx.subscribe()
+    }
+
+    /// Check if there is an active connection to the given public key.
+    pub async fn has_key(&self, key: &[u8; 32]) -> bool {
+        let inner = self.inner.lock().await;
+        inner.connections.values().any(|c| &c.key == key)
     }
 
     /// Get a snapshot of all active connections for the admin API.
@@ -862,7 +868,7 @@ impl Links {
 }
 
 /// Perform the Yggdrasil handshake over a stream (TCP or TLS), then hand off to ironwood.
-async fn handle_connection(
+pub(crate) async fn handle_connection(
     link_type: LinkType,
     options: LinkOptions,
     mut stream: Stream,

@@ -43,3 +43,18 @@ if_mtu = 65535
 # List of allowed public keys (hex-encoded). If non-empty, only peers with
 # these public keys will be allowed to connect. Leave empty to allow all peers.
 # allowed_public_keys = []
+
+# Multicast peer discovery on local network.
+# Each entry matches network interfaces by regex pattern.
+# beacon: advertise this node on matching interfaces
+# listen: accept peer discoveries on matching interfaces
+# port: TLS listener port (0 = auto-assign)
+# priority: connection priority (0-255)
+# password: authentication password (must match on both sides)
+[[multicast_interfaces]]
+regex = ".*"
+beacon = true
+listen = true
+# port = 0
+# priority = 0
+# password = ""

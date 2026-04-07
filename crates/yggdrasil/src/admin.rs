@@ -161,7 +161,7 @@ async fn handle_admin_conn(stream: tokio::net::TcpStream, core: Arc<Core>) {
 async fn handle_request(req: &AdminRequest, core: &Arc<Core>) -> Result<serde_json::Value, String> {
     match req.request.to_lowercase().as_str() {
         "list" => Ok(serde_json::json!({
-            "list": ["list", "getself", "getpeers", "gettree", "getpaths", "getsessions", "gettun", "addpeer", "removepeer", "getdebug", "getlookup", "forcelookup", "getnodeinfo", "debug_remotegetself", "debug_remotegetpeers", "debug_remotegettree"],
+            "list": ["list", "getself", "getpeers", "gettree", "getpaths", "getsessions", "gettun", "getmulticastinterfaces", "addpeer", "removepeer", "getdebug", "getlookup", "forcelookup", "getnodeinfo", "debug_remotegetself", "debug_remotegetpeers", "debug_remotegettree"],
         })),
 
         "getself" => {
@@ -284,6 +284,21 @@ async fn handle_request(req: &AdminRequest, core: &Arc<Core>) -> Result<serde_js
                 })
                 .collect();
             Ok(serde_json::json!({ "sessions": sessions_json }))
+        }
+
+        "getmulticastinterfaces" => {
+            let interfaces = core.get_multicast_interfaces().await;
+            let ifaces_json: Vec<serde_json::Value> = interfaces
+                .iter()
+                .map(|i| serde_json::json!({
+                    "name": i.name,
+                    "beacon": i.beacon,
+                    "listen": i.listen,
+                    "port": i.port,
+                    "password": i.password,
+                }))
+                .collect();
+            Ok(serde_json::json!({ "multicast_interfaces": ifaces_json }))
         }
 
         "gettun" => {

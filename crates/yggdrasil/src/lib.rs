@@ -6,6 +6,7 @@ pub mod core;
 pub mod ctl;
 pub mod ipv6rwc;
 pub mod links;
+pub mod multicast;
 pub mod proto;
 pub mod tls_support;
 #[cfg(not(target_os = "android"))]
