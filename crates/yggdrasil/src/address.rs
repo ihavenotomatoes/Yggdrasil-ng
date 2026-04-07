@@ -70,34 +70,17 @@ impl Subnet {
 
 impl fmt::Display for Address {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Format as IPv6 address
-        let a = &self.0;
-        write!(
-            f,
-            "{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}",
-            u16::from_be_bytes([a[0], a[1]]),
-            u16::from_be_bytes([a[2], a[3]]),
-            u16::from_be_bytes([a[4], a[5]]),
-            u16::from_be_bytes([a[6], a[7]]),
-            u16::from_be_bytes([a[8], a[9]]),
-            u16::from_be_bytes([a[10], a[11]]),
-            u16::from_be_bytes([a[12], a[13]]),
-            u16::from_be_bytes([a[14], a[15]]),
-        )
+        let addr = std::net::Ipv6Addr::from(self.0);
+        write!(f, "{}", addr)
     }
 }
 
 impl fmt::Display for Subnet {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = &self.0;
-        write!(
-            f,
-            "{:x}:{:x}:{:x}:{:x}::/64",
-            u16::from_be_bytes([s[0], s[1]]),
-            u16::from_be_bytes([s[2], s[3]]),
-            u16::from_be_bytes([s[4], s[5]]),
-            u16::from_be_bytes([s[6], s[7]]),
-        )
+        let mut bytes = [0u8; 16];
+        bytes[..8].copy_from_slice(&self.0);
+        let addr = std::net::Ipv6Addr::from(bytes);
+        write!(f, "{}/64", addr)
     }
 }
 
