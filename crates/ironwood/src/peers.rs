@@ -645,25 +645,39 @@ async fn drain_traffic_queue<W: tokio::io::AsyncWrite + Unpin>(
     read_deadline: &ReadDeadline,
 ) -> bool {
     use tokio::io::AsyncWriteExt;
-    for _ in 0..MAX_DRAIN_PER_ITER {
-        // Try to pop a packet from the queue
-        let traffic = {
-            let mut q = queue.lock().await;
-            q.pop()
-        };
 
-        let traffic = match traffic {
-            Some(t) => t,
-            None => return true, // Queue is empty, success
-        };
+    // Lock once, pop a batch of packets, unlock, then write them all.
+    let batch: Vec<TrafficPacket> = {
+        let mut q = queue.lock().await;
+        let mut batch = Vec::with_capacity(MAX_DRAIN_PER_ITER);
+        for _ in 0..MAX_DRAIN_PER_ITER {
+            match q.pop() {
+                Some(t) => batch.push(t),
+                None => break,
+            }
+        }
+        batch
+    };
 
+    if batch.is_empty() {
+        return true;
+    }
+
+    // Arm read deadline once for the entire batch
+    {
+        let mut dl = read_deadline.lock().unwrap();
+        if dl.is_none() {
+            *dl = Some(std::time::Instant::now() + peer_timeout);
+        }
+    }
+
+    for traffic in batch {
         let frame = wire::encode_traffic_frame(
             &traffic.path, &traffic.from,
             &traffic.source, &traffic.dest,
             traffic.watermark, &traffic.payload,
         );
 
-        // Write the frame with timeout
         let write_result = tokio::time::timeout(
             WRITE_TIMEOUT,
             writer.write_all(&frame)
@@ -672,12 +686,6 @@ async fn drain_traffic_queue<W: tokio::io::AsyncWrite + Unpin>(
         match write_result {
             Ok(Ok(_)) => {
                 tracing::debug!("peer_writer[{}]: sent queued traffic", peer_id);
-                // Traffic packets are always non-keepalive — arm read deadline
-                // (only if not already armed, matching Go's deadlined flag)
-                let mut dl = read_deadline.lock().unwrap();
-                if dl.is_none() {
-                    *dl = Some(std::time::Instant::now() + peer_timeout);
-                }
             }
             Ok(Err(e)) => {
                 tracing::debug!("peer_writer[{}]: write error for queued traffic: {}", peer_id, e);
@@ -689,7 +697,6 @@ async fn drain_traffic_queue<W: tokio::io::AsyncWrite + Unpin>(
             }
         }
     }
-    // Drained MAX_DRAIN_PER_ITER packets; yield back to the event loop.
     true
 }
 
