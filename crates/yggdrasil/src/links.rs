@@ -635,6 +635,7 @@ impl Links {
                                     }
                                 };
 
+                                stream.set_nodelay(true).ok();
                                 tracing::debug!("Accepted connection from {}", remote);
                                 let core = core.clone();
                                 let opts = options.clone();
