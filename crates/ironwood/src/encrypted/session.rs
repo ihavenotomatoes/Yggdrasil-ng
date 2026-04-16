@@ -4,6 +4,7 @@
 //! and forward secrecy using XSalsa20-Poly1305 (via RustCrypto's `crypto_box` crate).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crypto_box::SalsaBox;
@@ -184,21 +185,21 @@ pub(crate) struct SessionInfo {
     pub local_key_seq: u64,
     pub recv_priv: CurvePrivateKey,
     pub recv_pub: CurvePublicKey,
-    pub recv_shared: SalsaBox,
+    pub recv_shared: Arc<SalsaBox>,
     pub recv_nonce: u64,
 
     pub send_priv: CurvePrivateKey,
     pub send_pub: CurvePublicKey,
-    pub send_shared: SalsaBox,
+    pub send_shared: Arc<SalsaBox>,
     pub send_nonce: u64,
 
     pub next_priv: CurvePrivateKey,
     pub next_pub: CurvePublicKey,
 
     // Forward secrecy preparation
-    pub next_send_shared: SalsaBox,
+    pub next_send_shared: Arc<SalsaBox>,
     pub next_send_nonce: u64,
-    pub next_recv_shared: SalsaBox,
+    pub next_recv_shared: Arc<SalsaBox>,
     pub next_recv_nonce: u64,
 
     // Timing
@@ -209,9 +210,6 @@ pub(crate) struct SessionInfo {
     // Stats
     pub rx: u64,
     pub tx: u64,
-
-    // Reusable buffer for do_send inner plaintext (avoids per-packet allocation)
-    send_inner_buf: Vec<u8>,
 }
 
 impl SessionInfo {
@@ -225,10 +223,10 @@ impl SessionInfo {
         let (send_pub, send_priv) = new_box_keys();
         let (next_pub, next_priv) = new_box_keys();
 
-        let recv_shared = make_salsa_box(&current, &recv_priv);
-        let send_shared = make_salsa_box(&current, &send_priv);
-        let next_send_shared = make_salsa_box(&next, &send_priv);
-        let next_recv_shared = make_salsa_box(&next, &recv_priv);
+        let recv_shared = Arc::new(make_salsa_box(&current, &recv_priv));
+        let send_shared = Arc::new(make_salsa_box(&current, &send_priv));
+        let next_send_shared = Arc::new(make_salsa_box(&next, &send_priv));
+        let next_recv_shared = Arc::new(make_salsa_box(&next, &recv_priv));
 
         Self {
             seq: seq.wrapping_sub(1), // so first update works
@@ -255,16 +253,15 @@ impl SessionInfo {
             last_activity: Instant::now(),
             rx: 0,
             tx: 0,
-            send_inner_buf: Vec::with_capacity(32 + 1500),
         }
     }
 
     /// Recompute all shared secrets after key changes.
     fn fix_shared(&mut self, recv_nonce: u64, send_nonce: u64) {
-        self.recv_shared = make_salsa_box(&self.current, &self.recv_priv);
-        self.send_shared = make_salsa_box(&self.current, &self.send_priv);
-        self.next_send_shared = make_salsa_box(&self.next, &self.send_priv);
-        self.next_recv_shared = make_salsa_box(&self.next, &self.recv_priv);
+        self.recv_shared = Arc::new(make_salsa_box(&self.current, &self.recv_priv));
+        self.send_shared = Arc::new(make_salsa_box(&self.current, &self.send_priv));
+        self.next_send_shared = Arc::new(make_salsa_box(&self.next, &self.send_priv));
+        self.next_recv_shared = Arc::new(make_salsa_box(&self.next, &self.recv_priv));
         self.next_send_nonce = 0;
         self.next_recv_nonce = 0;
         self.recv_nonce = recv_nonce;
@@ -293,14 +290,21 @@ impl SessionInfo {
         self.last_activity = Instant::now();
     }
 
-    /// Encrypt and produce a traffic message.
-    ///
-    /// Wire format: [type(1)][varint(localKeySeq)][varint(remoteKeySeq)][varint(sendNonce)][encrypted([nextPub(32)][msg])]
+    /// Encrypt and produce a traffic message (cold path — used by handle_init/handle_ack
+    /// where the session is not yet shared and there is zero contention).
     pub fn do_send(&mut self, msg: &[u8]) -> Result<Vec<u8>, Error> {
+        let snap = self.send_snapshot()?;
+        let result = encrypt_outside_lock(&snap, msg)?;
+        self.send_finalize(msg.len() as u64);
+        Ok(result)
+    }
+
+    /// Phase 1 of split send: snapshot state under lock, increment nonce.
+    pub fn send_snapshot(&mut self) -> Result<SendSnapshot, Error> {
         self.send_nonce += 1;
 
         if self.send_nonce == 0 {
-            // Nonce overflow: ratchet
+            // Nonce overflow: ratchet (astronomically rare)
             self.recv_pub = self.send_pub;
             self.recv_priv = self.send_priv;
             self.send_pub = self.next_pub;
@@ -312,116 +316,107 @@ impl SessionInfo {
             self.fix_shared(0, 0);
         }
 
-        // Build header
-        let mut bs = Vec::with_capacity(SESSION_TRAFFIC_OVERHEAD as usize + msg.len());
-        bs.push(SESSION_TYPE_TRAFFIC);
-        wire::encode_uvarint(&mut bs, self.local_key_seq);
-        wire::encode_uvarint(&mut bs, self.remote_key_seq);
-        wire::encode_uvarint(&mut bs, self.send_nonce);
-
-        // Build inner payload: [nextPub(32)][msg] — reuse buffer
-        self.send_inner_buf.clear();
-        self.send_inner_buf.extend_from_slice(&self.next_pub);
-        self.send_inner_buf.extend_from_slice(msg);
-
-        // Encrypt
-        let ciphertext =
-            box_seal_precomputed(&self.send_inner_buf, self.send_nonce, &self.send_shared)
-                .map_err(|_| Error::Encode)?;
-        bs.extend_from_slice(&ciphertext);
-
-        self.tx += msg.len() as u64;
-        self.last_activity = Instant::now();
-        Ok(bs)
+        Ok(SendSnapshot {
+            local_key_seq: self.local_key_seq,
+            remote_key_seq: self.remote_key_seq,
+            send_nonce: self.send_nonce,
+            next_pub: self.next_pub,
+            send_shared: Arc::clone(&self.send_shared),
+        })
     }
 
-    /// Decrypt an incoming traffic message.
-    ///
-    /// Returns (decrypted_payload, need_init) where need_init means we should send an init.
-    pub fn do_recv(&mut self, msg: &[u8]) -> Result<Vec<u8>, RecvAction> {
+    /// Phase 3 of split send: update stats under lock.
+    pub fn send_finalize(&mut self, msg_len: u64) {
+        self.tx += msg_len;
+        self.last_activity = Instant::now();
+    }
+
+    /// Phase 1 of split recv: parse header, determine case, snapshot shared key.
+    /// Takes &self — no mutation, just reads state.
+    pub fn recv_snapshot(&self, msg: &[u8]) -> Result<RecvSnapshot, RecvSnapshotError> {
         if msg.len() < SESSION_TRAFFIC_OVERHEAD_MIN || msg[0] != SESSION_TYPE_TRAFFIC {
-            return Err(RecvAction::Drop);
+            return Err(RecvSnapshotError::Drop);
         }
 
         let mut offset = 1;
         let (remote_key_seq, len) =
-            wire::decode_uvarint(&msg[offset..]).ok_or(RecvAction::Drop)?;
+            wire::decode_uvarint(&msg[offset..]).ok_or(RecvSnapshotError::Drop)?;
         offset += len;
         let (local_key_seq, len) =
-            wire::decode_uvarint(&msg[offset..]).ok_or(RecvAction::Drop)?;
+            wire::decode_uvarint(&msg[offset..]).ok_or(RecvSnapshotError::Drop)?;
         offset += len;
-        let (nonce, len) = wire::decode_uvarint(&msg[offset..]).ok_or(RecvAction::Drop)?;
+        let (nonce, len) = wire::decode_uvarint(&msg[offset..]).ok_or(RecvSnapshotError::Drop)?;
         offset += len;
-
-        let encrypted = &msg[offset..];
 
         let from_current = remote_key_seq == self.remote_key_seq;
         let from_next = remote_key_seq == self.remote_key_seq + 1;
         let to_recv = local_key_seq + 1 == self.local_key_seq;
         let to_send = local_key_seq == self.local_key_seq;
 
-        enum DecryptCase {
-            CurrentToRecv,
-            NextToSend,
-            NextToRecv,
-        }
-
         let case = if from_current && to_recv {
             if !(self.recv_nonce < nonce) {
-                return Err(RecvAction::Drop);
+                return Err(RecvSnapshotError::Drop);
             }
             DecryptCase::CurrentToRecv
         } else if from_next && to_send {
             if !(self.next_send_nonce < nonce) {
-                return Err(RecvAction::Drop);
+                return Err(RecvSnapshotError::Drop);
             }
             DecryptCase::NextToSend
         } else if from_next && to_recv {
             if !(self.next_recv_nonce < nonce) {
-                return Err(RecvAction::Drop);
+                return Err(RecvSnapshotError::Drop);
             }
             DecryptCase::NextToRecv
         } else {
-            return Err(RecvAction::SendInit);
+            return Err(RecvSnapshotError::SendInit {
+                send_pub: self.send_pub,
+                next_pub: self.next_pub,
+                local_key_seq: self.local_key_seq,
+            });
         };
 
-        // Decrypt with the appropriate shared key
         let shared = match case {
-            DecryptCase::CurrentToRecv => &self.recv_shared,
-            DecryptCase::NextToSend => &self.next_send_shared,
-            DecryptCase::NextToRecv => &self.next_recv_shared,
+            DecryptCase::CurrentToRecv => Arc::clone(&self.recv_shared),
+            DecryptCase::NextToSend => Arc::clone(&self.next_send_shared),
+            DecryptCase::NextToRecv => Arc::clone(&self.next_recv_shared),
         };
 
-        let mut unboxed = box_open_precomputed(encrypted, nonce, shared)
-            .map_err(|_| RecvAction::SendInit)?;
+        Ok(RecvSnapshot {
+            remote_key_seq: self.remote_key_seq,
+            nonce,
+            encrypted_offset: offset,
+            shared,
+            case,
+        })
+    }
 
-        if unboxed.len() < 32 {
-            return Err(RecvAction::Drop);
+    /// Phase 3 of split recv: update nonce, maybe ratchet, update stats.
+    pub fn recv_finalize(&mut self, snap: &RecvSnapshot, inner_key: [u8; 32], payload_len: u64) {
+        // If a ratchet occurred between snapshot and finalize, the key epochs shifted.
+        // The decrypted data is still valid, but we must not update nonces for a stale epoch.
+        if self.remote_key_seq != snap.remote_key_seq {
+            self.rx += payload_len;
+            self.last_activity = Instant::now();
+            return;
         }
 
-        // Extract inner key, then remove it from the buffer to get the payload
-        let mut inner_key = [0u8; 32];
-        inner_key.copy_from_slice(&unboxed[..32]);
-        unboxed.drain(..32);
-
-        // Post-decrypt actions based on case
-        match case {
+        match snap.case {
             DecryptCase::CurrentToRecv => {
-                self.recv_nonce = nonce;
+                self.recv_nonce = snap.nonce;
             }
             DecryptCase::NextToSend => {
-                self.next_send_nonce = nonce;
-                self.maybe_ratchet_on_recv(inner_key, nonce);
+                self.next_send_nonce = snap.nonce;
+                self.maybe_ratchet_on_recv(inner_key, snap.nonce);
             }
             DecryptCase::NextToRecv => {
-                self.next_recv_nonce = nonce;
-                self.maybe_ratchet_on_recv(inner_key, nonce);
+                self.next_recv_nonce = snap.nonce;
+                self.maybe_ratchet_on_recv(inner_key, snap.nonce);
             }
         }
 
-        self.rx += unboxed.len() as u64;
+        self.rx += payload_len;
         self.last_activity = Instant::now();
-        Ok(unboxed)
     }
 
     /// Possibly ratchet keys when receiving from remote's "next" key.
@@ -456,6 +451,80 @@ impl SessionInfo {
     pub fn is_expired(&self) -> bool {
         self.last_activity.elapsed() > SESSION_TIMEOUT
     }
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot types for crypto-outside-lock pattern
+// ---------------------------------------------------------------------------
+
+/// Which decrypt path was selected.
+pub(crate) enum DecryptCase {
+    CurrentToRecv,
+    NextToSend,
+    NextToRecv,
+}
+
+/// Send-side state snapshot, captured under lock, used for encryption outside lock.
+pub(crate) struct SendSnapshot {
+    local_key_seq: u64,
+    remote_key_seq: u64,
+    send_nonce: u64,
+    next_pub: [u8; 32],
+    send_shared: Arc<SalsaBox>,
+}
+
+/// Recv-side state snapshot, captured under lock, used for decryption outside lock.
+pub(crate) struct RecvSnapshot {
+    remote_key_seq: u64,
+    nonce: u64,
+    encrypted_offset: usize,
+    shared: Arc<SalsaBox>,
+    case: DecryptCase,
+}
+
+/// Error from recv_snapshot (carries data needed for SendInit without re-locking).
+pub(crate) enum RecvSnapshotError {
+    Drop,
+    SendInit {
+        send_pub: CurvePublicKey,
+        next_pub: CurvePublicKey,
+        local_key_seq: u64,
+    },
+}
+
+/// Phase 2 of split send: encrypt outside lock using snapshot.
+fn encrypt_outside_lock(snap: &SendSnapshot, msg: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut bs = Vec::with_capacity(SESSION_TRAFFIC_OVERHEAD as usize + msg.len());
+    bs.push(SESSION_TYPE_TRAFFIC);
+    wire::encode_uvarint(&mut bs, snap.local_key_seq);
+    wire::encode_uvarint(&mut bs, snap.remote_key_seq);
+    wire::encode_uvarint(&mut bs, snap.send_nonce);
+
+    let mut inner = Vec::with_capacity(32 + msg.len());
+    inner.extend_from_slice(&snap.next_pub);
+    inner.extend_from_slice(msg);
+
+    let ciphertext =
+        box_seal_precomputed(&inner, snap.send_nonce, &snap.send_shared)
+            .map_err(|_| Error::Encode)?;
+    bs.extend_from_slice(&ciphertext);
+    Ok(bs)
+}
+
+/// Phase 2 of split recv: decrypt outside lock using snapshot.
+fn decrypt_outside_lock(snap: &RecvSnapshot, msg: &[u8]) -> Result<(Vec<u8>, [u8; 32]), RecvAction> {
+    let encrypted = &msg[snap.encrypted_offset..];
+    let mut unboxed = box_open_precomputed(encrypted, snap.nonce, &snap.shared)
+        .map_err(|_| RecvAction::SendInit)?;
+
+    if unboxed.len() < 32 {
+        return Err(RecvAction::Drop);
+    }
+
+    let mut inner_key = [0u8; 32];
+    inner_key.copy_from_slice(&unboxed[..32]);
+    unboxed.drain(..32);
+    Ok((unboxed, inner_key))
 }
 
 /// Action needed after receiving a packet.
@@ -496,8 +565,6 @@ pub(crate) struct ConcurrentSessionManager {
     sessions: std::sync::RwLock<HashMap<PublicKey, Arc<std::sync::Mutex<SessionInfo>>>>,
     buffers: std::sync::Mutex<HashMap<PublicKey, SessionBuffer>>,
 }
-
-use std::sync::Arc;
 
 impl ConcurrentSessionManager {
     pub fn new() -> Self {
@@ -541,19 +608,14 @@ impl ConcurrentSessionManager {
     }
 
     /// Handle incoming traffic (hot path).
-    /// Read-locks the map, clones the session Arc, drops the map lock,
-    /// then locks only the per-session mutex for decryption.
-    fn handle_traffic(&self,from: &PublicKey, data: &[u8], our_ed_priv: &ed25519_dalek::SigningKey) -> Vec<OutAction> {
+    /// Uses 3-phase pattern: snapshot under lock → decrypt outside lock → finalize under lock.
+    fn handle_traffic(&self, from: &PublicKey, data: &[u8], our_ed_priv: &ed25519_dalek::SigningKey) -> Vec<OutAction> {
         let session_arc = {
             let map = self.sessions.read().unwrap();
             map.get(from).cloned()
         };
 
         let Some(session_arc) = session_arc else {
-            // No session for this sender — they're using a stale session (e.g. after we restarted).
-            // Just send an Init with throwaway keys we won't save.
-            // If they Ack, we'll set up a real session and let it self-heal.
-            // Don't create a buffer or session here — the sender could be spoofed/replayed.
             tracing::debug!("encrypted: no session for {:?}, sending throwaway Init", hex::encode(&from[..4]));
             let (current_pub, _) = new_box_keys();
             let (next_pub, _) = new_box_keys();
@@ -564,28 +626,50 @@ impl ConcurrentSessionManager {
             };
         };
 
-        let mut info = session_arc.lock().unwrap();
-        match info.do_recv(data) {
-            Ok(payload) => {
-                vec![OutAction::Deliver {
-                    source: *from,
-                    data: payload,
-                }]
+        // Phase 1: snapshot under lock
+        let snap = {
+            let info = session_arc.lock().unwrap();
+            match info.recv_snapshot(data) {
+                Ok(snap) => snap,
+                Err(RecvSnapshotError::SendInit { send_pub, next_pub, local_key_seq }) => {
+                    let init = SessionInit::new(&send_pub, &next_pub, local_key_seq);
+                    return match init.encrypt(our_ed_priv, from, SESSION_TYPE_INIT) {
+                        Ok(data) => vec![OutAction::SendToInner { dest: *from, data }],
+                        Err(_) => Vec::new(),
+                    };
+                }
+                Err(RecvSnapshotError::Drop) => return Vec::new(),
             }
+        };
+
+        // Phase 2: decrypt outside lock
+        let (payload, inner_key) = match decrypt_outside_lock(&snap, data) {
+            Ok(result) => result,
             Err(RecvAction::SendInit) => {
+                let info = session_arc.lock().unwrap();
                 let init = SessionInit::new(&info.send_pub, &info.next_pub, info.local_key_seq);
-                match init.encrypt(our_ed_priv, from, SESSION_TYPE_INIT) {
+                return match init.encrypt(our_ed_priv, from, SESSION_TYPE_INIT) {
                     Ok(data) => vec![OutAction::SendToInner { dest: *from, data }],
                     Err(_) => Vec::new(),
-                }
+                };
             }
-            Err(RecvAction::Drop) => Vec::new(),
+            Err(RecvAction::Drop) => return Vec::new(),
+        };
+
+        // Phase 3: finalize under lock
+        {
+            let mut info = session_arc.lock().unwrap();
+            info.recv_finalize(&snap, inner_key, payload.len() as u64);
         }
+
+        vec![OutAction::Deliver {
+            source: *from,
+            data: payload,
+        }]
     }
 
     /// Encrypt and send outbound data (hot path).
-    /// Read-locks the map for existing sessions; falls back to buffer_and_init
-    /// for new sessions.
+    /// Uses 3-phase pattern: snapshot under lock → encrypt outside lock → finalize under lock.
     pub fn write_to(
         &self,
         dest: &PublicKey,
@@ -598,14 +682,31 @@ impl ConcurrentSessionManager {
         };
 
         if let Some(session_arc) = session_arc {
-            let mut info = session_arc.lock().unwrap();
-            match info.do_send(msg) {
-                Ok(traffic_data) => vec![OutAction::SendToInner {
-                    dest: *dest,
-                    data: traffic_data,
-                }],
-                Err(_) => Vec::new(),
+            // Phase 1: snapshot under lock
+            let snap = {
+                let mut info = session_arc.lock().unwrap();
+                match info.send_snapshot() {
+                    Ok(snap) => snap,
+                    Err(_) => return Vec::new(),
+                }
+            };
+
+            // Phase 2: encrypt outside lock
+            let traffic_data = match encrypt_outside_lock(&snap, msg) {
+                Ok(data) => data,
+                Err(_) => return Vec::new(),
+            };
+
+            // Phase 3: finalize under lock
+            {
+                let mut info = session_arc.lock().unwrap();
+                info.send_finalize(msg.len() as u64);
             }
+
+            vec![OutAction::SendToInner {
+                dest: *dest,
+                data: traffic_data,
+            }]
         } else {
             self.buffer_and_init(dest, msg, our_ed_priv)
         }
