@@ -7,7 +7,6 @@ use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
 use std::sync::Arc;
 
-use tokio::sync::mpsc;
 use tun_rs::AsyncDevice;
 
 use crate::ipv6rwc::ReadWriteCloser;
@@ -16,7 +15,6 @@ use crate::ipv6rwc::ReadWriteCloser;
 pub struct TunAdapter {
     device: Arc<AsyncDevice>,
     read_handle: tokio::task::JoinHandle<()>,
-    queue_handle: tokio::task::JoinHandle<()>,
     write_handle: tokio::task::JoinHandle<()>,
 }
 
@@ -98,9 +96,6 @@ impl TunAdapter {
             }
         }
 
-        // Channel for packets from network → TUN
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(256);
-
         // Task 1: TUN → network (read from TUN, write to RWC)
         let device_read = device.clone();
         let rwc_read = rwc.clone();
@@ -108,22 +103,16 @@ impl TunAdapter {
             tun_read_loop(device_read, rwc_read).await;
         });
 
-        // Task 2: network → channel (read from RWC, send to channel)
-        let rwc_queue = rwc.clone();
-        let queue_handle = tokio::spawn(async move {
-            tun_queue_loop(rwc_queue, tx).await;
-        });
-
-        // Task 3: channel → TUN (receive from channel, write to TUN)
+        // Task 2: network → TUN (read from RWC directly into TUN; no intermediate queue)
         let device_write = device.clone();
+        let rwc_write = rwc.clone();
         let write_handle = tokio::spawn(async move {
-            tun_write_loop(device_write, rx).await;
+            tun_write_loop(device_write, rwc_write).await;
         });
 
         Ok(Self {
             device,
             read_handle,
-            queue_handle,
             write_handle,
         })
     }
@@ -138,12 +127,10 @@ impl TunAdapter {
     /// the Wintun adapter isn't closed by then, it gets orphaned in the
     /// device tree and the next startup can't recreate it.
     pub async fn close(self) {
-        let TunAdapter { device, read_handle, queue_handle, write_handle } = self;
+        let TunAdapter { device, read_handle, write_handle } = self;
         read_handle.abort();
-        queue_handle.abort();
         write_handle.abort();
         let _ = read_handle.await;
-        let _ = queue_handle.await;
         let _ = write_handle.await;
         // Tasks have released their Arc clones; drop the last one so
         // AsyncDevice::Drop runs WintunCloseAdapter (or platform equivalent).
@@ -170,36 +157,22 @@ async fn tun_read_loop(device: Arc<AsyncDevice>, rwc: Arc<ReadWriteCloser>) {
     }
 }
 
-/// Read packets from the network (RWC) and send them to the channel.
-async fn tun_queue_loop(rwc: Arc<ReadWriteCloser>, tx: mpsc::Sender<Vec<u8>>) {
+/// Read packets from the network (RWC) and write them straight into the TUN device.
+async fn tun_write_loop(device: Arc<AsyncDevice>, rwc: Arc<ReadWriteCloser>) {
     let mut buf = vec![0u8; 65535];
     loop {
         match rwc.read(&mut buf).await {
             Ok(n) => {
-                tracing::debug!("TUN read {} bytes, version={:#x}", n, buf[0] >> 4);
-                if tx.send(buf[..n].to_vec()).await.is_err() {
-                    tracing::error!("TUN queue channel closed");
+                tracing::debug!("TUN write {} bytes, version={:#x}", n, buf[0] >> 4);
+                if let Err(e) = device.send(&buf[..n]).await {
+                    tracing::error!("TUN write error: {}", e);
                     return;
                 }
             }
             Err(e) => {
-                tracing::error!("Exiting TUN queue due to read error: {}", e);
+                tracing::error!("Exiting TUN write loop due to RWC read error: {}", e);
                 return;
             }
-        }
-    }
-}
-
-/// Receive packets from the channel and write them to the TUN device.
-async fn tun_write_loop(
-    device: Arc<AsyncDevice>,
-    mut rx: mpsc::Receiver<Vec<u8>>,
-) {
-    while let Some(packet) = rx.recv().await {
-        tracing::debug!("TUN write {} bytes", packet.len());
-        if let Err(e) = device.send(&packet).await {
-            tracing::error!("TUN write error: {}", e);
-            return;
         }
     }
 }

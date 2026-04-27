@@ -95,11 +95,10 @@ impl ReadWriteCloser {
     /// Read a packet from the network (Core) destined for the TUN.
     /// Returns the number of bytes written to `buf`.
     pub async fn read(&self, buf: &mut [u8]) -> Result<usize, String> {
-        let mut inner_buf = vec![0u8; 65536];
         loop {
             let (n, from_addr) = self
                 .core
-                .read_from(&mut inner_buf)
+                .read_from(buf)
                 .await
                 .map_err(|e| format!("core read: {}", e))?;
 
@@ -107,7 +106,7 @@ impl ReadWriteCloser {
                 continue;
             }
 
-            let packet = &inner_buf[..n];
+            let packet = &buf[..n];
             tracing::debug!("RWC read {} bytes from {:?}, first byte={:#x}", n, from_addr, packet[0]);
 
             let is_ip4 = packet[0] & 0xf0 == 0x40;
@@ -156,9 +155,7 @@ impl ReadWriteCloser {
                 if !accepted {
                     continue;
                 }
-                let copy_len = n.min(buf.len());
-                buf[..copy_len].copy_from_slice(&packet[..copy_len]);
-                return Ok(copy_len);
+                return Ok(n);
             }
 
             // Standard (non-CKR) path: IPv6 only validation
@@ -198,9 +195,7 @@ impl ReadWriteCloser {
             }
 
             tracing::debug!("RWC delivering {} bytes to TUN", n);
-            let copy_len = n.min(buf.len());
-            buf[..copy_len].copy_from_slice(&packet[..copy_len]);
-            return Ok(copy_len);
+            return Ok(n);
         }
     }
 
