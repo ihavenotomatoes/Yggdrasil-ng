@@ -664,6 +664,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Short
     external fun uniffi_yggdrasil_mobile_checksum_func_get_version(
     ): Short
+    external fun uniffi_yggdrasil_mobile_checksum_method_yggdrasilmobile_force_router_refresh(
+    ): Short
     external fun uniffi_yggdrasil_mobile_checksum_method_yggdrasilmobile_get_address_string(
     ): Short
     external fun uniffi_yggdrasil_mobile_checksum_method_yggdrasilmobile_get_mtu(
@@ -727,6 +729,8 @@ internal object UniffiLib {
     ): Unit
     external fun uniffi_yggdrasil_mobile_fn_constructor_yggdrasilmobile_new(`listener`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Long
+    external fun uniffi_yggdrasil_mobile_fn_method_yggdrasilmobile_force_router_refresh(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     external fun uniffi_yggdrasil_mobile_fn_method_yggdrasilmobile_get_address_string(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_yggdrasil_mobile_fn_method_yggdrasilmobile_get_mtu(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
@@ -895,6 +899,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_yggdrasil_mobile_checksum_func_get_version() != 49209.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_yggdrasil_mobile_checksum_method_yggdrasilmobile_force_router_refresh() != 1225.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_yggdrasil_mobile_checksum_method_yggdrasilmobile_get_address_string() != 45043.toShort()) {
@@ -1478,6 +1485,13 @@ public object FfiConverterByteArray: FfiConverterRustBuffer<ByteArray> {
 public interface YggdrasilMobileInterface {
     
     /**
+     * Force an immediate router refresh / re-announce. Used by Android's
+     * AlarmManager during Doze to keep the mesh's view of us fresh through
+     * suspend windows where the in-process refresh timer can't fire.
+     */
+    fun `forceRouterRefresh`()
+    
+    /**
      * Get the node's IPv6 address as a string.
      */
     fun `getAddressString`(): kotlin.String
@@ -1676,6 +1690,23 @@ open class YggdrasilMobile: Disposable, AutoCloseable, YggdrasilMobileInterface
             UniffiLib.uniffi_yggdrasil_mobile_fn_clone_yggdrasilmobile(handle, status)
         }
     }
+
+    
+    /**
+     * Force an immediate router refresh / re-announce. Used by Android's
+     * AlarmManager during Doze to keep the mesh's view of us fresh through
+     * suspend windows where the in-process refresh timer can't fire.
+     */override fun `forceRouterRefresh`()
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_yggdrasil_mobile_fn_method_yggdrasilmobile_force_router_refresh(
+        it,
+        _status)
+}
+    }
+    
+    
 
     
     /**

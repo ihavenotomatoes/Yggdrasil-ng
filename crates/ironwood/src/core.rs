@@ -98,6 +98,11 @@ pub(crate) enum RouterMsg {
         dest: PublicKey,
     },
 
+    /// External nudge to force an immediate router refresh / re-announce.
+    /// Triggered by Android's AlarmManager during Doze so the mesh doesn't
+    /// expire our tree info during long suspend windows.
+    ForceRefresh,
+
     // --- Queries (with oneshot reply) ---
     ForceLookup {
         dest: PublicKey,
@@ -267,10 +272,31 @@ async fn router_actor(
     let mut maintenance_interval = tokio::time::interval(Duration::from_secs(1));
     maintenance_interval.tick().await; // skip first immediate tick
 
+    // Track wall-clock alongside the monotonic interval so we can detect post-
+    // suspend wake-ups. CLOCK_MONOTONIC (which tokio::time uses) is frozen on
+    // Android during Doze; SystemTime is not. If the wall-clock delta between
+    // ticks is far larger than the ~1s interval, the device just resumed and
+    // the rest of the mesh has already expired our tree info on their side —
+    // we must immediately re-announce, not wait the next 4-minute refresh.
+    let mut last_wall = std::time::SystemTime::now();
+    const WALL_JUMP_THRESHOLD: Duration = Duration::from_secs(30);
+
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
             _ = maintenance_interval.tick() => {
+                let wall_now = std::time::SystemTime::now();
+                if let Ok(elapsed) = wall_now.duration_since(last_wall) {
+                    if elapsed >= WALL_JUMP_THRESHOLD {
+                        tracing::info!(
+                            "wall-clock jumped {}s between maintenance ticks (suspend/Doze resume) — forcing router refresh",
+                            elapsed.as_secs()
+                        );
+                        router.force_refresh();
+                    }
+                }
+                last_wall = wall_now;
+
                 router.expire_infos();
                 let actions = router.do_maintenance();
                 if !actions.is_empty() {
@@ -354,6 +380,15 @@ async fn handle_router_msg(
             router.pathfinder.ensure_rumor(xform);
             let actions = router.send_traffic(TrafficPacket::new(our_key, dest, Vec::new()));
             dispatch_actions(actions, peers, delivery_queue, traffic_tx, path_notify_cb).await;
+        }
+        RouterMsg::ForceRefresh => {
+            router.force_refresh();
+            // Run a maintenance pass immediately so the SigReq cycle and
+            // re-announce go out without waiting for the next 1s tick.
+            let actions = router.do_maintenance();
+            if !actions.is_empty() {
+                dispatch_actions(actions, peers, delivery_queue, traffic_tx, path_notify_cb).await;
+            }
         }
         RouterMsg::ForceLookup { dest, reply } => {
             let actions = router.force_lookup(dest);
@@ -870,6 +905,17 @@ impl PacketConnImpl {
         self.router_handle
             .query_count_lookup_targets(dest)
             .await
+    }
+
+    /// External nudge to force an immediate router refresh / re-announce.
+    /// Use from platform timers (e.g. Android AlarmManager) to keep the mesh
+    /// view of us fresh through long suspend windows where the in-process
+    /// 4-minute monotonic refresh timer can't fire.
+    pub fn force_refresh(&self) {
+        if self.closed.load(Ordering::Relaxed) {
+            return;
+        }
+        self.router_handle.send(RouterMsg::ForceRefresh);
     }
 }
 

@@ -1403,6 +1403,22 @@ impl Router {
         })
     }
 
+    /// Force an immediate router refresh on the next maintenance tick.
+    /// Called after the runtime detects a wall-clock jump (Android Doze
+    /// resume): the rest of the mesh has likely expired our tree info on
+    /// their side, so we need to re-announce now rather than waiting up to
+    /// `router_refresh` (4 min) for the periodic timer.
+    pub fn force_refresh(&mut self) {
+        self.refresh = true;
+        self.do_root1 = true;
+        self.do_root2 = true;
+        // Backdate last_refresh so the next do_maintenance() also schedules
+        // the SigReq cycle even if force_refresh() is called repeatedly.
+        self.last_refresh = Instant::now()
+            .checked_sub(self.router_refresh)
+            .unwrap_or_else(Instant::now);
+    }
+
     /// Expire old router infos.
     pub fn expire_infos(&mut self) {
         let now = Instant::now();

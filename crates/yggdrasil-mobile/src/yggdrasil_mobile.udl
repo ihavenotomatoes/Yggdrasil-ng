@@ -133,6 +133,11 @@ interface YggdrasilMobile {
     /// Retry connecting to all configured peers immediately.
     void retry_peers_now();
 
+    /// Force an immediate router refresh / re-announce. Used by Android's
+    /// AlarmManager during Doze to keep the mesh's view of us fresh through
+    /// suspend windows where the in-process refresh timer can't fire.
+    void force_router_refresh();
+
     /// Long-poll: blocks until state changes or timeout_ms expires.
     /// Returns current state snapshot.
     YggdrasilState wait_for_state_update(u64 timeout_ms);

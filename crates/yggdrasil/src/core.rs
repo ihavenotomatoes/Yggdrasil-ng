@@ -331,6 +331,13 @@ impl Core {
         self.links.lock().await.retry_peers_now();
     }
 
+    /// External nudge to force an immediate router refresh / re-announce.
+    /// Used by mobile clients to keep the mesh view of us fresh during long
+    /// suspend windows (Android Doze) where in-process timers can't fire.
+    pub fn force_router_refresh(&self) {
+        self.inner.force_refresh();
+    }
+
     /// Get link-level peer info merged with ironwood RTT/cost (for admin getPeers).
     /// Returns all configured peers (with up=false if disconnected) plus active inbound peers.
     pub async fn get_peers(&self) -> Vec<LinkPeerInfo> {

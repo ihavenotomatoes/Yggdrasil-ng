@@ -174,6 +174,11 @@ impl EncryptedPacketConn {
     pub async fn force_lookup(&self, dest: crate::crypto::PublicKey) -> usize {
         self.inner.force_lookup(dest).await
     }
+
+    /// Force an immediate router refresh / re-announce (delegates to inner).
+    pub fn force_refresh(&self) {
+        self.inner.force_refresh();
+    }
 }
 
 /// Background reader loop: reads from inner PacketConn, decrypts via sessions, delivers.

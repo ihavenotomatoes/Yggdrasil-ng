@@ -440,7 +440,7 @@ impl YggdrasilMobile {
                         Ok(Ok(n)) => {
                             // Ignore write errors: the TUN forwards non-Yggdrasil
                             // packets too, which rwc rightly rejects. Matches the
-                            // behaviour of the old send_buffer path.
+                            // behavior of the old send_buffer path.
                             let _ = rwc.write(&buf[..n]).await;
                         }
                         Ok(Err(e)) => {
@@ -561,6 +561,15 @@ impl YggdrasilMobile {
         if let Some(ns) = self.state.lock().unwrap().as_ref() {
             let core = Arc::clone(&ns.core);
             self.rt.block_on(core.retry_peers_now());
+        }
+    }
+
+    /// Force an immediate router refresh / re-announce. Called by Android's
+    /// AlarmManager during Doze to nudge the mesh before our tree info is
+    /// expired downstream.
+    pub fn force_router_refresh(&self) {
+        if let Some(ns) = self.state.lock().unwrap().as_ref() {
+            ns.core.force_router_refresh();
         }
     }
 

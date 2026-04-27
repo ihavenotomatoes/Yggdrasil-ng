@@ -879,6 +879,11 @@ pub(crate) async fn peer_writer(
 
     cancel.cancel();
 
+    // Best-effort clean shutdown so TLS streams emit close_notify before the
+    // TCP FIN — without this the remote rustls peer logs an "unexpected EOF"
+    // warning. Capped at 1s in case the connection is already broken.
+    let _ = tokio::time::timeout(Duration::from_secs(1), conn_write.shutdown()).await;
+
     // Remove the stale peer from the router and peer manager.
     {
         router.send(RouterMsg::RemovePeer { peer_id, key: peer_key, port });
