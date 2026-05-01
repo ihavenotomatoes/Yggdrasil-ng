@@ -6,6 +6,7 @@ pub mod core;
 pub mod ctl;
 #[cfg(feature = "ckr")]
 pub mod ckr;
+pub mod firewall;
 pub mod ipv6rwc;
 pub mod links;
 pub mod multicast;

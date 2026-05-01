@@ -130,6 +130,8 @@ fn convert_config(cfg: &YggdrasilConfig) -> config::Config {
         .map(|r| (r.public_key.clone(), r.cidrs.clone()))
         .collect();
 
+    let mut firewall = config::FirewallConfig::default();
+    firewall.enable = true;
     config::Config {
         private_key: cfg.private_key.clone(),
         peers: cfg.peers.clone(),
@@ -162,6 +164,7 @@ fn convert_config(cfg: &YggdrasilConfig) -> config::Config {
             // try to install OS routes from the unprivileged app process.
             install_system_routes: false,
         },
+        firewall
     }
 }
 
@@ -303,7 +306,7 @@ impl YggdrasilMobile {
             core
         });
 
-        let rwc = ReadWriteCloser::new(core.clone(), core.mtu(), Some(&ckr_cfg));
+        let rwc = ReadWriteCloser::new(core.clone(), core.mtu(), Some(&ckr_cfg), None);
         core.set_path_notify(rwc.clone());
 
         let (stop_tx, _) = broadcast::channel(1);

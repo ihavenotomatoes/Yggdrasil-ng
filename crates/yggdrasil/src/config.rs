@@ -95,6 +95,50 @@ pub struct Config {
     #[cfg(feature = "ckr")]
     #[serde(default)]
     pub tunnel_routing: TunnelRoutingConfig,
+
+    /// Built-in stateful firewall configuration.
+    #[serde(default)]
+    pub firewall: FirewallConfig,
+}
+
+/// Built-in stateful firewall configuration. Default-off; when enabled,
+/// inbound mesh traffic is dropped unless it matches an outbound flow
+/// (stateful return), comes from `open_all_for`, or hits an open port.
+/// Outbound is always allowed.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FirewallConfig {
+    /// Master switch. False = no filtering (preserves legacy behavior).
+    #[serde(default)]
+    pub enable: bool,
+
+    /// Inbound TCP destination ports that are open to the mesh.
+    #[serde(default)]
+    pub open_tcp: Vec<u16>,
+
+    /// Inbound UDP destination ports that are open to the mesh.
+    #[serde(default)]
+    pub open_udp: Vec<u16>,
+
+    /// IPv6 source CIDRs (mesh addresses) for which all inbound is allowed.
+    /// Use a /128 to whitelist a single peer; a /64 whitelists their subnet.
+    #[serde(default)]
+    pub open_all_for: Vec<String>,
+
+    /// Allow inbound ICMPv6 Echo Request (ping). Default: true.
+    #[serde(default = "default_true")]
+    pub allow_icmp_echo: bool,
+}
+
+impl Default for FirewallConfig {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            open_tcp: Vec::new(),
+            open_udp: Vec::new(),
+            open_all_for: Vec::new(),
+            allow_icmp_echo: true,
+        }
+    }
 }
 
 /// Crypto-Key Routing (CKR) tunnel configuration.
@@ -167,6 +211,7 @@ impl Default for Config {
             multicast_interfaces: default_multicast_interfaces(),
             #[cfg(feature = "ckr")]
             tunnel_routing: TunnelRoutingConfig::default(),
+            firewall: FirewallConfig::default(),
         }
     }
 }

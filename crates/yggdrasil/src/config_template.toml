@@ -67,3 +67,15 @@ listen = true
 # ipv4_address = "10.99.0.1/24"  # IPv4 address for the TUN (exit-node/VPN use)
 # [tunnel_routing.remote_subnets]
 # "peer_public_key_hex" = ["10.0.0.0/24", "192.168.1.0/24"]
+
+# Built-in stateful firewall. Default policy when enabled: drop inbound
+# from the mesh unless it's a reply to outbound traffic, comes from a
+# whitelisted source subnet, or hits an explicitly opened port. Outbound
+# is always allowed. Default off so servers reachable only via Yggdrasil
+# keep working after upgrade.
+[firewall]
+enable = false
+open_tcp = [22, 80, 443]
+open_udp = [53]
+# open_all_for = ["200:abcd:1234::/48"]   # trusted friend subnets
+allow_icmp_echo = true

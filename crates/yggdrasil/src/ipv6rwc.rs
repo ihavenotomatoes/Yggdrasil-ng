@@ -14,6 +14,7 @@ use {
     crate::ckr::CryptoKey,
     crate::config::TunnelRoutingConfig,
 };
+use crate::firewall::Firewall;
 
 const KEY_STORE_TIMEOUT: Duration = Duration::from_secs(120);
 const IPV6_HEADER_LEN: usize = 40;
@@ -45,6 +46,7 @@ pub struct ReadWriteCloser {
     mtu: u64,
     #[cfg(feature = "ckr")]
     ckr: Option<CryptoKey>,
+    firewall: Option<Arc<Firewall>>,
 }
 
 #[derive(Clone)]
@@ -64,6 +66,7 @@ impl ReadWriteCloser {
         core: Arc<Core>,
         mtu: u64,
         #[cfg(feature = "ckr")] ckr_config: Option<&TunnelRoutingConfig>,
+        firewall: Option<Arc<Firewall>>,
     ) -> Arc<Self> {
         let address = *core.address();
         let subnet = *core.subnet();
@@ -95,6 +98,7 @@ impl ReadWriteCloser {
             mtu,
             #[cfg(feature = "ckr")]
             ckr,
+            firewall,
         })
     }
 
@@ -161,6 +165,12 @@ impl ReadWriteCloser {
                 if !accepted {
                     continue;
                 }
+                if let Some(fw) = &self.firewall {
+                    if fw.enabled() && is_ip6 && !fw.check_inbound(packet) {
+                        tracing::debug!("RWC firewall: drop inbound (CKR path)");
+                        continue;
+                    }
+                }
                 return Ok(n);
             }
 
@@ -200,6 +210,13 @@ impl ReadWriteCloser {
                 continue;
             }
 
+            if let Some(fw) = &self.firewall {
+                if fw.enabled() && !fw.check_inbound(packet) {
+                    tracing::debug!("RWC firewall: drop inbound");
+                    continue;
+                }
+            }
+
             tracing::debug!("RWC delivering {} bytes to TUN", n);
             return Ok(n);
         }
@@ -208,6 +225,16 @@ impl ReadWriteCloser {
     /// Write a packet from the TUN to the network (Core).
     pub async fn write(&self, buf: &[u8]) -> Result<usize, String> {
         let is_ip6 = buf.first().map_or(false, |b| b & 0xf0 == 0x60);
+
+        // Firewall: observe outbound IPv6 flows so matching inbound replies pass.
+        // Outbound is never blocked.
+        if is_ip6 {
+            if let Some(fw) = &self.firewall {
+                if fw.enabled() {
+                    fw.observe_outbound(buf);
+                }
+            }
+        }
 
         // CKR path: handle IPv4 and non-Yggdrasil IPv6 destinations
         #[cfg(feature = "ckr")]

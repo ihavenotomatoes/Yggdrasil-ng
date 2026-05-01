@@ -44,11 +44,10 @@ arc-swap = "1.9"
 default = ["ctl", "tun"]
 ctl = []
 tun = ["dep:tun-rs"]
-ckr = ["dep:ipnet", "dep:route_manager"]
+ckr = ["dep:route_manager"]
 
 [dependencies.ipnet]
 version = "2"
-optional = true
 
 # route_manager doesn't build on Android; system routes there are handled by VpnService.
 [target.'cfg(not(target_os = "android"))'.dependencies.route_manager]
