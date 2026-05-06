@@ -8,16 +8,36 @@
 # Delete this line and restart to generate a new identity.
 private_key = "{{PRIVATE_KEY}}"
 
-# List of connection strings for outbound peer connections in URI format,
-# e.g. tcp://a.b.c.d:e, tls://a.b.c.d:e, quic://a.b.c.d:e, etc.
-# NOTE: Now Yggdrasil-ng supports only TCP connections.
+# List of connection strings for outbound peer connections in URI format.
+# Supported schemes: tcp://, tls://
 # You can find public peers at https://publicpeers.neilalexander.dev/
+#
+# Optional query parameters:
+#   key=HEX          - pin the remote peer's public key (connection fails if mismatch)
+#   password=SECRET  - shared password, must match the listener side (max 64 chars)
+#   priority=N       - connection priority 0-255, lower = preferred when multiple
+#                      connections exist to the same peer (default: 0)
+#   maxbackoff=DUR   - max reconnect wait if peer goes offline, e.g. 30s, 5m, 1h
+#                      (default: 4096s ≈ 68 min, minimum: 5s)
+#   sni=HOSTNAME     - override TLS SNI hostname, useful when connecting via IP
+#                      or through a reverse proxy (TLS only)
+#
+# Examples:
+#   "tcp://192.0.2.1:12345"
+#   "tls://peer.example.com:443?maxbackoff=30s&key=abcdef01..."
+#   "tls://203.0.113.5:2096?sni=peer.example.com&password=s3cr3t"
 peers = []
 
 # Listen addresses for inbound connections. You'll need to add port
 # forwarding for these ports if you are behind a NAT/firewall.
-# e.g. tcp://[::]:12345, tls://[::]:12345
-# NOTE: Now Yggdrasil-ng supports only TCP connections.
+# Supported schemes: tcp://, tls://
+#
+# Optional query parameters:
+#   password=SECRET  - require a shared password from connecting peers (max 64 chars)
+#
+# Examples:
+#   "tcp://[::]:12345"
+#   "tls://[::]:443?password=s3cr3t"
 listen = ["tcp://0.0.0.0:0"]
 
 # Listen address for the admin socket.
@@ -44,13 +64,20 @@ if_mtu = 65535
 # these public keys will be allowed to connect. Leave empty to allow all peers.
 # allowed_public_keys = []
 
-# Multicast peer discovery on local network.
-# Each entry matches network interfaces by glob pattern.
-# beacon: advertise this node on matching interfaces
-# listen: accept peer discoveries on matching interfaces
-# port: TLS listener port (0 = auto-assign)
-# priority: connection priority (0-255)
-# password: authentication password (must match on both sides)
+# Multicast peer discovery — automatically finds and connects to nearby nodes
+# on the local network without manual configuration.
+#
+# Each entry controls which network interfaces participate in discovery.
+# Multiple entries can be added to apply different settings per interface.
+#
+# filter   - glob pattern to match interface names, e.g. "eth*", "en*", "*" (default: "*")
+# beacon   - advertise this node's presence on matching interfaces (default: true)
+# listen   - connect to other nodes discovered on matching interfaces (default: true)
+# port     - TLS listener port for this interface, 0 = auto-assign (default: 0)
+# priority - connection priority for peers found on this interface (0-255, lower = preferred),
+#            used when the same peer is reachable via multiple connections
+# password - shared password for discovery; only nodes with the same password
+#            will discover each other on this interface (default: none)
 [[multicast_interfaces]]
 filter = "*"
 beacon = true

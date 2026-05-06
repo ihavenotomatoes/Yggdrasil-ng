@@ -30,7 +30,6 @@ This project aims to provide a lightweight, self-arranging, and secure mesh netw
 - Crypto-Key Routing (CKR) — tunnel arbitrary IPv4/IPv6 subnets through the mesh (`--features ckr`)
 
 **⏳ Planned Features:**
-- Additional transports: QUIC, WebSocket
 - Multicast peer discovery on local networks
 - Performance optimizations and protocol improvements
 
@@ -238,6 +237,43 @@ name = "my-node"
 location = "datacenter-1"
 ```
 
+### Peer URI Query Parameters
+
+Both `peers` entries and `listen` addresses support optional query-string parameters:
+
+**Outbound peers** (`peers`):
+
+| Parameter | Description | Example |
+|-----------|-------------|---------|
+| `password=PASSWORD` | Shared secret required to connect (max 64 chars, must match remote side) | `?password=secret` |
+| `key=PUBLICKEY` | Pin the expected public key (hex); connection fails if remote key differs | `?key=aabbcc...` |
+| `priority=N` | Connection priority (0-255, lower = higher priority) when multiple connections exist to the same peer | `?priority=10` |
+| `maxbackoff=DURATION` | Maximum reconnect backoff interval if the peer goes down (min 5s, default 68m) | `?maxbackoff=30s` |
+| `sni=HOSTNAME` | Override TLS SNI hostname (TLS only; ignored for plain TCP) | `?sni=example.com` |
+
+**Inbound listeners** (`listen`):
+
+| Parameter | Description | Example |
+|-----------|-------------|---------|
+| `password=PASSWORD` | Require this password from connecting peers (max 64 chars) | `?password=secret` |
+
+Duration values for `maxbackoff` accept plain seconds (`30`) or human-readable format (`30s`, `5m`, `1h`, `1h30m`).
+
+**Example with multiple parameters:**
+
+```toml
+peers = [
+    # VPS relay: faster reconnect, pinned key, TLS with custom SNI
+    "tls://relay.example.com:2096?maxbackoff=30s&key=aabbccdd...&sni=example.net",
+
+    # LAN node: higher priority than WAN peers
+    "tcp://192.168.1.10:12345?priority=10",
+
+    # Password-protected peer
+    "tcp://peer.example.com:12345?password=mysecret",
+]
+```
+
 ### Differences from Go Version
 
 **Command line:**
@@ -257,13 +293,13 @@ location = "datacenter-1"
   - `node_info_privacy` instead of `NodeInfoPrivacy`
   - `allowed_public_keys` instead of `AllowedPublicKeys`
 - **Single binary**: Daemon and control tool are combined (no separate `yggdrasilctl`)
-- **Transport support**: TCP and TLS (QUIC, WebSocket coming later)
+- **Transport support**: TCP and TLS only
 - **Admin socket**: Defaults to TCP `localhost:9001` instead of Unix socket
 
 **Migration from Go config:**
 1. Convert HJSON/JSON to TOML format
 2. Rename all fields from PascalCase to snake_case
-3. Change transport URIs to TCP-only (remove `tls://`, `quic://`, etc.)
+3. Change transport URIs as needed (QUIC and WebSocket are not supported — use `tcp://` or `tls://`)
 4. Update admin socket to TCP format if using Unix socket
 
 ## Crypto-Key Routing (CKR)
