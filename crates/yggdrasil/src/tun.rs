@@ -72,6 +72,32 @@ impl TunAdapter {
             }
         }
 
+        // Assign IP addresses to TUN if configured in CKR
+        #[cfg(feature = "ckr")]
+        if let Some(ckr_cfg) = ckr_config {
+            for cidr in &ckr_cfg.ip_addresses {
+                if ckr_cfg.enable && !cidr.is_empty() {
+                    if cidr.contains(':') {
+                        // IPv6 path - reuse the same split/parse pattern already present 
+                        // in parse_ipv4_cidr and the existing Yggdrasil IPv6 handling above
+                        let parts: Vec<&str> = cidr.split('/').collect();
+                        if parts.len() == 2 {
+                            let ip_str = parts[0];
+                            let prefix: u8 = parts[1].parse().map_err(|e| format!("invalid IPv6 prefix in ip_addresses '{}': {}", cidr, e))?;
+                            let ip: Ipv6Addr = ip_str.parse().map_err(|e| format!("invalid IPv6 in ip_addresses '{}': {}", cidr, e))?;
+                            builder = builder.ipv6(ip, prefix);
+                            tracing::info!("CKR: assigning IPv6 address {} to TUN", cidr);
+                        }
+                    } else {
+                        // IPv4 path - reuse the exact existing parse_ipv4_cidr function
+                        let (v4_addr, v4_prefix) = parse_ipv4_cidr(cidr)?;
+                        builder = builder.ipv4(v4_addr, v4_prefix, None);
+                        tracing::info!("CKR: assigning IPv4 address {} to TUN", cidr);
+                    }
+                }
+            }
+        }
+
         #[cfg(windows)]
         {
             // Only call device_guid on Windows

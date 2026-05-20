@@ -157,8 +157,19 @@ pub struct TunnelRoutingConfig {
     /// IPv4 address to assign to the TUN interface, in CIDR notation.
     /// Required for exit-node / VPN scenarios where IPv4 traffic is tunneled.
     /// Example: "10.99.0.1/24"
+    /// DEPRECATED: kept for backward compatibility; use `ip_addresses` 
+    /// for any number of IPv4/IPv6 addresses.
     #[serde(default)]
     pub ipv4_address: String,
+
+    /// Additional IP addresses (IPv4 or IPv6, in CIDR notation) to assign
+    /// to the TUN interface. Supports any number of addresses. New preferred
+    /// option for exit-node / VPN to replace deprecated ‘ipv4_address’.
+    /// Example: ["10.99.0.1/24", "2005:8a:9:11::3/64"]
+    /// The `ipv4_address` (if non-empty) is still assigned as the primary IPv4;
+    /// entries here are added alongside it.
+    #[serde(default)]
+    pub ip_addresses: Vec<String>,
 
     /// Remote subnets: maps hex public key -> list of CIDRs.
     /// Example: { "aabbcc...01": ["10.0.0.0/24", "192.168.1.0/24"] }
@@ -178,6 +189,7 @@ impl Default for TunnelRoutingConfig {
             enable: false,
             yggdrasil_routing: true,
             ipv4_address: String::new(),
+            ip_addresses: Vec::new(),
             remote_subnets: HashMap::new(),
             install_system_routes: true,
         }

@@ -320,7 +320,7 @@ Add a `[tunnel_routing]` section to your `yggdrasil.toml`:
 [tunnel_routing]
 enable = true
 yggdrasil_routing = true
-ipv4_address = "10.99.0.1/24"
+ip_addresses = ["10.99.0.1/24"]
 
 [tunnel_routing.remote_subnets]
 "peer_public_key_hex" = ["10.0.0.0/24", "192.168.1.0/24"]
@@ -330,7 +330,9 @@ ipv4_address = "10.99.0.1/24"
 |--------|------|-------------|
 | `enable` | bool | Enable/disable CKR |
 | `yggdrasil_routing` | bool | Also route standard Yggdrasil `0200::/7` traffic (default: true) |
-| `ipv4_address` | string | IPv4 address to assign to TUN in CIDR notation (e.g., `"10.99.0.1/24"`) |
+| `install_system_routes` | bool | Automatically install system routing table entries for CKR. (default: true) |
+| `ipv4_address` | string | IPv4 address to assign to TUN in CIDR notation (e.g., `"10.99.0.1/24"`). Deprecated |
+| `ip_addresses` | array | IP addresses to assign to TUN in CIDR notation (e.g.,`[ "10.99.0.1/24", "2005:8a:9:11::3/64" ]`) |
 | `remote_subnets` | table | Maps hex public key to list of CIDRs to route via that node |
 
 System routes for all configured CIDRs are automatically installed when the TUN device starts and removed on shutdown. This works on Linux, Windows, and macOS.
@@ -347,7 +349,7 @@ Both nodes must be peered (directly or through the mesh) and built with `--featu
 [tunnel_routing]
 enable = true
 yggdrasil_routing = true
-ipv4_address = "10.99.0.2/24"
+ip_addresses = ["10.99.0.2/24"]
 
 [tunnel_routing.remote_subnets]
 # Route all IPv4 and IPv6 internet traffic via VPS
@@ -365,7 +367,7 @@ The `0.0.0.0/1` + `128.0.0.0/1` split covers all IPv4 without overriding the sys
 [tunnel_routing]
 enable = true
 yggdrasil_routing = true
-ipv4_address = "10.99.0.1/24"
+ip_addresses = ["10.99.0.1/24"]
 
 [tunnel_routing.remote_subnets]
 # Accept traffic from client's CKR subnet
@@ -403,33 +405,33 @@ curl ifconfig.me          # Should show VPS IPv4 address
 curl -6 ifconfig.me       # Should show VPS IPv6 address
 ```
 
-### Site-to-Site Tunnel
+### Dual-stack Site-to-Site Tunnel
 
-CKR can also connect two private networks. For example, to link `192.168.1.0/24` (Site A) with `192.168.2.0/24` (Site B):
+CKR can also connect two private networks. For example, to link `192.168.1.0/24` / `fd0a:1:1:1::1/64` (Site A) with `192.168.2.0/24` / `fd0a:1:1:2::1/64` (Site B): 
 
 **Site A:**
 ```toml
 [tunnel_routing]
 enable = true
-ipv4_address = "192.168.1.1/24"
+ip_addresses = ["192.168.1.1/24", "fd0a:1:1:1::1/64"]
 
 [tunnel_routing.remote_subnets]
-"<SITE_B_KEY>" = ["192.168.2.0/32"]
+"<SITE_B_KEY>" = ["192.168.2.0/32", "fd0a:1:1:2::1/128"]
 ```
 
 **Site B:**
 ```toml
 [tunnel_routing]
 enable = true
-ipv4_address = "192.168.2.1/24"
+ip_addresses = ["192.168.2.1/24", "fd0a:1:1:2::1/64"]
 
 [tunnel_routing.remote_subnets]
-"<SITE_A_KEY>" = ["192.168.1.0/32"]
+"<SITE_A_KEY>" = ["192.168.1.0/32", "fd0a:1:1:1::1/128"]
 ```
 
 Hosts on each side can then reach the other network through their Yggdrasil gateway node.
 
-### Private VPN (Multi-Node)
+### Private IPv4 VPN (Multi-Node)
 
 CKR can create a virtual private network where multiple nodes share a common IPv4 subnet and communicate directly over private IPs.
 Each node gets an address from the shared range (e.g., `10.99.0.0/24`) and has CKR routes pointing to every other node.
@@ -438,7 +440,7 @@ Each node gets an address from the shared range (e.g., `10.99.0.0/24`) and has C
 ```toml
 [tunnel_routing]
 enable = true
-ipv4_address = "10.99.0.1/24"
+ip_addresses = ["10.99.0.1/24"]
 
 [tunnel_routing.remote_subnets]
 "<NODE_B_KEY>" = ["10.99.0.2/32"]
@@ -449,7 +451,7 @@ ipv4_address = "10.99.0.1/24"
 ```toml
 [tunnel_routing]
 enable = true
-ipv4_address = "10.99.0.2/24"
+ip_addresses = ["10.99.0.2/24"]
 
 [tunnel_routing.remote_subnets]
 "<NODE_A_KEY>" = ["10.99.0.1/32"]
@@ -460,7 +462,7 @@ ipv4_address = "10.99.0.2/24"
 ```toml
 [tunnel_routing]
 enable = true
-ipv4_address = "10.99.0.3/24"
+ip_addresses = ["10.99.0.3/24"]
 
 [tunnel_routing.remote_subnets]
 "<NODE_A_KEY>" = ["10.99.0.1/32"]

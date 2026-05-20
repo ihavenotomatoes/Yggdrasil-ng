@@ -376,6 +376,7 @@ mod tests {
             enable: true,
             yggdrasil_routing: true,
             ipv4_address: String::new(),
+            ip_addresses: Vec::new(),
             remote_subnets: subnets,
             install_system_routes: true,
         }
@@ -410,6 +411,7 @@ mod tests {
             enable: false,
             yggdrasil_routing: true,
             ipv4_address: String::new(),
+            ip_addresses: Vec::new(),
             remote_subnets: subnets,
             install_system_routes: true,
         };
@@ -685,5 +687,20 @@ mod tests {
         // /16 should come before /8 (more specific first)
         assert_eq!(ckr.v4_routes[0].prefix.prefix_len(), 16);
         assert_eq!(ckr.v4_routes[1].prefix.prefix_len(), 8);
+    }
+
+    #[test]
+    fn test_ip_addresses_field_in_config() {
+        let config = TunnelRoutingConfig {
+            enable: true,
+            yggdrasil_routing: true,
+            ipv4_address: String::new(),
+            ip_addresses: vec!["10.99.0.1/24".to_string(), "2005:8a:9:11::3/64".to_string()],
+            remote_subnets: HashMap::new(),
+            install_system_routes: true,
+        };
+        let ckr = CryptoKey::new(&config, &SELF_KEY).unwrap();
+        assert!(ckr.v4_routes.is_empty());
+        assert!(ckr.v6_routes.is_empty());
     }
 }

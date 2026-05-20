@@ -91,9 +91,10 @@ listen = true
 # [tunnel_routing]
 # enable = true
 # yggdrasil_routing = true
-# ipv4_address = "10.99.0.1/24"  # IPv4 address for the TUN (exit-node/VPN use)
+# install_system_routes = true  # Automatically install system routing table entries for CKR.
+# ip_addresses = [ "10.99.0.1/24", "2005:8a:9:11::3/64" ]  # IPs for the TUN (VPN use) 
 # [tunnel_routing.remote_subnets]
-# "peer_public_key_hex" = ["10.0.0.0/24", "192.168.1.0/24"]
+# "peer_public_key_hex" = ["10.99.0.0/24", "192.168.1.0/24", "2005:8a:9:10::/64"]
 
 # Built-in stateful firewall. Default policy when enabled: drop inbound
 # from the mesh unless it's a reply to outbound traffic, comes from a
