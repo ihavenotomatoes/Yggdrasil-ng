@@ -25,9 +25,7 @@ This project aims to provide a lightweight, self-arranging, and secure mesh netw
 - Single binary for daemon and control commands (no separate `yggdrasilctl`)
 - Windows service support (runs as `yggdrasil-ng` service via SCM)
 - UniFFI bindings for Android
-
-**✅ Optional (feature-gated):**
-- Crypto-Key Routing (CKR) — tunnel arbitrary IPv4/IPv6 subnets through the mesh (`--features ckr`)
+- Crypto-Key Routing (CKR) — tunnel arbitrary IPv4/IPv6 subnets through the mesh (enabled by default via the `ckr` feature)
 
 **⏳ Planned Features:**
 - Multicast peer discovery on local networks
@@ -207,7 +205,7 @@ Yggdrasil-ng uses **TOML** format for configuration (unlike the Go version which
 | `node_info` | table | Custom node metadata (TOML table) |
 | `node_info_privacy` | bool | Hide node info from other nodes (default: false) |
 | `allowed_public_keys` | array | Whitelist of allowed peer keys (empty = allow all) |
-| `[tunnel_routing]` | table | CKR tunnel routing config (requires `ckr` feature) — see [docs/CKR.md](docs/CKR.md) |
+| `[tunnel_routing]` | table | CKR tunnel routing config (`ckr` feature, enabled by default) — see [docs/CKR.md](docs/CKR.md) |
 
 **Example minimal configuration:**
 
@@ -308,10 +306,16 @@ CKR enables tunneling arbitrary IPv4/IPv6 traffic through the Yggdrasil mesh by 
 This turns Yggdrasil into a point-to-point VPN — useful for exit-node setups, site-to-site tunnels, multi-node private VPNs,
 or handing out routable public IPv6 to home devices.
 
-CKR requires building with the `ckr` feature:
+CKR is part of the default feature set, so a standard build already includes it:
 
 ```bash
-cargo build --release --features ckr
+cargo build --release
+```
+
+To build without CKR, disable default features and re-enable the others:
+
+```bash
+cargo build --release --no-default-features --features ctl,tun,systemd
 ```
 
 See the **[full CKR guide](docs/CKR.md)** for the `[tunnel_routing]` configuration reference and worked examples:

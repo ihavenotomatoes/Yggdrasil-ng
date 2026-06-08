@@ -4,10 +4,16 @@
 
 CKR enables tunneling arbitrary IPv4/IPv6 traffic through the Yggdrasil mesh by mapping IP subnets to node public keys. This turns Yggdrasil into a point-to-point VPN — useful for exit-node setups, site-to-site tunnels, or routing specific subnets between nodes.
 
-CKR requires building with the `ckr` feature:
+CKR is part of the default feature set, so a standard build already includes it:
 
 ```bash
-cargo build --release --features ckr
+cargo build --release
+```
+
+To build without CKR, disable default features and re-enable the others:
+
+```bash
+cargo build --release --no-default-features --features ctl,tun,systemd
 ```
 
 ## Configuration
@@ -35,7 +41,7 @@ ip_addresses = ["10.99.0.1/24"]
 
 System routes for all configured CIDRs are automatically installed when the TUN device starts and removed on shutdown. This works on Linux, Windows, and macOS.
 
-The list of CIDRs for each public key supports additional syntax when the ckr feature is enabled (bare IPv4/IPv6 addresses without a subnet prefix are recognised as /32 and /128 respectively; this also applies to addresses beginning with "\~" and "!"):
+The list of CIDRs for each public key supports additional syntax (bare IPv4/IPv6 addresses without a subnet prefix are recognised as /32 and /128 respectively; this also applies to addresses beginning with "\~" and "!"):
 
 Prefix an IPv4 or IPv6 address/subnet with "\~" (e.g. "\~0.0.0.0/1", "\~10.0.0.0/8", "\~2000::/3") to establish CKR tunnels without installing system routes for those prefixes.
 Use "inetv4" to include the full list of IPv4 internet prefixes (excluding internal networks) for both CKR and system routes; use "\~inetv4" for CKR tunnels only without system routes.
@@ -46,7 +52,7 @@ The "!" prefix for exclusions applies to CKR ranges for both normal and "\~" pre
 
 This example shows how to route all internet traffic from a client through a VPS running Yggdrasil-ng with CKR.
 
-Both nodes must be peered (directly or through the mesh) and built with `--features ckr`.
+Both nodes must be peered (directly or through the mesh). CKR is included in a default build.
 
 ### Client configuration
 
@@ -200,7 +206,7 @@ The provider routes the prefix `2001:db8:0:1::/112` to the VPS:
 | `2001:db8:0:1::4` | Phone (via Yggdrasil) |
 | `2001:db8:0:1::5` | Home PC (via Yggdrasil) |
 
-The VPS and each device must be built with `--features ckr`, peered with each other (peer the devices **to the VPS over IPv4** — see the note below), and you need each node's public key (`yggdrasil getSelf`).
+The VPS and each device must be peered with each other (peer the devices **to the VPS over IPv4** — see the note below), and you need each node's public key (`yggdrasil getSelf`). CKR is included in a default build.
 
 ### VPS configuration
 
