@@ -7,6 +7,9 @@ use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
 use std::sync::Arc;
 
+#[cfg(windows)]
+use std::sync::OnceLock;
+
 use tun_rs::AsyncDevice;
 
 use crate::ipv6rwc::ReadWriteCloser;
@@ -15,6 +18,16 @@ use crate::ipv6rwc::ReadWriteCloser;
 /// interface when assigning DNS servers via `SetInterfaceDnsSettings`.
 #[cfg(windows)]
 const TUN_DEVICE_GUID: u128 = 0x8f59971a78724aa6b2eb061fc4e9d0a7;
+
+#[cfg(windows)]
+static SET_INTERFACE_DNS_PTR: OnceLock<
+    Option<
+        unsafe extern "system" fn(
+            windows::core::GUID,
+            *const windows::Win32::NetworkManagement::IpHelper::DNS_INTERFACE_SETTINGS,
+        ) -> windows::core::HRESULT,
+    >,
+> = OnceLock::new();
 
 /// TUN adapter: bridges a TUN network device with the IPv6 RWC.
 pub struct TunAdapter {
@@ -148,9 +161,16 @@ impl TunAdapter {
         // Assign DNS servers to the interface (Windows only). Non-fatal on error.
         #[cfg(windows)]
         if !dns_servers.is_empty() {
-            match set_interface_dns(dns_servers) {
-                Ok(()) => tracing::info!("Set DNS servers on TUN interface: {}", dns_servers.join(", ")),
-                Err(e) => tracing::error!("Failed to set DNS servers on TUN interface: {}", e),
+            if is_set_interface_dns_settings_supported() {
+                match set_interface_dns(dns_servers) {
+                    Ok(()) => tracing::info!("Set DNS servers on TUN interface: {}", dns_servers.join(", ")),
+                    Err(e) => tracing::error!("Failed to set DNS servers on TUN interface: {}", e),
+                }
+            } else {
+                tracing::warn!(
+                    "This Windows version does not support per-interface DNS settings \
+                     (SetInterfaceDnsSettings not found in iphlpapi.dll), skipping"
+                );
             }
         }
 
@@ -258,6 +278,63 @@ fn parse_ipv4_cidr(cidr: &str) -> Result<(Ipv4Addr, u8), String> {
     Ok((addr, prefix))
 }
 
+#[cfg(windows)]
+fn get_set_interface_dns_settings_ptr() -> Option<
+    unsafe extern "system" fn(
+        windows::core::GUID,
+        *const windows::Win32::NetworkManagement::IpHelper::DNS_INTERFACE_SETTINGS,
+    ) -> windows::core::HRESULT,
+> {
+    *SET_INTERFACE_DNS_PTR.get_or_init(|| {
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+        use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+
+        let dll_name: Vec<u16> = OsStr::new("iphlpapi.dll")
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+
+        let hmod_result = unsafe { GetModuleHandleW(windows::core::PCWSTR(dll_name.as_ptr())) };
+        let hmod = match hmod_result {
+            Ok(h) => h,
+            Err(_) => return None,
+        };
+        if hmod.is_invalid() {
+            return None;
+        }
+
+        let proc_name = b"SetInterfaceDnsSettings\0";
+        let proc = unsafe { GetProcAddress(hmod, windows::core::PCSTR(proc_name.as_ptr())) };
+        proc.map(|addr| unsafe { std::mem::transmute(addr) })
+    })
+}
+
+#[cfg(windows)]
+fn is_set_interface_dns_settings_supported() -> bool {
+    get_set_interface_dns_settings_ptr().is_some()
+}
+
+#[cfg(windows)]
+fn call_set_interface_dns_settings(
+    guid: windows::core::GUID,
+    settings: *const windows::Win32::NetworkManagement::IpHelper::DNS_INTERFACE_SETTINGS,
+) -> windows::core::Result<()> {
+    match get_set_interface_dns_settings_ptr() {
+        Some(func) => {
+            let hr = unsafe { func(guid, settings) };
+            if hr.is_ok() {
+                Ok(())
+            } else {
+                Err(windows::core::Error::from(hr))
+            }
+        }
+        None => Err(windows::core::Error::from(
+            windows::Win32::Foundation::ERROR_PROC_NOT_FOUND,
+        )),
+    }
+}
+
 /// Assign DNS servers to our TUN interface via `SetInterfaceDnsSettings`, and
 /// disable dynamic DNS registration for it. Targets the adapter by the fixed
 /// GUID we registered it with.
@@ -297,7 +374,7 @@ fn set_interface_dns(servers: &[String]) -> Result<(), String> {
 #[cfg(windows)]
 fn set_interface_registration(guid: windows::core::GUID, enabled: bool) -> Result<(), String> {
     use windows::Win32::NetworkManagement::IpHelper::{
-        SetInterfaceDnsSettings, DNS_INTERFACE_SETTINGS, DNS_INTERFACE_SETTINGS_VERSION1,
+        DNS_INTERFACE_SETTINGS, DNS_INTERFACE_SETTINGS_VERSION1,
         DNS_SETTING_REGISTRATION_ENABLED,
     };
 
@@ -308,11 +385,8 @@ fn set_interface_registration(guid: windows::core::GUID, enabled: bool) -> Resul
         ..Default::default()
     };
 
-    unsafe {
-        SetInterfaceDnsSettings(guid, &settings)
-            .ok()
-            .map_err(|e| format!("SetInterfaceDnsSettings (registration): {}", e))
-    }
+    call_set_interface_dns_settings(guid, &settings as *const _)
+        .map_err(|e| format!("SetInterfaceDnsSettings (registration): {}", e))
 }
 
 /// Set the nameserver list for a single address family on the interface.
@@ -321,7 +395,7 @@ fn set_interface_registration(guid: windows::core::GUID, enabled: bool) -> Resul
 fn apply_interface_dns(guid: windows::core::GUID, addrs: &[&str], ipv6: bool) -> Result<(), String> {
     use windows::core::PWSTR;
     use windows::Win32::NetworkManagement::IpHelper::{
-        SetInterfaceDnsSettings, DNS_INTERFACE_SETTINGS, DNS_INTERFACE_SETTINGS_VERSION1,
+        DNS_INTERFACE_SETTINGS, DNS_INTERFACE_SETTINGS_VERSION1,
         DNS_SETTING_IPV6, DNS_SETTING_NAMESERVER,
     };
 
@@ -349,9 +423,6 @@ fn apply_interface_dns(guid: windows::core::GUID, addrs: &[&str], ipv6: bool) ->
         ..Default::default()
     };
 
-    unsafe {
-        SetInterfaceDnsSettings(guid, &settings)
-            .ok()
-            .map_err(|e| format!("SetInterfaceDnsSettings (ipv6={}): {}", ipv6, e))
-    }
+    call_set_interface_dns_settings(guid, &settings as *const _)
+        .map_err(|e| format!("SetInterfaceDnsSettings (ipv6={}): {}", ipv6, e))
 }
