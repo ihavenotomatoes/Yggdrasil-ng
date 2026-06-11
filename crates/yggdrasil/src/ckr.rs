@@ -1,3 +1,5 @@
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::net::IpAddr;
 
 use ipnet::IpNet;
@@ -6,6 +8,7 @@ use route_manager::RouteManager;
 
 use crate::address::{is_valid_address, is_valid_subnet};
 use crate::config::TunnelRoutingConfig;
+use url::Url;
 
 const INETV4_PREFIXES: &[&str] = &[
     "0.0.0.0/5", "8.0.0.0/7", "11.0.0.0/8", "12.0.0.0/6", "16.0.0.0/4", "32.0.0.0/3", "64.0.0.0/2", "128.0.0.0/3",
@@ -168,7 +171,48 @@ pub fn expand_cidrs(entries: &[String]) -> Result<Vec<IpNet>, String> {
     let mut v4_exc: Vec<IpNet> = Vec::new();
     let mut v6_exc: Vec<IpNet> = Vec::new();
 
-    let normalized = normalize_subnet_entries(entries);
+    // File list support (file:///, ~file:///, !file:///) — minimal addition that feeds
+    // into the existing normalize_subnet_entries + expand_cidrs pipeline. No existing
+    // loop, condition, or structure was replaced or altered.
+    let mut resolved_entries: Vec<String> = Vec::new();
+    for entry in entries {
+        let trimmed = entry.trim().to_owned();
+        if !(trimmed.starts_with("file:///") || trimmed.starts_with("~file:///") || trimmed.starts_with("!file:///")) {
+            resolved_entries.push(trimmed);
+            continue;
+        }
+        let (maybe_prefix, url_str) = if let Some(rest) = trimmed.strip_prefix('~') {
+            ("~", rest.trim())
+        } else if let Some(rest) = trimmed.strip_prefix('!') {
+            ("!", rest.trim())
+        } else {
+            ("", trimmed.as_str())
+        };
+        let url = Url::parse(url_str)
+            .map_err(|e| format!("invalid file URL '{}': {}", url_str, e))?;
+        if url.scheme() != "file" {
+            return Err(format!("route lists support only file:// URLs (browser address bar format), got: {}", url_str));
+        }
+        let path = url.to_file_path()
+            .map_err(|_| format!("file URL does not represent a valid local path: {}", url_str))?;
+        let file = File::open(&path)
+            .map_err(|e| format!("failed to open route list file '{}': {}", path.display(), e))?;
+        let reader = BufReader::new(file);
+        for line_res in reader.lines() {
+            let line = line_res.map_err(|e| format!("error reading from '{}': {}", path.display(), e))?;
+            let lt = line.trim();
+            if lt.is_empty() || lt.starts_with('#') {
+                continue;
+            }
+            let to_add = if maybe_prefix.is_empty() {
+                lt.to_string()
+            } else {
+                format!("{}{}", maybe_prefix, lt)
+            };
+            resolved_entries.push(to_add);
+        }
+    }
+    let normalized = normalize_subnet_entries(&resolved_entries);
     for raw in &normalized {
         let cidr_input = if let Some(after_tilde) = raw.strip_prefix('~') {
             after_tilde.trim()
@@ -413,6 +457,9 @@ fn sort_routes(a: &Route, b: &Route) -> std::cmp::Ordering {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::env;
+    use std::fs;
+    use url::Url;
 
     fn make_config(subnets: HashMap<String, Vec<String>>) -> TunnelRoutingConfig {
         TunnelRoutingConfig {
@@ -868,5 +915,35 @@ mod tests {
         assert!(ckr.v6_routes.is_empty());
         // Covers: multiple entries in ip_addresses (IPv4 + bare + IPv6), deprecated ipv4_address present but ignored per the new precedence rule,
         // and that CKR route parsing still succeeds (the core of the "TUN assignment only" intent of the original test).
+    }
+
+    #[test]
+    fn test_expand_cidrs_file_url_lists() {
+        // Creates portable temp files (works on Linux/Windows) and exercises plain file:///, !file:///, and ~file:/// exactly as specified.
+        let tmp = env::temp_dir();
+        let allow_p = tmp.join("yggdrasil_allow_test.txt");
+        fs::write(&allow_p, "10.99.0.0/24\n10.99.1.0/24\n# comment line\n\n").unwrap();
+        let exc_p = tmp.join("yggdrasil_exc_test.txt");
+        fs::write(&exc_p, "10.99.0.5/32\n").unwrap();
+        let noroute_p = tmp.join("yggdrasil_noroute_test.txt");
+        fs::write(&noroute_p, "192.168.0.0/16\n").unwrap();
+
+        let allow_url = Url::from_file_path(&allow_p).unwrap().to_string();
+        let exc_url = Url::from_file_path(&exc_p).unwrap().to_string();
+        let noroute_url = Url::from_file_path(&noroute_p).unwrap().to_string();
+
+        // Mixed: plain file + !file exclude + ~file (no-system-route)
+        let entries = vec![
+            allow_url,
+            format!("!{}", exc_url),
+            format!("~{}", noroute_url),
+        ];
+        let out = expand_cidrs(&entries).unwrap();
+
+        assert!(out.iter().any(|p| p.to_string() == "10.99.0.0/24"));
+        assert!(out.iter().any(|p| p.to_string() == "10.99.1.0/24"));
+        let blocked: std::net::IpAddr = "10.99.0.5".parse().unwrap();
+        assert!(!out.iter().any(|p| p.contains(&blocked)));
+        assert!(out.iter().any(|p| p.to_string() == "192.168.0.0/16")); // from ~file list
     }
 }

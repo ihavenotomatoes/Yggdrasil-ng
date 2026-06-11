@@ -192,6 +192,10 @@ pub struct TunnelRoutingConfig {
     /// - "!CIDR" (or !bare IP) → exclude from CKR (applies to both normal and ‘~’ entries)
     /// - "inetv4" / "~inetv4" → full public IPv4 internet (excl. internals) +/– routes
     /// - "inetv6" / "~inetv6" → 2000::/3 +/– routes
+    /// - "file:///absolute/path/to/list.txt"  → include CIDRs/IPs from the text file
+    /// - "~file:///absolute/path/to/list.txt" → CKR-only from the file (no system routes)
+    /// - "!file:///absolute/path/to/list.txt" → exclude all CIDRs/IPs listed in the file
+    ///   (blank lines and `#`-prefixed lines in the file are ignored)
     #[serde(default)]
     pub remote_subnets: HashMap<String, Vec<String>>,
 
