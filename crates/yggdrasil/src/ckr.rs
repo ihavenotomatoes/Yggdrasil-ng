@@ -70,7 +70,7 @@ impl CryptoKey {
                             ));
                         }
                         if v6_routes.iter().any(|r| r.prefix == prefix) {
-                            return Err(format!("duplicate remote subnet: {}", prefix));
+                            continue;
                         }
                         v6_routes.push(Route {
                             prefix,
@@ -79,7 +79,7 @@ impl CryptoKey {
                     }
                     IpNet::V4(_) => {
                         if v4_routes.iter().any(|r| r.prefix == prefix) {
-                            return Err(format!("duplicate remote subnet: {}", prefix));
+                            continue;
                         }
                         v4_routes.push(Route {
                             prefix,
@@ -595,8 +595,8 @@ mod tests {
             dummy_key_hex(),
             vec!["10.0.0.0/24".to_string(), "10.0.0.0/24".to_string()],
         );
-        let result = CryptoKey::new(&make_config(subnets), &SELF_KEY);
-        assert!(result.is_err());
+        let ckr = CryptoKey::new(&make_config(subnets), &SELF_KEY).unwrap();
+        assert_eq!(ckr.v4_routes.len(), 1);
     }
 
     #[test]
