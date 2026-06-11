@@ -195,8 +195,14 @@ pub fn expand_cidrs(entries: &[String]) -> Result<Vec<IpNet>, String> {
         }
         let path = url.to_file_path()
             .map_err(|_| format!("file URL does not represent a valid local path: {}", url_str))?;
-        let file = File::open(&path)
-            .map_err(|e| format!("failed to open route list file '{}': {}", path.display(), e))?;
+        let file = match File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::warn!("CKR route list file missing, skipping (file will not be used): {}", path.display());
+                continue;
+            }
+            Err(e) => return Err(format!("failed to open route list file '{}': {}", path.display(), e)),
+        };
         let reader = BufReader::new(file);
         for line_res in reader.lines() {
             let line = line_res.map_err(|e| format!("error reading from '{}': {}", path.display(), e))?;
@@ -932,11 +938,14 @@ mod tests {
         let exc_url = Url::from_file_path(&exc_p).unwrap().to_string();
         let noroute_url = Url::from_file_path(&noroute_p).unwrap().to_string();
 
-        // Mixed: plain file + !file exclude + ~file (no-system-route)
+        // Mixed: plain file + !file exclude + ~file (no-system-route) + one missing file (must warn + continue, not fail)
+        let missing_path = tmp.join("nonexistent_yggdrasil_list.txt");
+        let missing_url = Url::from_file_path(&missing_path).unwrap().to_string();
         let entries = vec![
             allow_url,
             format!("!{}", exc_url),
             format!("~{}", noroute_url),
+            missing_url, // missing file — should only produce a warning and be skipped
         ];
         let out = expand_cidrs(&entries).unwrap();
 
