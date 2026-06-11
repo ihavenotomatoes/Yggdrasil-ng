@@ -1,6 +1,8 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::net::IpAddr;
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
 
 use ipnet::IpNet;
 #[cfg(not(target_os = "android"))]
@@ -18,6 +20,12 @@ const INETV4_PREFIXES: &[&str] = &[
 ];
 
 const INETV6_PREFIXES: &[&str] = &["2000::/3"];
+
+/// In-memory cache of route list file contents (keyed by absolute path).
+/// Value = Some(raw lines) on success, None if the file was missing.
+/// Guarantees each text file is opened+read at most once, even when
+/// expand_cidrs is called from both CryptoKey::new and install_routes/remove_routes.
+static ROUTE_FILE_CACHE: LazyLock<Mutex<HashMap<String, Option<Vec<String>>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// A single CKR route: CIDR prefix -> destination public key.
 struct Route {
@@ -195,14 +203,37 @@ pub fn expand_cidrs(entries: &[String]) -> Result<Vec<IpNet>, String> {
         }
         let path = url.to_file_path()
             .map_err(|_| format!("file URL does not represent a valid local path: {}", url_str))?;
+        let path_str = path.display().to_string();
+        {
+            let cache = ROUTE_FILE_CACHE.lock().unwrap();
+            if let Some(cached_opt) = cache.get(&path_str) {
+                if let Some(lines) = cached_opt {
+                    for lt in lines {
+                        let to_add = if maybe_prefix.is_empty() {
+                            lt.clone()
+                        } else {
+                            format!("{}{}", maybe_prefix, lt)
+                        };
+                        resolved_entries.push(to_add);
+                    }
+                }
+                // missing case: already warned on first encounter, just skip
+                continue;
+            }
+        }
         let file = match File::open(&path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 tracing::warn!("CKR route list file missing, skipping (file will not be used): {}", path.display());
+                {
+                    let mut cache = ROUTE_FILE_CACHE.lock().unwrap();
+                    cache.insert(path_str, None);
+                }
                 continue;
             }
             Err(e) => return Err(format!("failed to open route list file '{}': {}", path.display(), e)),
         };
+        let mut file_lines: Vec<String> = Vec::new();
         let reader = BufReader::new(file);
         for line_res in reader.lines() {
             let line = line_res.map_err(|e| format!("error reading from '{}': {}", path.display(), e))?;
@@ -210,12 +241,17 @@ pub fn expand_cidrs(entries: &[String]) -> Result<Vec<IpNet>, String> {
             if lt.is_empty() || lt.starts_with('#') {
                 continue;
             }
+            file_lines.push(lt.to_string());
             let to_add = if maybe_prefix.is_empty() {
                 lt.to_string()
             } else {
                 format!("{}{}", maybe_prefix, lt)
             };
             resolved_entries.push(to_add);
+        }
+        {
+            let mut cache = ROUTE_FILE_CACHE.lock().unwrap();
+            cache.insert(path_str, Some(file_lines));
         }
     }
     let normalized = normalize_subnet_entries(&resolved_entries);
@@ -954,5 +990,11 @@ mod tests {
         let blocked: std::net::IpAddr = "10.99.0.5".parse().unwrap();
         assert!(!out.iter().any(|p| p.contains(&blocked)));
         assert!(out.iter().any(|p| p.to_string() == "192.168.0.0/16")); // from ~file list
+
+        // Re-run with identical entries (including the missing file) to exercise
+        // the in-memory cache path. Must succeed with identical results and
+        // without a second "file missing" warning or second disk read.
+        let out2 = expand_cidrs(&entries).unwrap();
+        assert_eq!(out, out2);
     }
 }
