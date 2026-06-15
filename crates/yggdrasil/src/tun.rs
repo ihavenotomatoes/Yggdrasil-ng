@@ -52,7 +52,7 @@ impl TunAdapter {
         _subnet: &str,
         mtu: u16,
         #[cfg(windows)] dns_servers: &[String],
-        #[cfg(feature = "ckr")] ckr_config: Option<&crate::config::TunnelRoutingConfig>,
+        #[cfg(feature = "ckr")] _ckr_config: Option<&crate::config::TunnelRoutingConfig>,
         #[cfg(feature = "ckr")] _self_key: &[u8; 32],
     ) -> Result<Self, String> {
         if name == "none" {
@@ -75,57 +75,12 @@ impl TunAdapter {
             .parse()
             .map_err(|e| format!("invalid address '{}': {}", ip_str, e))?;
 
-        // Create TUN device using tun-rs DeviceBuilder
+        // Create TUN device using tun-rs DeviceBuilder (only primary Yggdrasil IPv6)
         #[allow(unused_mut)]
         let mut builder = tun_rs::DeviceBuilder::new()
             .name(tun_name)
             .ipv6(ip, 7u8)
             .mtu(mtu);
-
-        // Assign IPv4 address to TUN if configured in CKR
-        #[cfg(feature = "ckr")]
-        if let Some(ckr_cfg) = ckr_config {
-            if ckr_cfg.enable && !ckr_cfg.ipv4_address.is_empty() && ckr_cfg.ip_addresses.iter().all(|s| s.is_empty()) {
-                let (v4_addr, v4_prefix) = parse_ipv4_cidr(&ckr_cfg.ipv4_address)?;
-                builder = builder.ipv4(v4_addr, v4_prefix, None);
-                tracing::info!("CKR: assigning IPv4 address {} to TUN", ckr_cfg.ipv4_address);
-            }
-        }
-
-        #[cfg(feature = "ckr")]
-        let mut ipv4_addrs: Vec<(Ipv4Addr, u8)> = Vec::new();
-
-        // Assign IP addresses to TUN if configured in CKR
-        #[cfg(feature = "ckr")]
-        if let Some(ckr_cfg) = ckr_config {
-            for cidr in &ckr_cfg.ip_addresses {
-                if ckr_cfg.enable && !cidr.is_empty() {
-                    if cidr.contains(':') {
-                        // IPv6 path - reuse the same split/parse pattern already present 
-                        // in parse_ipv4_cidr and the existing Yggdrasil IPv6 handling above
-                        let parts: Vec<&str> = cidr.split('/').collect();
-                        if parts.len() == 1 || parts.len() == 2 {
-                            let ip_str = parts[0];
-                            let prefix: u8 = if parts.len() == 1 {
-                                128
-                            } else {
-                                parts[1].parse().map_err(|e| format!("invalid IPv6 prefix in ip_addresses '{}': {}", cidr, e))?
-                            };
-                            let ip: Ipv6Addr = ip_str.parse().map_err(|e| format!("invalid IPv6 in ip_addresses '{}': {}", cidr, e))?;
-                            builder = builder.ipv6(ip, prefix);
-                            tracing::info!("CKR: assigning IPv6 address {} to TUN", cidr);
-                        } else {
-                            return Err(format!("invalid IPv6 CIDR in ip_addresses '{}': expected addr or addr/prefix", cidr));
-                        }
-                    } else {
-                        // IPv4 path - reuse the exact existing parse_ipv4_cidr function
-                        let (v4_addr, v4_prefix) = parse_ipv4_cidr(cidr)?;
-                        ipv4_addrs.push((v4_addr, v4_prefix));
-                        tracing::info!("CKR: assigning IPv4 address {} to TUN", cidr);
-                    }
-                }
-            }
-        }
 
         #[cfg(windows)]
         {
@@ -138,15 +93,6 @@ impl TunAdapter {
             .map_err(|e| format!("failed to create TUN device: {}", e))?;
 
         let device = Arc::new(device);
-
-        #[cfg(feature = "ckr")]
-        for (v4_addr, v4_prefix) in ipv4_addrs {
-            device
-                .add_address_v4(v4_addr, v4_prefix)
-                .map_err(|e| format!("failed to add IPv4 address to TUN: {}", e))?;
-        }
-
-        tracing::info!("TUN device '{}' created with address {} and MTU {}", tun_name, addr, mtu);
 
         tracing::info!("TUN device '{}' created with address {} and MTU {}", tun_name, addr, mtu);
 
@@ -200,6 +146,66 @@ impl TunAdapter {
     /// before tokio's runtime drop has a chance to abort the I/O tasks. If
     /// the Wintun adapter isn't closed by then, it gets orphaned in the
     /// device tree and the next startup can't recreate it.
+    
+    /// Assign additional CKR IP addresses (from legacy `ipv4_address` and `ip_addresses`)
+    /// to an already running TUN interface. Called from main.rs after multicast
+    /// to achieve the required startup ordering (Stage 2).
+    /// Uses post-creation add_address_v* methods which are supported by tun_rs.
+    #[cfg(feature = "ckr")]
+    pub fn assign_ckr_ip_addresses(&self, ckr_config: &crate::config::TunnelRoutingConfig) -> Result<(), String> {
+        if !ckr_config.enable {
+            return Ok(());
+        }
+
+        // Legacy ipv4_address path (only if ip_addresses is empty)
+        if !ckr_config.ipv4_address.is_empty() && ckr_config.ip_addresses.iter().all(|s| s.is_empty()) {
+            let (v4_addr, v4_prefix) = parse_ipv4_cidr(&ckr_config.ipv4_address)?;
+            self.device
+                .add_address_v4(v4_addr, v4_prefix)
+                .map_err(|e| format!("failed to add IPv4 address to TUN: {}", e))?;
+            tracing::info!("CKR: assigning IPv4 address {} to TUN", ckr_config.ipv4_address);
+        }
+
+        let mut ipv4_addrs: Vec<(Ipv4Addr, u8)> = Vec::new();
+
+        for cidr in &ckr_config.ip_addresses {
+            if !cidr.is_empty() {
+                if cidr.contains(':') {
+                    // IPv6 path
+                    let parts: Vec<&str> = cidr.split('/').collect();
+                    if parts.len() == 1 || parts.len() == 2 {
+                        let ip_str = parts[0];
+                        let prefix: u8 = if parts.len() == 1 {
+                            128
+                        } else {
+                            parts[1].parse().map_err(|e| format!("invalid IPv6 prefix in ip_addresses '{}': {}", cidr, e))?
+                        };
+                        let ip: Ipv6Addr = ip_str.parse().map_err(|e| format!("invalid IPv6 in ip_addresses '{}': {}", cidr, e))?;
+                        self.device
+                            .add_address_v6(ip, prefix)
+                            .map_err(|e| format!("failed to add IPv6 address to TUN: {}", e))?;
+                        tracing::info!("CKR: assigning IPv6 address {} to TUN", cidr);
+                    } else {
+                        return Err(format!("invalid IPv6 CIDR in ip_addresses '{}': expected addr or addr/prefix", cidr));
+                    }
+                } else {
+                    // IPv4 path - reuse the exact existing parse_ipv4_cidr function
+                    let (v4_addr, v4_prefix) = parse_ipv4_cidr(cidr)?;
+                    ipv4_addrs.push((v4_addr, v4_prefix));
+                    tracing::info!("CKR: assigning IPv4 address {} to TUN", cidr);
+                }
+            }
+        }
+
+        for (v4_addr, v4_prefix) in ipv4_addrs {
+            self.device
+                .add_address_v4(v4_addr, v4_prefix)
+                .map_err(|e| format!("failed to add IPv4 address to TUN: {}", e))?;
+        }
+
+        Ok(())
+    }
+
     pub async fn close(self) {
         let TunAdapter { device, read_handle, write_handle } = self;
         read_handle.abort();

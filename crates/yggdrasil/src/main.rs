@@ -367,6 +367,22 @@ async fn run_node(
         tracing::warn!("Multicast peer discovery disabled: {}", e);
     }
 
+    // Assign additional CKR IP addresses (from ip_addresses / legacy ipv4_address)
+    // to the already running TUN interface. This is done after multicast peer
+    // discovery so the "CKR: assigning ..." logs appear in the required order
+    // (between "Multicast peer discovery started" and system route installation).
+    // We call the new method on the TunAdapter that was created earlier.
+    #[cfg(feature = "ckr")]
+    if config.if_name != "none" {
+        if let Some(ref tun_adapter) = tun {
+            if config.tunnel_routing.enable {
+                if let Err(e) = tun_adapter.assign_ckr_ip_addresses(&config.tunnel_routing) {
+                    tracing::error!("Failed to assign CKR IP addresses to TUN: {}", e);
+                }
+            }
+        }
+    }
+
     // Install CKR system routes late — after multicast peer discovery has started.
     // This moves "Installed route" logs to the very end of startup (between
     // "Multicast peer discovery started" and "Yggdrasil NG started").
