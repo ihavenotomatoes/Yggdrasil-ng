@@ -367,6 +367,25 @@ async fn run_node(
         tracing::warn!("Multicast peer discovery disabled: {}", e);
     }
 
+    // Install CKR system routes late — after multicast peer discovery has started.
+    // This moves "Installed route" logs to the very end of startup (between
+    // "Multicast peer discovery started" and "Yggdrasil NG started").
+    // Routes are now added only when the Yggdrasil network is fully operational.
+    // The early installation block was removed from TunAdapter::new.
+    // We reuse the exact same tun_name computation and error handling pattern
+    // that already exists in the shutdown/remove_routes block below.
+    #[cfg(feature = "ckr")]
+    if config.tunnel_routing.enable && config.tunnel_routing.install_system_routes && config.if_name != "none" {
+        let tun_name = if config.if_name == "auto" {
+            if cfg!(windows) { "Yggdrasil" } else { "ygg0" }
+        } else {
+            &config.if_name
+        };
+        if let Err(e) = yggdrasil::ckr::install_routes(&config.tunnel_routing, tun_name, core.public_key()) {
+            tracing::error!("Failed to install CKR routes: {}", e);
+        }
+    }
+
     // Wait for shutdown signal
     tracing::info!("Yggdrasil NG started");
 

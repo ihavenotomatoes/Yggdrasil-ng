@@ -53,7 +53,7 @@ impl TunAdapter {
         mtu: u16,
         #[cfg(windows)] dns_servers: &[String],
         #[cfg(feature = "ckr")] ckr_config: Option<&crate::config::TunnelRoutingConfig>,
-        #[cfg(feature = "ckr")] self_key: &[u8; 32],
+        #[cfg(feature = "ckr")] _self_key: &[u8; 32],
     ) -> Result<Self, String> {
         if name == "none" {
             return Err("TUN disabled".to_string());
@@ -148,15 +148,11 @@ impl TunAdapter {
 
         tracing::info!("TUN device '{}' created with address {} and MTU {}", tun_name, addr, mtu);
 
-        // Install CKR routes if configured
-        #[cfg(feature = "ckr")]
-        if let Some(ckr_cfg) = ckr_config {
-            if ckr_cfg.install_system_routes {
-                if let Err(e) = crate::ckr::install_routes(ckr_cfg, tun_name, self_key) {
-                    tracing::error!("Failed to install CKR routes: {}", e);
-                }
-            }
-        }
+        tracing::info!("TUN device '{}' created with address {} and MTU {}", tun_name, addr, mtu);
+
+        // CKR system route installation moved to main.rs (after multicast)
+        // to ensure routes are added only after Yggdrasil network is fully up.
+        // Early call removed to support correct startup ordering (Stage 1+).
 
         // Assign DNS servers to the interface (Windows only). Non-fatal on error.
         #[cfg(windows)]
