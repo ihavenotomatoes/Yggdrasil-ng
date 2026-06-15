@@ -367,6 +367,12 @@ async fn run_node(
         tracing::warn!("Multicast peer discovery disabled: {}", e);
     }
 
+    // Initialize CKR routing table (CryptoKey) after multicast has started.
+    // This moves the "CKR: ignoring ..." and "Active CKR routes" logs
+    // to the position required by Stage 3 (before TUN IP assignment).
+    #[cfg(feature = "ckr")]
+    rwc.init_crypto_key(&config.tunnel_routing, core.public_key());
+    
     // Assign additional CKR IP addresses (from ip_addresses / legacy ipv4_address)
     // to the already running TUN interface. This is done after multicast peer
     // discovery so the "CKR: assigning ..." logs appear in the required order

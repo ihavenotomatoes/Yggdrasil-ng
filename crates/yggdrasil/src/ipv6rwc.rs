@@ -45,7 +45,7 @@ pub struct ReadWriteCloser {
     buffers: Mutex<KeyStoreBuffers>,
     mtu: u64,
     #[cfg(feature = "ckr")]
-    ckr: Option<CryptoKey>,
+    ckr: ArcSwap<Option<CryptoKey>>,
     firewall: Option<Arc<Firewall>>,
 }
 
@@ -65,21 +65,14 @@ impl ReadWriteCloser {
     pub fn new(
         core: Arc<Core>,
         mtu: u64,
-        #[cfg(feature = "ckr")] ckr_config: Option<&TunnelRoutingConfig>,
+        #[cfg(feature = "ckr")] _ckr_config: Option<&TunnelRoutingConfig>,
         firewall: Option<Arc<Firewall>>,
     ) -> Arc<Self> {
         let address = *core.address();
         let subnet = *core.subnet();
 
         #[cfg(feature = "ckr")]
-        let ckr = ckr_config
-            .filter(|c| c.enable)
-            .map(|c| {
-                CryptoKey::new(c, core.public_key()).unwrap_or_else(|e| {
-                    tracing::error!("Failed to configure CKR: {}", e);
-                    panic!("CKR configuration error: {}", e);
-                })
-            });
+        let ckr = ArcSwap::from_pointee(None);
 
         Arc::new(Self {
             core,
@@ -100,6 +93,22 @@ impl ReadWriteCloser {
             ckr,
             firewall,
         })
+    }
+
+    /// Initialize CKR routing table (CryptoKey) after the Yggdrasil network
+    /// is already running. Called from main.rs after multicast peer discovery.
+    /// This moves the "ignoring" and "Active CKR routes" logs to the correct
+    /// position in startup order (Stage 3).
+    #[cfg(feature = "ckr")]
+    pub fn init_crypto_key(&self, config: &TunnelRoutingConfig, self_key: &[u8; 32]) {
+        if !config.enable {
+            return;
+        }
+        let ckr = CryptoKey::new(config, self_key).unwrap_or_else(|e| {
+            tracing::error!("Failed to configure CKR: {}", e);
+            panic!("CKR configuration error: {}", e);
+        });
+        self.ckr.store(std::sync::Arc::new(Some(ckr)));
     }
 
     /// Read a packet from the network (Core) destined for the TUN.
@@ -123,7 +132,9 @@ impl ReadWriteCloser {
             let is_ip6 = packet[0] & 0xf0 == 0x60;
 
             #[cfg(feature = "ckr")]
-            let ckr_active = self.ckr.is_some();
+            let ckr_guard = self.ckr.load();
+            #[cfg(feature = "ckr")]
+            let ckr_active = ckr_guard.is_some();
             #[cfg(not(feature = "ckr"))]
             let ckr_active = false;
 
@@ -160,7 +171,7 @@ impl ReadWriteCloser {
 
             // CKR path: dual-mode validation
             #[cfg(feature = "ckr")]
-            if let Some(ref ckr) = self.ckr {
+            if let Some(ref ckr) = **ckr_guard {
                 let accepted = self.ckr_read_validate(ckr, packet, is_ip4, is_ip6, &from_key).await;
                 if !accepted {
                     continue;
@@ -238,7 +249,7 @@ impl ReadWriteCloser {
 
         // CKR path: handle IPv4 and non-Yggdrasil IPv6 destinations
         #[cfg(feature = "ckr")]
-        if let Some(ref ckr) = self.ckr {
+        if let Some(ref ckr) = **self.ckr.load() {
             let is_ip4 = buf.first().map_or(false, |b| b & 0xf0 == 0x40);
             if !is_ip4 && !is_ip6 {
                 return Ok(buf.len()); // silently drop non-IP
