@@ -184,16 +184,18 @@ pub struct TunnelRoutingConfig {
 
     /// Remote subnets: maps hex public key -> list of CIDRs (bare IP addresses 
     /// without prefix are supported and treated as /32 for IPv4 or /128 for IPv6; 
-    /// this also applies to addresses beginning with "~" and "!").
+    /// this also applies to addresses beginning with "~", "_" and "!").
     /// Example: { "aabbcc...01": ["10.0.0.0/24", "192.168.1.0/24"] }
     /// Supported syntax in the lists:
     /// - "CIDR" (or bare IP) → CKR + system route
     /// - "~CIDR" (or ~bare IP) → CKR tunnel only (no system route)
-    /// - "!CIDR" (or !bare IP) → exclude from CKR (applies to both normal and ‘~’ entries)
+    /// - "_CIDR" (or _bare IP) → system route only (no CKR, for advanced users)   
+    /// - "!CIDR" (or !bare IP) → exclude from CKR (applies to normal "~" and "_" entries)
     /// - "inetv4" / "~inetv4" → full public IPv4 internet (excl. internals) +/– routes
     /// - "inetv6" / "~inetv6" → 2000::/3 +/– routes
     /// - "file:///absolute/path/to/list.txt"  → include CIDRs/IPs from the text file
     /// - "~file:///absolute/path/to/list.txt" → CKR-only from the file (no system routes)
+    /// - "_file:///absolute/path/to/list.txt" → system routes only from the file (no CKR)    
     /// - "!file:///absolute/path/to/list.txt" → exclude all CIDRs/IPs listed in the file
     ///   (blank lines and `#`-prefixed lines in the file are ignored)
     #[serde(default)]

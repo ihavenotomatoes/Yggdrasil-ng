@@ -68,7 +68,15 @@ impl CryptoKey {
                 );
                 continue;
             }
-            for prefix in expand_cidrs(cidrs)? {
+
+            // "_" prefix = system routes only (no CKR). Filter them out here.
+            let ckr_cidrs: Vec<String> = cidrs
+                .iter()
+                .filter(|s| !s.trim().starts_with('_'))
+                .cloned()
+                .collect();
+
+            for prefix in expand_cidrs(&ckr_cidrs)? {
                 match prefix {
                     IpNet::V6(_) => {
                         if is_yggdrasil_destination(prefix.addr()) {
@@ -179,13 +187,13 @@ pub fn expand_cidrs(entries: &[String]) -> Result<Vec<IpNet>, String> {
     let mut v4_exc: Vec<IpNet> = Vec::new();
     let mut v6_exc: Vec<IpNet> = Vec::new();
 
-    // File list support (file:///, ~file:///, !file:///) — minimal addition that feeds
-    // into the existing normalize_subnet_entries + expand_cidrs pipeline. No existing
-    // loop, condition, or structure was replaced or altered.
+    // File list support (file:///, ~file:///, !file:///, _file:///) — minimal addition.
+    // "_" prefix means: add to system routes only (no CKR entry).
+    // "!" exclusions apply to lists from "_" files as well.
     let mut resolved_entries: Vec<String> = Vec::new();
     for entry in entries {
         let trimmed = entry.trim().to_owned();
-        if !(trimmed.starts_with("file:///") || trimmed.starts_with("~file:///") || trimmed.starts_with("!file:///")) {
+        if !(trimmed.starts_with("file:///") || trimmed.starts_with("~file:///") || trimmed.starts_with("!file:///") || trimmed.starts_with("_file:///")) {
             resolved_entries.push(trimmed);
             continue;
         }
@@ -193,6 +201,8 @@ pub fn expand_cidrs(entries: &[String]) -> Result<Vec<IpNet>, String> {
             ("~", rest.trim())
         } else if let Some(rest) = trimmed.strip_prefix('!') {
             ("!", rest.trim())
+        } else if let Some(rest) = trimmed.strip_prefix('_') {
+            ("_", rest.trim())
         } else {
             ("", trimmed.as_str())
         };
@@ -256,8 +266,8 @@ pub fn expand_cidrs(entries: &[String]) -> Result<Vec<IpNet>, String> {
     }
     let normalized = normalize_subnet_entries(&resolved_entries);
     for raw in &normalized {
-        let cidr_input = if let Some(after_tilde) = raw.strip_prefix('~') {
-            after_tilde.trim()
+        let cidr_input = if let Some(after) = raw.strip_prefix('~').or_else(|| raw.strip_prefix('_')) {
+            after.trim()
         } else {
             raw.as_str()
         };
@@ -355,8 +365,10 @@ fn normalize_subnet_entries(entries: &[String]) -> Vec<String> {
         match trimmed {
             "inetv4" => normalized.extend(INETV4_PREFIXES.iter().map(|&s| s.to_string())),
             "~inetv4" => normalized.extend(INETV4_PREFIXES.iter().map(|&s| format!("~{}", s))),
+            "_inetv4" => normalized.extend(INETV4_PREFIXES.iter().map(|&s| format!("_{}", s))),
             "inetv6" => normalized.extend(INETV6_PREFIXES.iter().map(|&s| s.to_string())),
             "~inetv6" => normalized.extend(INETV6_PREFIXES.iter().map(|&s| format!("~{}", s))),
+            "_inetv6" => normalized.extend(INETV6_PREFIXES.iter().map(|&s| format!("_{}", s))),
             _ => normalized.push(trimmed.to_string()),
         }
     }
@@ -977,11 +989,16 @@ mod tests {
         // Mixed: plain file + !file exclude + ~file (no-system-route) + one missing file (must warn + continue, not fail)
         let missing_path = tmp.join("nonexistent_yggdrasil_list.txt");
         let missing_url = Url::from_file_path(&missing_path).unwrap().to_string();
+        let system_only_p = tmp.join("yggdrasil_system_only_test.txt");
+        fs::write(&system_only_p, "172.16.0.0/12\n").unwrap();
+        let system_only_url = Url::from_file_path(&system_only_p).unwrap().to_string();
+
         let entries = vec![
             allow_url,
             format!("!{}", exc_url),
             format!("~{}", noroute_url),
-            missing_url, // missing file — should only produce a warning and be skipped
+            format!("_{}", system_only_url),   // NEW: system routes only, no CKR
+            missing_url,
         ];
         let out = expand_cidrs(&entries).unwrap();
 
@@ -990,7 +1007,7 @@ mod tests {
         let blocked: std::net::IpAddr = "10.99.0.5".parse().unwrap();
         assert!(!out.iter().any(|p| p.contains(&blocked)));
         assert!(out.iter().any(|p| p.to_string() == "192.168.0.0/16")); // from ~file list
-
+        assert!(out.iter().any(|p| p.to_string() == "172.16.0.0/12")); // from _file list (system routes only)
         // Re-run with identical entries (including the missing file) to exercise
         // the in-memory cache path. Must succeed with identical results and
         // without a second "file missing" warning or second disk read.
