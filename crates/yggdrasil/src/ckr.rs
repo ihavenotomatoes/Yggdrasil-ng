@@ -12,6 +12,11 @@ use crate::address::{is_valid_address, is_valid_subnet};
 use crate::config::TunnelRoutingConfig;
 use url::Url;
 
+use std::fs;
+use std::io::Read;
+use std::path::PathBuf;
+use std::time::Duration;
+
 const INETV4_PREFIXES: &[&str] = &[
     "0.0.0.0/5", "8.0.0.0/7", "11.0.0.0/8", "12.0.0.0/6", "16.0.0.0/4", "32.0.0.0/3", "64.0.0.0/2", "128.0.0.0/3",
     "160.0.0.0/5", "168.0.0.0/6", "172.0.0.0/12", "172.32.0.0/11", "172.64.0.0/10", "172.128.0.0/9", "173.0.0.0/8", "174.0.0.0/7",
@@ -187,13 +192,15 @@ pub fn expand_cidrs(entries: &[String]) -> Result<Vec<IpNet>, String> {
     let mut v4_exc: Vec<IpNet> = Vec::new();
     let mut v6_exc: Vec<IpNet> = Vec::new();
 
-    // File list support (file:///, ~file:///, !file:///, _file:///) — minimal addition.
-    // "_" prefix means: add to system routes only (no CKR entry).
-    // "!" exclusions apply to lists from "_" files as well.
+    // File and HTTP/HTTPS route list support (http://, https:// with optional
+    // ~, _, ! prefixes) — minimal addition for stage 1 download.
+    // "_" prefix = system routes only (no CKR). "!" exclusions apply to lists too.
     let mut resolved_entries: Vec<String> = Vec::new();
     for entry in entries {
         let trimmed = entry.trim().to_owned();
-        if !(trimmed.starts_with("file:///") || trimmed.starts_with("~file:///") || trimmed.starts_with("!file:///") || trimmed.starts_with("_file:///")) {
+        if !(trimmed.starts_with("file:///") || trimmed.starts_with("~file:///") || trimmed.starts_with("!file:///") || trimmed.starts_with("_file:///") ||
+             trimmed.starts_with("http://") || trimmed.starts_with("https://") || trimmed.starts_with("~http://") || trimmed.starts_with("~https://") ||
+             trimmed.starts_with("!http://") || trimmed.starts_with("!https://") || trimmed.starts_with("_http://") || trimmed.starts_with("_https://")) {
             resolved_entries.push(trimmed);
             continue;
         }
@@ -208,6 +215,16 @@ pub fn expand_cidrs(entries: &[String]) -> Result<Vec<IpNet>, String> {
         };
         let url = Url::parse(url_str)
             .map_err(|e| format!("invalid file URL '{}': {}", url_str, e))?;
+        if url.scheme() != "file" && url.scheme() != "http" && url.scheme() != "https" {
+            return Err(format!("route lists support only file://, http:// and https:// URLs, got: {}", url_str));
+        }
+        if url.scheme() == "http" || url.scheme() == "https" {
+            // HTTP(S) route lists (with optional ~_! prefixes) are downloaded at startup
+            // (stage 1) into the OS-specific yggdrasil_routes_download cache.
+            // Content is NOT expanded here — this prevents treating them as CIDR/IP
+            // and because full integration happens in stage 2. Skip silently.
+            continue;
+        }
         if url.scheme() != "file" {
             return Err(format!("route lists support only file:// URLs (browser address bar format), got: {}", url_str));
         }
@@ -505,6 +522,217 @@ fn sort_routes(a: &Route, b: &Route) -> std::cmp::Ordering {
         std::cmp::Ordering::Equal => a.prefix.addr().cmp(&b.prefix.addr()),
         other => other,
     }
+}
+
+/// Returns OS-specific base directory for downloaded route lists.
+/// Matches exactly the paths specified in the task (Linux/BSD, macOS, Windows).
+fn get_routes_download_base_dir() -> PathBuf {
+    if cfg!(target_os = "macos") {
+        PathBuf::from("/Library/Caches/yggdrasil_routes_download")
+    } else if cfg!(target_os = "windows") {
+        std::env::temp_dir().join("yggdrasil_routes_download")
+    } else {
+        // Linux, FreeBSD, OpenBSD, NetBSD etc.
+        PathBuf::from("/var/cache/yggdrasil_routes_download")
+    }
+}
+
+/// Returns true if filename starts with index >= current_count (e.g. "2-..." when only 0,1 exist).
+/// Used to remove stale files after config change.
+fn is_stale_index_file(name: &str, current_count: usize) -> bool {
+    if let Some(dash_pos) = name.find('-') {
+        if let Ok(idx) = name[..dash_pos].parse::<usize>() {
+            return idx >= current_count;
+        }
+    }
+    false
+}
+
+/// Extracts optional prefix (~, _, !) and the bare http(s):// URL.
+/// Reuses the same strip_prefix logic already present in expand_cidrs.
+fn extract_prefix_url(entry: &str) -> (Option<char>, &str) {
+    let t = entry.trim();
+    if let Some(rest) = t.strip_prefix('~') {
+        (Some('~'), rest.trim())
+    } else if let Some(rest) = t.strip_prefix('_') {
+        (Some('_'), rest.trim())
+    } else if let Some(rest) = t.strip_prefix('!') {
+        (Some('!'), rest.trim())
+    } else {
+        (None, t)
+    }
+}
+
+/// Blocking download with exactly 2 attempts and 10s timeout each.
+/// Returns body only on final 200 + successful read. Warn is done by caller.
+fn download_with_retries(url: &str, max_attempts: u32, timeout: Duration) -> Result<Vec<u8>, String> {
+    for attempt in 1..=max_attempts {
+        match ureq::get(url).timeout(timeout).call() {
+            Ok(resp) => {
+                if resp.status() == 200 {
+                    let mut body = Vec::new();
+                    match resp.into_reader().read_to_end(&mut body) {
+                        Ok(_) => return Ok(body),
+                        Err(e) if attempt == max_attempts => return Err(format!("read error: {}", e)),
+                        Err(_) => continue,
+                    }
+                } else if attempt == max_attempts {
+                    return Err(format!("HTTP status {}", resp.status()));
+                }
+            }
+            Err(e) if attempt == max_attempts => return Err(format!("network error: {}", e)),
+            Err(_) => continue,
+        }
+    }
+    Err("unreachable".into())
+}
+
+/// Removes empty subdirectories inside base (after stale file cleanup).
+fn remove_empty_dirs(base: &PathBuf) {
+    if let Ok(rd) = fs::read_dir(base) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                let _ = fs::remove_dir(&p); // succeeds only if truly empty
+            }
+        }
+    }
+}
+
+/// Stage 1: Download HTTP/HTTPS route lists into yggdrasil_routes_download/<pubkey>/
+/// right after "Multicast peer discovery started".
+/// - Only processes entries that look like http(s):// (with optional ~_! prefix).
+/// - Filename format: N-prefix-md5hex or N--md5hex (exactly as specified).
+/// - Never overwrites existing file if its md5 (encoded in name) matches new content.
+/// - Removes files whose index >= current number of http(s) entries for this pubkey.
+/// - If 0 http(s) entries for a pubkey → removes all files from its folder.
+/// - Finally removes any empty subdirs.
+/// - 2 attempts, 10s timeout. Warn only on final failure per URL. No extra warnings if all fail.
+/// - Blocking call — we wait until finished before next startup stage.
+pub fn download_route_lists(config: &TunnelRoutingConfig) {
+    if !config.enable || config.remote_subnets.is_empty() {
+        return;
+    }
+
+    let base_dir = get_routes_download_base_dir();
+    if let Err(e) = fs::create_dir_all(&base_dir) {
+        tracing::warn!(
+            "Failed to create routes download base dir {:?}: {}. Skipping downloads.",
+            base_dir, e
+        );
+        return;
+    }
+
+    for (pubkey_hex, entries) in &config.remote_subnets {
+        if pubkey_hex.is_empty() {
+            continue;
+        }
+
+        // Collect ONLY http(s) entries in the order they appear (for correct 0,1,2... numbering)
+        let http_entries: Vec<String> = entries
+            .iter()
+            .filter(|e| {
+                let t = e.trim();
+                t.starts_with("http://")
+                    || t.starts_with("https://")
+                    || t.starts_with("~http://")
+                    || t.starts_with("~https://")
+                    || t.starts_with("_http://")
+                    || t.starts_with("_https://")
+                    || t.starts_with("!http://")
+                    || t.starts_with("!https://")
+            })
+            .cloned()
+            .collect();
+
+        let num = http_entries.len();
+        let subdir = base_dir.join(pubkey_hex);
+
+        // Remove stale files (index >= num). If num==0 this removes everything matching pattern.
+        if subdir.exists() {
+            if let Ok(rd) = fs::read_dir(&subdir) {
+                for dent in rd.flatten() {
+                    let fname = dent.file_name().to_string_lossy().into_owned();
+                    if is_stale_index_file(&fname, num) {
+                        let _ = fs::remove_file(dent.path());
+                    }
+                }
+            }
+        }
+
+        if num == 0 {
+            continue; // folder may now be empty → will be removed by remove_empty_dirs
+        }
+
+        if let Err(e) = fs::create_dir_all(&subdir) {
+            tracing::warn!("Failed to create subdir for pubkey {}: {}", pubkey_hex, e);
+            continue;
+        }
+
+        for (i, entry) in http_entries.iter().enumerate() {
+            let (prefix_opt, bare_url) = extract_prefix_url(entry);
+
+            let body = match download_with_retries(bare_url, 2, Duration::from_secs(10)) {
+                Ok(b) => b,
+                Err(e) => {
+                    // Warn ONLY on final (2nd) failure, exactly as required.
+                    tracing::warn!(
+                        "Failed to download route list #{} for {} from {} after 2 attempts: {}",
+                        i, pubkey_hex, bare_url, e
+                    );
+                    continue;
+                }
+            };
+
+            let digest = md5::compute(&body);
+            let md5_hex = hex::encode(digest.0);
+
+            let fname = if let Some(p) = prefix_opt {
+                format!("{}-{}-{}", i, p, md5_hex)
+            } else {
+                format!("{}--{}", i, md5_hex)
+            };
+            let target = subdir.join(&fname);
+
+            // If a file with the same index and same content (md5) already exists
+            // but with a different prefix → rename it instead of creating a duplicate file.
+            // This fixes the case when only the prefix (~, _, ! or none) is changed in config.
+            let mut renamed = false;
+            if let Ok(rd) = fs::read_dir(&subdir) {
+                for dent in rd.flatten() {
+                    let name = dent.file_name().to_string_lossy().into_owned();
+                    if (name.starts_with(&format!("{}-", i)) || name.starts_with(&format!("{}--", i)))
+                        && (name.ends_with(&format!("-{}", md5_hex)) || name.ends_with(&format!("--{}", md5_hex)))
+                    {
+                        let old_path = dent.path();
+                        if old_path != target {
+                            if let Err(e) = fs::rename(&old_path, &target) {
+                                tracing::warn!(
+                                    "Failed to rename route list file {} → {}: {}",
+                                    old_path.display(),
+                                    target.display(),
+                                    e
+                                );
+                            }
+                            renamed = true;
+                        }
+                        break; // at most one such file can exist
+                    }
+                }
+            }
+
+            if renamed || target.exists() {
+                continue;
+            }
+
+            if let Err(e) = fs::write(&target, &body) {
+                tracing::warn!("Failed to write downloaded list to {:?}: {}", target, e);
+            }
+        }
+    }
+
+    // Clean up any empty pubkey folders left after removals (including those where all downloads failed).
+    remove_empty_dirs(&base_dir);
 }
 
 #[cfg(test)]
@@ -999,6 +1227,7 @@ mod tests {
             format!("~{}", noroute_url),
             format!("_{}", system_only_url),   // NEW: system routes only, no CKR
             missing_url,
+            "http://example.invalid/this-must-be-skipped.txt".to_string(),
         ];
         let out = expand_cidrs(&entries).unwrap();
 

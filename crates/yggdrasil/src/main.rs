@@ -367,6 +367,16 @@ async fn run_node(
         tracing::warn!("Multicast peer discovery disabled: {}", e);
     }
 
+    // Download any HTTP/HTTPS route lists declared in tunnel_routing.remote_subnets.
+    // Must happen immediately after multicast peer discovery started and must
+    // complete before we proceed to CKR initialization / route installation.
+    // Uses the new download_route_lists (stage 1). Blocking is intentional.
+    #[cfg(feature = "ckr")]
+    {
+        tracing::info!("Starting download of http(s) route lists...");
+        yggdrasil::ckr::download_route_lists(&config.tunnel_routing);
+        tracing::info!("Finished downloading http(s) route lists"); 
+    }
     // Initialize CKR routing table (CryptoKey) after multicast has started.
     // This moves the "CKR: ignoring ..." and "Active CKR routes" logs
     // to the position required by Stage 3 (before TUN IP assignment).
