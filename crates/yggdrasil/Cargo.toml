@@ -40,7 +40,7 @@ socket2 = "0.6.3"
 getifaddrs = "0.6"
 rustc-hash = "2.1.2"
 arc-swap = "1.9"
-md5 = "0.7"
+md5 = "0.8"
 ureq = { version = "2.12", default-features = false, features = ["tls"] }
 
 [features]

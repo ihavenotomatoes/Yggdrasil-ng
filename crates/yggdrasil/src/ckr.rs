@@ -566,6 +566,9 @@ fn extract_prefix_url(entry: &str) -> (Option<char>, &str) {
 /// Blocking download with exactly 2 attempts and 10s timeout each.
 /// Returns body only on final 200 + successful read. Warn is done by caller.
 fn download_with_retries(url: &str, max_attempts: u32, timeout: Duration) -> Result<Vec<u8>, String> {
+    // Delay before the very first download attempt (as requested)
+    std::thread::sleep(Duration::from_millis(1500));
+
     for attempt in 1..=max_attempts {
         match ureq::get(url).timeout(timeout).call() {
             Ok(resp) => {
@@ -573,15 +576,28 @@ fn download_with_retries(url: &str, max_attempts: u32, timeout: Duration) -> Res
                     let mut body = Vec::new();
                     match resp.into_reader().read_to_end(&mut body) {
                         Ok(_) => return Ok(body),
-                        Err(e) if attempt == max_attempts => return Err(format!("read error: {}", e)),
-                        Err(_) => continue,
+                        Err(e) if attempt == max_attempts => {
+                            return Err(format!("read error on attempt {}: {}", attempt, e));
+                        }
+                        Err(_) => {} // will retry
                     }
                 } else if attempt == max_attempts {
-                    return Err(format!("HTTP status {}", resp.status()));
+                    return Err(format!("HTTP status {} on attempt {}", resp.status(), attempt));
                 }
+                // non-200 on non-final attempt → fallthrough to retry
             }
-            Err(e) if attempt == max_attempts => return Err(format!("network error: {}", e)),
-            Err(_) => continue,
+            Err(e) if attempt == max_attempts => {
+                return Err(format!("network error on attempt {}: {}", attempt, e));
+            }
+            Err(_) => {
+                // network error on non-final attempt → retry
+            }
+        }
+
+        // Small delay between attempts (only if not the last one).
+        // This makes the "two attempts with 10s timeout" behaviour more predictable.
+        if attempt < max_attempts {
+            std::thread::sleep(Duration::from_millis(1500));
         }
     }
     Err("unreachable".into())
