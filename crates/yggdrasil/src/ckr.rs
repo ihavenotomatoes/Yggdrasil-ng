@@ -15,6 +15,8 @@ use route_manager::RouteManager;
 
 use crate::address::{is_valid_address, is_valid_subnet};
 use crate::config::TunnelRoutingConfig;
+use crate::core::Core;
+use crate::links::PeerEvent;
 
 const INETV4_PREFIXES: &[&str] = &[
     "0.0.0.0/5", "8.0.0.0/7", "11.0.0.0/8", "12.0.0.0/6", "16.0.0.0/4", "32.0.0.0/3", "64.0.0.0/2", "128.0.0.0/3",
@@ -566,7 +568,7 @@ fn extract_prefix_url(entry: &str) -> (Option<char>, &str) {
 /// Returns body only on final 200 + successful read. Warn is done by caller.
 fn download_with_retries(url: &str, max_attempts: u32, timeout: Duration) -> Result<Vec<u8>, String> {
     // Delay before the very first download attempt (as requested)
-    std::thread::sleep(Duration::from_millis(1500));
+    std::thread::sleep(Duration::from_millis(2000));
 
     for attempt in 1..=max_attempts {
         match ureq::get(url).timeout(timeout).call() {
@@ -596,7 +598,7 @@ fn download_with_retries(url: &str, max_attempts: u32, timeout: Duration) -> Res
         // Small delay between attempts (only if not the last one).
         // This makes the "two attempts with 10s timeout" behaviour more predictable.
         if attempt < max_attempts {
-            std::thread::sleep(Duration::from_millis(1500));
+            std::thread::sleep(Duration::from_millis(2000));
         }
     }
     Err("unreachable".into())
@@ -614,7 +616,7 @@ fn remove_empty_dirs(base: &PathBuf) {
     }
 }
 
-/// Stage 1: Download HTTP/HTTPS route lists into yggdrasil_routes_download/<pubkey>/
+/// Download HTTP/HTTPS route lists into yggdrasil_routes_download/<pubkey>/
 /// right after "Multicast peer discovery started".
 /// - Only processes entries that look like http(s):// (with optional ~_! prefix).
 /// - Filename format: N-prefix-md5hex or N--md5hex (exactly as specified).
@@ -622,9 +624,54 @@ fn remove_empty_dirs(base: &PathBuf) {
 /// - Removes files whose index >= current number of http(s) entries for this pubkey.
 /// - If 0 http(s) entries for a pubkey → removes all files from its folder.
 /// - Finally removes any empty subdirs.
-/// - 3 attempts, 10s timeout. Warn only on final failure per URL. No extra warnings if all fail.
+/// - 3 attempts, 10s timeout. Warn only on final failure per URL.
 /// - Blocking call — we wait until finished before next startup stage.
-pub fn download_route_lists(config: &TunnelRoutingConfig) {
+pub fn download_route_lists(config: &TunnelRoutingConfig, core: &Core) {
+    // === Wait for the first peer or 15s timeout ===
+    {
+        // First check: maybe static peers from config.peers already connected
+        // during core.start() (before we subscribed to events).
+        let already_has_peers = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(core.has_any_peers())
+        });
+
+        if already_has_peers {
+            tracing::info!("Peers already connected. Starting route list download immediately.");
+        } else {
+            let mut peer_rx = core.subscribe_peer_events();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+
+            tracing::info!("Waiting for first peer connection (max 15s) before downloading HTTP/HTTPS route lists...");
+
+            let mut first_peer_connected = false;
+
+            while std::time::Instant::now() < deadline {
+                match peer_rx.try_recv() {
+                    Ok(PeerEvent::Connected { key, .. }) => {
+                        tracing::info!(
+                            "First peer connected ({}). Starting route list download.",
+                            hex::encode(&key[..8])
+                        );
+                        first_peer_connected = true;
+                        break;
+                    }
+                    Ok(_) => {} // ignore Disconnected
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                }
+            }
+
+            if !first_peer_connected && !already_has_peers {
+                tracing::info!("No peers connected within 15 seconds. Proceeding with route list download anyway.");
+            }
+        }
+    }
+    // === End of wait logic ===
     if !config.enable || config.remote_subnets.is_empty() {
         return;
     }

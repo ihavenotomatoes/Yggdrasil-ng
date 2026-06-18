@@ -49,10 +49,10 @@ Use "inetv4" to include the full list of IPv4 internet prefixes (excluding inter
 Use "inetv6" or "\~inetv6" similarly for IPv6 (expands to "2000::/3").
 The "!" prefix for exclusions applies to CKR ranges for normal, "\~ "and "_" prefixed includes. No "!inetv4" or "!inetv6" are supported.
 
-Local text files (one CIDR or bare IP address per line) are supported via the exact "file:///absolute/path/to/list.txt" syntax used in the browser address bar (both Linux/UNIX and Windows "file:///C:/..." forms). The `~` or `_` or `!` prefix may appear immediately before "file:///" to apply CKR without system route, system route without CKR, or exclude behaviour to the whole list. Blank lines and lines beginning with `#` are ignored. Example:
+Text files with route lists (one CIDR or bare IP address per line) via HTTP(S) and, of course, similar local text files are supported via the exact "https://example.com/routelist.txt" and "file:///absolute/path/to/list.txt" syntax used in the browser address bar (both Linux/UNIX and Windows "file:///C:/..." forms). The "\~" or "_" or "!" prefix may appear immediately before "http://" or "file:///" to apply CKR without system route, system route without CKR, or exclude behaviour to the whole list. Blank lines and lines beginning with "#" are ignored when processing files. Example:
 ```toml
 [tunnel_routing.remote_subnets]
-"<NODE_A_KEY>" = ["10.99.0.1/32", "file:///home/user/list-allow.txt", "~file:///home/user/noroute.txt", "_file:///home/user/nockr.txt", "!file:///home/user/excludes.txt"]
+"<NODE_A_KEY>" = ["10.99.0.1/32", "file:///home/user/list-allow.txt", "~file:///home/user/noroute.txt", "_https://example.com/nockr.txt", "!http://[211:5c63:53ac:6ae6:6d7e:9d0:c14f:efb8]:8080/excludes.txt"]
 ```
 
 ## Exit-Node Setup

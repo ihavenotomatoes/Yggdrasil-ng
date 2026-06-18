@@ -503,6 +503,11 @@ impl Core {
         tree.iter().map(|t| t.key).collect()
     }
 
+    /// Returns whether at least one peer is currently connected.
+    pub async fn has_any_peers(&self) -> bool {
+        self.active_links.has_active_connections().await
+    }
+
     /// Background task to renew TLS certificate before expiry.
     /// Checks every 12 hours and renews if certificate expires within 10 days.
     async fn tls_renewal_task(self: Arc<Self>) {

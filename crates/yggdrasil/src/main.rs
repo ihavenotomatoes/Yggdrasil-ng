@@ -373,10 +373,11 @@ async fn run_node(
     // Uses the new download_route_lists (stage 1). Blocking is intentional.
     #[cfg(feature = "ckr")]
     {
-        tracing::info!("Starting download of http(s) route lists...");
-        yggdrasil::ckr::download_route_lists(&config.tunnel_routing);
+        tracing::info!("Starting download of http(s) route lists (waiting for first peer or 15s timeout)...");
+        yggdrasil::ckr::download_route_lists(&config.tunnel_routing, &core);
         tracing::info!("Finished downloading http(s) route lists"); 
     }
+
     // Initialize CKR routing table (CryptoKey) after multicast has started.
     // This moves the "CKR: ignoring ..." and "Active CKR routes" logs
     // to the position required by Stage 3 (before TUN IP assignment).

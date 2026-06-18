@@ -409,6 +409,12 @@ impl ActiveLinks {
         }
     }
 
+    /// Returns true if there is at least one active peer connection right now.
+    pub async fn has_active_connections(&self) -> bool {
+        let inner = self.inner.lock().await;
+        !inner.connections.is_empty()
+    }
+    
     async fn register(&self, uri: String, inbound: bool, key: [u8; 32], priority: u8) -> Option<(u64, Arc<AtomicUsize>, Arc<AtomicUsize>)> {
         let mut inner = self.inner.lock().await;
         // Reject duplicate: same key + same direction

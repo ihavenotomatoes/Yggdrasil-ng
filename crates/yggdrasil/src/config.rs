@@ -197,7 +197,8 @@ pub struct TunnelRoutingConfig {
     /// - "~file:///absolute/path/to/list.txt" → CKR-only from the file (no system routes)
     /// - "_file:///absolute/path/to/list.txt" → system routes only from the file (no CKR)    
     /// - "!file:///absolute/path/to/list.txt" → exclude all CIDRs/IPs listed in the file
-    ///   (blank lines and `#`-prefixed lines in the file are ignored)
+    /// - "https://example.com/routelist.txt"  → CIDRs/IPs from the text file via HTTP(S)
+    /// The paths "~http(s)://", "_http(s)://" and "!http(s)://" are also supported.
     #[serde(default)]
     pub remote_subnets: HashMap<String, Vec<String>>,
 
