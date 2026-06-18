@@ -3,19 +3,18 @@ use std::io::{BufRead, BufReader};
 use std::net::IpAddr;
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
+use std::fs;
+use std::io::Read;
+use std::path::PathBuf;
+use std::time::Duration;
 
+use url::Url;
 use ipnet::IpNet;
 #[cfg(not(target_os = "android"))]
 use route_manager::RouteManager;
 
 use crate::address::{is_valid_address, is_valid_subnet};
 use crate::config::TunnelRoutingConfig;
-use url::Url;
-
-use std::fs;
-use std::io::Read;
-use std::path::PathBuf;
-use std::time::Duration;
 
 const INETV4_PREFIXES: &[&str] = &[
     "0.0.0.0/5", "8.0.0.0/7", "11.0.0.0/8", "12.0.0.0/6", "16.0.0.0/4", "32.0.0.0/3", "64.0.0.0/2", "128.0.0.0/3",
@@ -563,7 +562,7 @@ fn extract_prefix_url(entry: &str) -> (Option<char>, &str) {
     }
 }
 
-/// Blocking download with exactly 2 attempts and 10s timeout each.
+/// Blocking download with exactly 3 attempts and 10s timeout each.
 /// Returns body only on final 200 + successful read. Warn is done by caller.
 fn download_with_retries(url: &str, max_attempts: u32, timeout: Duration) -> Result<Vec<u8>, String> {
     // Delay before the very first download attempt (as requested)
@@ -623,7 +622,7 @@ fn remove_empty_dirs(base: &PathBuf) {
 /// - Removes files whose index >= current number of http(s) entries for this pubkey.
 /// - If 0 http(s) entries for a pubkey → removes all files from its folder.
 /// - Finally removes any empty subdirs.
-/// - 2 attempts, 10s timeout. Warn only on final failure per URL. No extra warnings if all fail.
+/// - 3 attempts, 10s timeout. Warn only on final failure per URL. No extra warnings if all fail.
 /// - Blocking call — we wait until finished before next startup stage.
 pub fn download_route_lists(config: &TunnelRoutingConfig) {
     if !config.enable || config.remote_subnets.is_empty() {
@@ -688,12 +687,12 @@ pub fn download_route_lists(config: &TunnelRoutingConfig) {
         for (i, entry) in http_entries.iter().enumerate() {
             let (prefix_opt, bare_url) = extract_prefix_url(entry);
 
-            let body = match download_with_retries(bare_url, 2, Duration::from_secs(10)) {
+            let body = match download_with_retries(bare_url, 3, Duration::from_secs(3)) {
                 Ok(b) => b,
                 Err(e) => {
-                    // Warn ONLY on final (2nd) failure, exactly as required.
+                    // Warn ONLY on final (third) failure, exactly as required.
                     tracing::warn!(
-                        "Failed to download route list #{} for {} from {} after 2 attempts: {}",
+                        "Failed to download route list #{} for {} from {} after 3 attempts: {}",
                         i, pubkey_hex, bare_url, e
                     );
                     continue;
