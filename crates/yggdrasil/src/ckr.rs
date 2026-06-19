@@ -756,6 +756,22 @@ pub fn download_route_lists(config: &TunnelRoutingConfig, core: &Core) {
             };
             let target = subdir.join(&fname);
 
+            // Remove any old versions of this index (different md5).
+            // We want to keep only the latest version of the file for each slot.
+            if subdir.exists() {
+                if let Ok(rd) = fs::read_dir(&subdir) {
+                    for dent in rd.flatten() {
+                        let name = dent.file_name().to_string_lossy().into_owned();
+                        if (name.starts_with(&format!("{}-", i)) || name.starts_with(&format!("{}--", i)))
+                            && !name.ends_with(&format!("-{}", md5_hex))
+                            && !name.ends_with(&format!("--{}", md5_hex))
+                        {
+                            let _ = fs::remove_file(dent.path());
+                        }
+                    }
+                }
+            }
+            
             // If a file with the same index and same content (md5) already exists
             // but with a different prefix → rename it instead of creating a duplicate file.
             // This fixes the case when only the prefix (~, _, ! or none) is changed in config.
