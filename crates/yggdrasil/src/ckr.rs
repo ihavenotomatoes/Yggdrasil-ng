@@ -1386,7 +1386,6 @@ mod tests {
         ];
         let out = expand_cidrs(&entries).unwrap();
 
-        assert!(out.iter().any(|p| p.to_string() == "10.99.0.0/24"));
         assert!(out.iter().any(|p| p.to_string() == "10.99.1.0/24"));
         let blocked: std::net::IpAddr = "10.99.0.5".parse().unwrap();
         assert!(!out.iter().any(|p| p.contains(&blocked)));
@@ -1401,12 +1400,9 @@ mod tests {
 
     #[test]
     fn test_get_downloaded_virtual_file_entries() {
-        use std::fs;
-        use tempfile::tempdir;
-
-        let tmp = tempdir().unwrap();
+        let tmp = env::temp_dir();
         let pubkey = "000e5ebdbab5ef0772deadaa2aecde23daa2d3615d99fdc352d4fb3ab1cd345a";
-        let dir = tmp.path().join(pubkey);
+        let dir = tmp.join(pubkey);
         fs::create_dir_all(&dir).unwrap();
 
         // Create test files mimicking downloaded ones
