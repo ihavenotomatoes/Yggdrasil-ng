@@ -33,6 +33,15 @@ const INETV6_PREFIXES: &[&str] = &["2000::/3"];
 /// expand_cidrs is called from both CryptoKey::new and install_routes/remove_routes.
 static ROUTE_FILE_CACHE: LazyLock<Mutex<HashMap<String, Option<Vec<String>>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// In-memory storage for peer-derived exclusion entries (e.g. "!23.184.48.86", "!2a0d:8480:3:234c::").
+/// Populated once at startup by prepare_peer_exclusions() (called from main.rs after
+/// download_route_lists). These entries are appended to *every* remote_subnets list so that
+/// underlay peer IPs (direct from config.peers or resolved via tokio::net::lookup_host) are
+/// treated as "!" exclusions by expand_cidrs for both CKR and system routes.
+/// Non-Android only. Empty if not prepared yet or on Android.
+#[cfg(not(target_os = "android"))]
+static PEER_EXCLUSIONS: LazyLock<Mutex<Option<Vec<String>>>> = LazyLock::new(|| Mutex::new(None));
+
 /// A single CKR route: CIDR prefix -> destination public key.
 struct Route {
     prefix: IpNet,
@@ -78,6 +87,10 @@ impl CryptoKey {
             // Combine config entries with downloaded HTTP/HTTPS route lists
             let mut effective_entries = cidrs.clone();
             effective_entries.extend(get_downloaded_virtual_file_entries(pubkey_hex));
+            // Append peer underlay exclusions (from config.peers, resolved at startup after network is up).
+            // These "!IP"/"!IPv6" entries are applied to *every* remote_subnets public key so that
+            // expand_cidrs treats peer addresses as exclusions for both CKR and system routes.
+            effective_entries.extend(get_peer_exclusion_entries());
 
             // "_" prefix = system routes only (no CKR entry)
             let ckr_cidrs: Vec<String> = effective_entries
@@ -197,9 +210,8 @@ pub fn expand_cidrs(entries: &[String]) -> Result<Vec<IpNet>, String> {
     let mut v4_exc: Vec<IpNet> = Vec::new();
     let mut v6_exc: Vec<IpNet> = Vec::new();
 
-    // File and HTTP/HTTPS route list support (http://, https:// with optional
-    // ~, _, ! prefixes) — minimal addition for stage 1 download.
-    // "_" prefix = system routes only (no CKR). "!" exclusions apply to lists too.
+    // File and HTTP/HTTPS route list support (http://, https:// 
+    // with optional "~", "_", "!" prefixes)
     let mut resolved_entries: Vec<String> = Vec::new();
     for entry in entries {
         let trimmed = entry.trim().to_owned();
@@ -224,10 +236,10 @@ pub fn expand_cidrs(entries: &[String]) -> Result<Vec<IpNet>, String> {
             return Err(format!("route lists support only file://, http:// and https:// URLs, got: {}", url_str));
         }
         if url.scheme() == "http" || url.scheme() == "https" {
-            // HTTP(S) route lists (with optional ~_! prefixes) are downloaded at startup
-            // (stage 1) into the OS-specific yggdrasil_routes_download cache.
+            // HTTP(S) route lists (with optional "~", "_", "!"" prefixes) are downloaded
+            //  at startup into the OS-specific yggdrasil_routes_download cache.
             // Content is NOT expanded here — this prevents treating them as CIDR/IP
-            // and because full integration happens in stage 2. Skip silently.
+            // and because full integration happens at the next stage. Skip silently.
             continue;
         }
         if url.scheme() != "file" {
@@ -446,7 +458,11 @@ pub fn install_routes(
         // Include downloaded route lists from yggdrasil_routes_download
         let mut effective_entries = subnet_list.clone();
         effective_entries.extend(get_downloaded_virtual_file_entries(pubkey_hex));
-
+        // Append peer underlay exclusions (from config.peers, resolved at startup after network is up).
+        // These "!IP"/"!IPv6" entries are applied to *every* remote_subnets public key so that
+        // expand_cidrs treats peer addresses as exclusions for both CKR and system routes.
+        effective_entries.extend(get_peer_exclusion_entries());
+        
         let non_tilde_entries: Vec<String> = effective_entries
             .iter()
             .filter(|s| !s.trim().starts_with('~'))
@@ -505,6 +521,10 @@ pub fn remove_routes(config: &TunnelRoutingConfig, tun_name: &str, self_key: &[u
         // These are treated exactly the same as "file://" entries from the config.
         let mut effective_entries = subnet_list.clone();
         effective_entries.extend(get_downloaded_virtual_file_entries(pubkey_hex));
+        // Append peer underlay exclusions (from config.peers, resolved at startup after network is up).
+        // These "!IP"/"!IPv6" entries are applied to *every* remote_subnets public key so that
+        // expand_cidrs treats peer addresses as exclusions for both CKR and system routes.
+        effective_entries.extend(get_peer_exclusion_entries());
 
         let non_tilde_entries: Vec<String> = effective_entries
             .iter()
@@ -592,7 +612,7 @@ fn extract_prefix_url(entry: &str) -> (Option<char>, &str) {
 /// Blocking download with exactly 3 attempts and 10s timeout each.
 /// Returns body only on final 200 + successful read. Warn is done by caller.
 fn download_with_retries(url: &str, max_attempts: u32, timeout: Duration) -> Result<Vec<u8>, String> {
-    // Delay before the very first download attempt (as requested)
+    // Delay before the very first download attempt
     std::thread::sleep(Duration::from_millis(2000));
 
     for attempt in 1..=max_attempts {
@@ -652,6 +672,8 @@ fn remove_empty_dirs(base: &PathBuf) {
 /// - 3 attempts, 10s timeout. Warn only on final failure per URL.
 /// - Blocking call — we wait until finished before next startup stage.
 pub fn download_route_lists(config: &TunnelRoutingConfig, core: &Core) {
+    // Delay before checking for connected peers
+    std::thread::sleep(Duration::from_millis(2000));
     // === Wait for the first peer or 15s timeout ===
     {
         // First check: maybe static peers from config.peers already connected
@@ -661,12 +683,12 @@ pub fn download_route_lists(config: &TunnelRoutingConfig, core: &Core) {
         });
 
         if already_has_peers {
-            tracing::info!("Peers already connected. Starting route list download immediately.");
+            tracing::info!("Peers already connected. Prepare to launch CKR immediately");
         } else {
             let mut peer_rx = core.subscribe_peer_events();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
 
-            tracing::info!("Waiting for first peer connection (max 15s) before downloading HTTP/HTTPS route lists...");
+            tracing::info!("Waiting for first peer connection (max 15s) before proceed...");
 
             let mut first_peer_connected = false;
 
@@ -674,7 +696,7 @@ pub fn download_route_lists(config: &TunnelRoutingConfig, core: &Core) {
                 match peer_rx.try_recv() {
                     Ok(PeerEvent::Connected { key, .. }) => {
                         tracing::info!(
-                            "First peer connected ({}). Starting route list download.",
+                            "First peer connected ({}). Preparing to launch CKR",
                             hex::encode(&key[..8])
                         );
                         first_peer_connected = true;
@@ -692,7 +714,7 @@ pub fn download_route_lists(config: &TunnelRoutingConfig, core: &Core) {
             }
 
             if !first_peer_connected && !already_has_peers {
-                tracing::info!("No peers connected within 15 seconds. Proceeding with route list download anyway.");
+                tracing::info!("No peers connected within 15 seconds. Proceeding anyway.");
             }
         }
     }
@@ -888,6 +910,120 @@ fn get_downloaded_virtual_file_entries(pubkey: &str) -> Vec<String> {
     }
 
     result
+}
+
+/// Extracts the host/IP/domain part from a peer URI exactly as specified:
+/// everything between "://" and the *last* ":", then strip "[" and "]" for IPv6.
+/// Examples:
+///   "tls://23.184.48.86:1443"          -> "23.184.48.86"
+///   "tcp://[2a0d:8480:3:234c::]:65535" -> "2a0d:8480:3:234c::"
+///   "tls://ygg-google.axxa.dev:18080"  -> "ygg-google.axxa.dev"
+fn extract_peer_host(peer: &str) -> Option<String> {
+    let after_scheme = peer.split("://").nth(1)?;
+    let host_part = after_scheme.split('/').next().unwrap_or(after_scheme);
+    if let Some(last_colon) = host_part.rfind(':') {
+        let mut host = host_part[..last_colon].to_string();
+        if host.starts_with('[') && host.ends_with(']') {
+            host = host[1..host.len() - 1].to_string();
+        }
+        if !host.is_empty() {
+            return Some(host);
+        }
+    } else if !host_part.is_empty() {
+        let mut host = host_part.to_string();
+        if host.starts_with('[') && host.ends_with(']') {
+            host = host[1..host.len() - 1].to_string();
+        }
+        if !host.is_empty() {
+            return Some(host);
+        }
+    }
+    None
+}
+
+/// Call this exactly once after the Yggdrasil network is running (i.e. after core.start()
+/// and after download_route_lists which already waits for first peer or 15s timeout)
+/// but *before* rwc.init_crypto_key() and install_routes().
+/// It extracts hosts from config.peers, resolves domains via tokio::net::lookup_host
+/// (A + AAAA records), builds "!IP" / "!IPv6" strings and stores them.
+/// These exclusions then apply to *all* public keys in tunnel_routing.remote_subnets.
+/// Non-Android only. Safe to call even if peers list is empty or contains only IPs.
+#[cfg(not(target_os = "android"))]
+pub fn prepare_peer_exclusions(peers: &[String]) {
+    let mut exclusions: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for peer in peers {
+        if let Some(host) = extract_peer_host(peer) {
+            if let Ok(ip) = host.parse::<IpAddr>() {
+                let entry = format!("!{}", ip);
+                if seen.insert(entry.clone()) {
+                    exclusions.push(entry);
+                }
+                continue;
+            }
+            // Domain name -> resolve all IPv4 + IPv6 (A + AAAA records) with up to 3 attempts.
+            // Each subsequent attempt happens only if the previous one returned an error.
+            // Warn only on final failure (after 3 attempts). Success on any attempt stops retries.
+            let resolved = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    let mut result: Vec<std::net::IpAddr> = Vec::new();
+                    let mut last_error = None;
+                    for _ in 1..=3 {
+                        match tokio::net::lookup_host(format!("{}:0", host)).await {
+                            Ok(addrs) => {
+                                result = addrs.map(|sa| sa.ip()).collect();
+                                break; // success — stop retrying
+                            }
+                            Err(e) => {
+                                last_error = Some(e);
+                                // continue to next attempt (loop will stop after 3 failures automatically)
+                            }
+                        }
+                    }
+                    if result.is_empty() {
+                        if let Some(e) = last_error {
+                            tracing::warn!(
+                                "CKR: failed to resolve peer domain '{}' after 3 attempts: {}",
+                                host, e
+                            );
+                        }
+                    }
+                    result
+                })
+            });
+            for ip in resolved {
+                let entry = format!("!{}", ip);
+                if seen.insert(entry.clone()) {
+                    exclusions.push(entry);
+                }
+            }
+        }
+    }
+
+    {
+        let mut guard = PEER_EXCLUSIONS.lock().unwrap();
+        *guard = Some(exclusions.clone());
+    }
+    if !exclusions.is_empty() {
+        tracing::info!(
+            "Prepared {} peer underlay exclusion(s) from config.peers",
+            exclusions.len()
+        );
+    }
+}
+
+/// Returns the peer exclusion entries (already with "!" prefix) or empty Vec.
+/// Used in the three places that build effective_entries (CryptoKey::new + install/remove_routes).
+#[cfg(not(target_os = "android"))]
+fn get_peer_exclusion_entries() -> Vec<String> {
+    let guard = PEER_EXCLUSIONS.lock().unwrap();
+    guard.clone().unwrap_or_default()
+}
+
+#[cfg(target_os = "android")]
+fn get_peer_exclusion_entries() -> Vec<String> {
+    Vec::new()
 }
 
 #[cfg(test)]

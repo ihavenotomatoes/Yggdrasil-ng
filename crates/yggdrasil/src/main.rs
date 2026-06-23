@@ -370,17 +370,21 @@ async fn run_node(
     // Download any HTTP/HTTPS route lists declared in tunnel_routing.remote_subnets.
     // Must happen immediately after multicast peer discovery started and must
     // complete before we proceed to CKR initialization / route installation.
-    // Uses the new download_route_lists (stage 1). Blocking is intentional.
+    // Uses the new download_route_lists. Blocking is intentional.
     #[cfg(feature = "ckr")]
-    {
-        tracing::info!("Starting download of http(s) route lists (waiting for first peer or 15s timeout)...");
-        yggdrasil::ckr::download_route_lists(&config.tunnel_routing, &core);
-        tracing::info!("Finished downloading http(s) route lists"); 
-    }
+    yggdrasil::ckr::download_route_lists(&config.tunnel_routing, &core);
+
+    // Prepare peer IP exclusions from config.peers *after* Yggdrasil network is running
+    // (core.start() + download_route_lists which waits for first peer) but *before*
+    // init_crypto_key() and install_routes(). This guarantees that tokio::net::lookup_host
+    // can succeed for domains (DNS often lives in Yggdrasil) and that the resulting "!IP"
+    // exclusions are present in effective_entries for all remote_subnets entries.
+    #[cfg(all(feature = "ckr", not(target_os = "android")))]
+    yggdrasil::ckr::prepare_peer_exclusions(&config.peers);
 
     // Initialize CKR routing table (CryptoKey) after multicast has started.
     // This moves the "CKR: ignoring ..." and "Active CKR routes" logs
-    // to the position required by Stage 3 (before TUN IP assignment).
+    // to the position before TUN IP assignment.
     #[cfg(feature = "ckr")]
     rwc.init_crypto_key(&config.tunnel_routing, core.public_key());
     
