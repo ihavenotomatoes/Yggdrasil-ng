@@ -78,6 +78,56 @@ const DEFAULT_PACKET_QUEUE_PER_FLOW_MULTIPLIER: u64 = 4;
 /// Fallback quantum when constructed with `0` (matches Go's default message size).
 const DEFAULT_MAX_MESSAGE_SIZE: u64 = 1024 * 1024;
 
+// --- CoDel (RFC 8289) controlled-delay AQM ---------------------------------
+//
+// Replaces the old "drop the head if it sat >25ms" rule, which over-dropped on
+// high-latency links (Wi-Fi/mobile): it fired on a single transient spike even
+// when the queue was nearly empty. CoDel drops only when the *sojourn time*
+// (how long a packet actually spent in this queue) stays above TARGET for a
+// full INTERVAL — i.e. a persistent standing queue — and never while the
+// backlog is below one max packet. Evaluated at dequeue. Faithful to the Linux
+// `codel_impl.h` reference.
+
+/// Acceptable standing-queue sojourn time.
+const CODEL_TARGET: Duration = Duration::from_millis(15);
+/// Window the standing queue must persist before CoDel starts dropping. Sized to
+/// cover typical worst-case RTTs, including Wi-Fi/mobile.
+const CODEL_INTERVAL: Duration = Duration::from_millis(100);
+/// Never drop while the whole backlog is below one max-size packet.
+const CODEL_MAX_PACKET: u64 = 65535;
+
+/// Signed nanoseconds of `now - t` (negative when `t` is in the future).
+#[inline]
+fn signed_nanos(now: Instant, t: Instant) -> i128 {
+    if now >= t {
+        (now - t).as_nanos() as i128
+    } else {
+        -((t - now).as_nanos() as i128)
+    }
+}
+
+/// CoDel control law: `t + INTERVAL / sqrt(count)`.
+#[inline]
+fn codel_control_law(t: Instant, count: u32) -> Instant {
+    let ns = (CODEL_INTERVAL.as_nanos() as f64 / (count.max(1) as f64).sqrt()) as u64;
+    t + Duration::from_nanos(ns)
+}
+
+/// CoDel per-queue state.
+#[derive(Default)]
+struct Codel {
+    /// Time the sojourn first rose above TARGET, offset by INTERVAL (`None` = below).
+    first_above_time: Option<Instant>,
+    /// Scheduled time of the next drop while in the dropping state.
+    drop_next: Option<Instant>,
+    /// Drops in the current dropping cycle (drives the control law).
+    count: u32,
+    /// `count` snapshot from the previous cycle (for fast re-entry).
+    lastcount: u32,
+    /// Whether we are currently in the dropping state.
+    dropping: bool,
+}
+
 /// Stable identity of a queued flow: the original sender and intended receiver.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct FlowKey {
@@ -128,6 +178,8 @@ pub(crate) struct PacketQueue {
     max_bytes_per_flow: u64,
     /// DRR byte budget granted to a flow each round.
     quantum: u64,
+    /// CoDel AQM state (evaluated at dequeue).
+    codel: Codel,
 }
 
 impl PacketQueue {
@@ -147,6 +199,7 @@ impl PacketQueue {
             max_bytes_total: quantum * DEFAULT_PACKET_QUEUE_MAX_BYTES_MULTIPLIER,
             max_bytes_per_flow: quantum * DEFAULT_PACKET_QUEUE_PER_FLOW_MULTIPLIER,
             quantum,
+            codel: Codel::default(),
         }
     }
 
@@ -369,30 +422,109 @@ impl PacketQueue {
         }
     }
 
-    /// Remove and return the next packet (DRR order).
+    /// Remove and return the next packet (DRR order), without CoDel. Retained
+    /// for the scheduling/eviction tests; production dequeues use `pop_codel`.
+    #[cfg(test)]
     pub fn pop(&mut self) -> Option<TrafficPacket> {
         self.pop_info().map(|info| info.packet)
+    }
+
+    /// Remove and return the next packet, applying CoDel AQM at dequeue.
+    /// Packets CoDel selects are dropped (discarded) and the next is dequeued;
+    /// the returned packet is the one to actually deliver/forward. `now` is the
+    /// current time (taken once per drain batch by the caller).
+    pub fn pop_codel(&mut self, now: Instant) -> Option<TrafficPacket> {
+        let mut info = self.pop_info();
+        if info.is_none() {
+            self.codel.dropping = false;
+            return None;
+        }
+        let mut drop = self.codel_should_drop(&info, now);
+        let interval_ns = CODEL_INTERVAL.as_nanos() as i128;
+
+        if self.codel.dropping {
+            if !drop {
+                self.codel.dropping = false;
+            } else {
+                while self.codel.dropping && self.codel.drop_next.map_or(false, |dn| now >= dn) {
+                    self.codel.count += 1;
+                    info = self.pop_info(); // previous packet is dropped here
+                    drop = self.codel_should_drop(&info, now);
+                    if !drop {
+                        self.codel.dropping = false;
+                    } else {
+                        let dn = self.codel.drop_next.unwrap();
+                        self.codel.drop_next = Some(codel_control_law(dn, self.codel.count));
+                    }
+                }
+            }
+        } else if drop
+            && (self
+                .codel
+                .drop_next
+                .map_or(false, |dn| signed_nanos(now, dn) < interval_ns)
+                || self
+                    .codel
+                    .first_above_time
+                    .map_or(false, |fat| signed_nanos(now, fat) >= interval_ns))
+        {
+            info = self.pop_info(); // current packet is dropped
+            let _ = self.codel_should_drop(&info, now);
+            self.codel.dropping = true;
+            // If we re-entered dropping soon after leaving, resume near the
+            // previous drop rate; otherwise start fresh.
+            let delta = self.codel.count.wrapping_sub(self.codel.lastcount);
+            self.codel.count = if delta > 1
+                && self
+                    .codel
+                    .drop_next
+                    .map_or(false, |dn| signed_nanos(now, dn) < 16 * interval_ns)
+            {
+                delta
+            } else {
+                1
+            };
+            self.codel.lastcount = self.codel.count;
+            self.codel.drop_next = Some(codel_control_law(now, self.codel.count));
+        }
+
+        info.map(|i| i.packet)
+    }
+
+    /// CoDel's `should_drop`: updates `first_above_time` and reports whether the
+    /// just-dequeued packet is eligible to drop (sojourn stood above TARGET for
+    /// at least INTERVAL). `self.size` here is the backlog *after* the pop.
+    fn codel_should_drop(&mut self, info: &Option<PqPacketInfo>, now: Instant) -> bool {
+        match info {
+            None => {
+                self.codel.first_above_time = None;
+                false
+            }
+            Some(pkt) => {
+                let sojourn = now.saturating_duration_since(pkt.time);
+                if sojourn < CODEL_TARGET || self.size < CODEL_MAX_PACKET {
+                    // Below target (or trivially small backlog): stay/return below.
+                    self.codel.first_above_time = None;
+                    false
+                } else {
+                    match self.codel.first_above_time {
+                        None => {
+                            // Just went above target; start the interval clock.
+                            self.codel.first_above_time = Some(now + CODEL_INTERVAL);
+                            false
+                        }
+                        Some(fat) => now > fat,
+                    }
+                }
+            }
+        }
     }
 
     /// Get the total queued bytes.
     pub fn size(&self) -> u64 {
         self.size
     }
-
-    /// Get the age of the oldest packet in the queue (oldest head across flows).
-    pub fn oldest_age(&self) -> Option<Duration> {
-        self.active
-            .iter()
-            .filter_map(|k| self.flows.get(k))
-            .filter_map(|f| f.infos.front())
-            .map(|info| info.time)
-            .min()
-            .map(|time| time.elapsed())
-    }
 }
-
-/// Maximum age for queued packets before they are dropped (25 milliseconds).
-const MAX_PACKET_AGE: Duration = Duration::from_millis(25);
 
 /// DeliveryQueue manages the packet queue with receive-ready counting.
 /// Packets are queued when no reader is waiting, and sent directly when a
@@ -424,17 +556,9 @@ impl DeliveryQueue {
             return Some(packet);
         }
 
-        // Slow path: queue the packet
+        // Slow path: queue the packet. Overload is handled by CoDel at dequeue
+        // (`pop_codel`); `push` only enforces the hard byte caps.
         let mut queue = self.queue.lock().unwrap();
-
-        // Check if the oldest packet is too old (>25ms), if so drop it
-        if let Some(age) = queue.oldest_age() {
-            if age > MAX_PACKET_AGE {
-                queue.drop_largest();
-                tracing::debug!("Dropped oldest packet from queue (age > 25ms)");
-            }
-        }
-
         queue.push(packet);
         None
     }
@@ -449,7 +573,7 @@ impl DeliveryQueue {
     pub fn try_pop_or_wait(&self) -> Option<TrafficPacket> {
         let mut queue = self.queue.lock().unwrap();
 
-        if let Some(packet) = queue.pop() {
+        if let Some(packet) = queue.pop_codel(std::time::Instant::now()) {
             // Packet was queued, return it immediately
             Some(packet)
         } else {
@@ -473,6 +597,53 @@ mod tests {
             watermark: u64::MAX,
             payload: payload.to_vec(),
         }
+    }
+
+    #[test]
+    fn codel_no_drop_when_not_standing() {
+        // Fresh packets (sojourn ~0 < TARGET) must never be dropped, even with a
+        // backlog above the one-max-packet guard.
+        let mut q = big_queue();
+        for _ in 0..100 {
+            q.push(make_packet(1, 2, &[0u8; 1000])); // ~100 KiB total
+        }
+        let now = std::time::Instant::now();
+        let mut returned = 0;
+        while q.pop_codel(now).is_some() {
+            returned += 1;
+        }
+        assert_eq!(returned, 100, "no drops when packets are fresh");
+        assert_eq!(q.codel.count, 0, "CoDel must not enter the dropping state");
+    }
+
+    #[test]
+    fn codel_drops_on_persistent_standing_queue() {
+        // A backlog whose sojourn stays above TARGET for longer than INTERVAL
+        // must trigger CoDel drops. Time is simulated by advancing `now` well
+        // past the packets' enqueue time on each dequeue.
+        let mut q = big_queue();
+        for _ in 0..300 {
+            q.push(make_packet(1, 2, &[0u8; 1000])); // ~300 KiB, above the 64 KiB guard
+        }
+        let t0 = std::time::Instant::now();
+        let mut returned = 0;
+        let mut step_ms = 0u64;
+        loop {
+            step_ms += 200; // advance past 2*INTERVAL each dequeue
+            let now = t0 + std::time::Duration::from_millis(step_ms);
+            match q.pop_codel(now) {
+                Some(_) => returned += 1,
+                None => break,
+            }
+            if step_ms > 60_000 {
+                break; // safety
+            }
+        }
+        assert!(
+            returned < 300,
+            "CoDel should drop under a persistent standing queue (returned {returned})"
+        );
+        assert!(q.codel.count > 0, "CoDel should have entered the dropping state");
     }
 
     /// A queue with a large (1 MB) quantum: byte caps are far out of reach, so
