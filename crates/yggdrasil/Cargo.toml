@@ -1,6 +1,6 @@
 [package]
 name = "yggdrasil"
-version = "0.1.6"
+version = "0.2.0"
 edition = "2024"
 description = "Yggdrasil mesh networking daemon"
 license = "MPL-2.0"
