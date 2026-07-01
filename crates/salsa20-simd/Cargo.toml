@@ -1,0 +1,36 @@
+# Fork of RustCrypto salsa20 0.10.2 with added SIMD backends for the Salsa20
+# core: AVX2 + SSE2 (x86/x86_64) and NEON (aarch64), with a scalar fallback.
+# Backends are runtime-selected and produce keystream byte-identical to the
+# scalar implementation (verified by tests), so this is a drop-in replacement
+# for crates.io `salsa20 = "0.10"` via [patch.crates-io] (see the workspace
+# root Cargo.toml). The package name stays `salsa20` so the patch intercepts
+# the transitive dependency; only the directory is `salsa20-simd`.
+[package]
+name = "salsa20"
+version = "0.10.2"
+edition = "2021"
+rust-version = "1.61"
+description = "Salsa20 Stream Cipher (SIMD fork: AVX2/SSE2/NEON backends)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/RustCrypto/stream-ciphers"
+publish = false
+
+[dependencies]
+cipher = "0.4.2"
+
+[target.'cfg(any(target_arch = "x86_64", target_arch = "x86"))'.dependencies]
+cpufeatures = "0.2"
+
+[dev-dependencies]
+cipher = { version = "0.4.2", features = ["dev"] }
+hex-literal = "0.3.3"
+
+[features]
+std = ["cipher/std"]
+zeroize = ["cipher/zeroize"]
+# Force a specific backend (for benchmarking / testing one path on a machine
+# whose CPU would otherwise auto-select a different one). x86 only; ignored on
+# other targets. Do not enable more than one.
+force-soft = []
+force-sse2 = []
+force-avx2 = []
