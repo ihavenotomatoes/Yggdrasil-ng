@@ -2366,6 +2366,7 @@ dependencies = [
  "route_manager",
  "rustc-hash",
  "rustls",
+ "salsa20",
  "sd-notify",
  "serde",
  "serde_json",

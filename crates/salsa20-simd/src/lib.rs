@@ -75,6 +75,10 @@
 #![allow(unsafe_code)]
 #![warn(rust_2018_idioms, trivial_casts, unused_qualifications)]
 
+// `std` for test-only conveniences (e.g. `println!`); the crate itself is no_std.
+#[cfg(test)]
+extern crate std;
+
 pub use cipher;
 
 use cipher::{
@@ -104,6 +108,73 @@ cpufeatures::new!(avx2_cpuid, "avx2");
 cpufeatures::new!(sse2_cpuid, "sse2");
 
 pub use xsalsa::{hsalsa, XSalsa12, XSalsa20, XSalsa8, XSalsaCore};
+
+/// Name of the Salsa20 keystream backend this build selects at runtime on the
+/// current CPU: `"AVX2"`, `"SSE2"`, `"NEON"`, or `"scalar"` (with a `(forced)`
+/// suffix when a `force-*` feature pins it). Mirrors the dispatch in
+/// [`SalsaCore::process_with_backend`], so it reflects what is actually used —
+/// useful for a startup diagnostic. (Fork addition; not part of upstream salsa20.)
+pub fn active_backend() -> &'static str {
+    #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "force-soft"))]
+    {
+        return "scalar (forced)";
+    }
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "force-sse2",
+        not(feature = "force-soft")
+    ))]
+    {
+        return "SSE2 (forced)";
+    }
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "force-avx2",
+        not(any(feature = "force-soft", feature = "force-sse2"))
+    ))]
+    {
+        return "AVX2 (forced)";
+    }
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        not(any(feature = "force-soft", feature = "force-sse2", feature = "force-avx2"))
+    ))]
+    {
+        if avx2_cpuid::get() {
+            return "AVX2";
+        }
+        if sse2_cpuid::get() {
+            return "SSE2";
+        }
+        return "scalar";
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return "NEON";
+    }
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        "scalar"
+    }
+}
+
+#[cfg(test)]
+mod backend_tests {
+    #[test]
+    fn active_backend_is_known() {
+        let b = super::active_backend();
+        assert!(
+            matches!(
+                b,
+                "AVX2" | "SSE2" | "NEON" | "scalar"
+                    | "AVX2 (forced)" | "SSE2 (forced)" | "scalar (forced)"
+            ),
+            "unexpected backend: {b}"
+        );
+        // Visible with `cargo test -p salsa20 -- --nocapture`.
+        std::println!("active salsa20 backend on this host: {b}");
+    }
+}
 
 /// Salsa20/8 stream cipher
 /// (reduced-round variant of Salsa20 with 8 rounds, *not recommended*)
