@@ -270,6 +270,7 @@ async fn run_node(
     tracing::info!("Your IPv6 address is {}", core.address());
     tracing::info!("Your IPv6 subnet is {}", core.subnet());
     tracing::info!("Your public key is {}", hex::encode(core.public_key()));
+    tracing::info!("Salsa20 backend: {}", salsa20::active_backend());
 
     // Initialize links with core reference
     core.init_links().await;

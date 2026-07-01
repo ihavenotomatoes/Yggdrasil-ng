@@ -15,6 +15,10 @@ path = "src/lib.rs"
 
 [dependencies]
 ironwood = { path = "../ironwood" }
+# Used only for the startup crypto-backend log line. Resolves to the SIMD fork
+# (crates/salsa20-simd) via the workspace [patch.crates-io]; active_backend() is
+# a fork-only helper.
+salsa20 = "0.10"
 tokio = { version = "1", features = ["full"] }
 ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"] }
 rand = "0.8"

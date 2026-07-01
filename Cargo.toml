@@ -1,6 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["crates/ironwood", "crates/yggdrasil"]
+members = ["crates/ironwood", "crates/yggdrasil", "crates/salsa20-simd"]
+
+# Redirect the transitive salsa20 (ironwood -> crypto_box -> crypto_secretbox ->
+# salsa20) to the local SIMD fork (AVX2/SSE2 on x86, NEON on aarch64; scalar
+# fallback elsewhere). Keystream is byte-identical to stock salsa20, so this is
+# wire-compatible. The package there is named `salsa20` so this patch applies.
+[patch.crates-io]
+salsa20 = { path = "crates/salsa20-simd" }
 
 [profile.release]
 opt-level = 3       # Optimize for speed
