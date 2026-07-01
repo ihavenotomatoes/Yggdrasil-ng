@@ -206,10 +206,7 @@ impl Peers {
 // Peer traffic sending with queuing
 // ---------------------------------------------------------------------------
 
-/// Maximum age for queued packets before applying backpressure (25ms, matches Go).
-const MAX_PACKET_AGE_SEND: Duration = Duration::from_millis(25);
-
-/// Send a batch of traffic packets to their respective peers with backpressure.
+/// Send a batch of traffic packets to their respective peers.
 ///
 /// Locks the peers mutex once to collect all queue/notify handles, then drops
 /// the lock before pushing packets. This avoids per-packet lock acquisition
@@ -234,20 +231,11 @@ async fn send_traffic_to_peers_batch(peers: &Arc<tokio::sync::Mutex<Peers>>, bat
     // peers lock is dropped here
 
     // Phase 2: push packets and notify writers (no peers lock held).
-    for (peer_id, traffic, traffic_queue, traffic_notify) in resolved {
+    for (_peer_id, traffic, traffic_queue, traffic_notify) in resolved {
         {
             let mut queue = traffic_queue.lock().await;
-            if let Some(age) = queue.oldest_age() {
-                if age > MAX_PACKET_AGE_SEND {
-                    if queue.drop_largest() {
-                        tracing::warn!(
-                            "send_traffic_to_peer[{}]: dropped oldest packet (age={:?} > 25ms) - backpressure applied",
-                            peer_id,
-                            age
-                        );
-                    }
-                }
-            }
+            // Overload is handled by CoDel at dequeue (`drain_traffic_queue`);
+            // `push` only enforces the hard byte caps.
             queue.push(traffic);
         }
         traffic_notify.notify_one();
@@ -651,9 +639,10 @@ async fn drain_traffic_queue<W: tokio::io::AsyncWrite + Unpin>(
     // Lock once, pop a batch of packets, unlock, then write them all.
     let batch: Vec<TrafficPacket> = {
         let mut q = queue.lock().await;
+        let now = std::time::Instant::now();
         let mut batch = Vec::with_capacity(MAX_DRAIN_PER_ITER);
         for _ in 0..MAX_DRAIN_PER_ITER {
-            match q.pop() {
+            match q.pop_codel(now) {
                 Some(t) => batch.push(t),
                 None => break,
             }
