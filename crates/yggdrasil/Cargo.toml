@@ -63,7 +63,7 @@ version = "0.2"
 optional = true
 
 [dependencies.tun-rs]
-version = "2.8"
+version = "2.8.6"
 features = ["async_tokio"]
 optional = true
 
