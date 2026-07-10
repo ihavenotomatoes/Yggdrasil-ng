@@ -44,14 +44,15 @@ socket2 = "0.6.3"
 getifaddrs = "0.6"
 rustc-hash = "2.1.2"
 arc-swap = "1.9"
-md5 = "0.8"
-ureq = { version = "2.12", default-features = false, features = ["tls"] }
+md5 = { version = "0.8", default-features = false, optional = true }
+ureq = { version = "2.12", default-features = false, features = ["tls"], optional = true }
 
 [features]
 default = ["ctl", "tun", "systemd", "ckr"]
 ctl = []
 tun = ["dep:tun-rs"]
 ckr = ["dep:route_manager"]
+ckr-advanced = ["ckr", "dep:md5", "dep:ureq"]
 systemd = ["dep:sd-notify"]
 
 [dependencies.ipnet]

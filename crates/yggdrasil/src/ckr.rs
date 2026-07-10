@@ -3,11 +3,13 @@ use std::io::{BufRead, BufReader};
 use std::net::IpAddr;
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
-use std::fs;
-use std::io::Read;
-use std::path::PathBuf;
-use std::time::Duration;
-
+#[cfg(feature = "ckr-advanced")]
+use {
+std::fs,
+std::io::Read,
+std::path::PathBuf,
+std::time::Duration,
+};
 use url::Url;
 use ipnet::IpNet;
 #[cfg(not(target_os = "android"))]
@@ -17,6 +19,7 @@ use crate::address::{is_valid_address, is_valid_subnet};
 use crate::config::TunnelRoutingConfig;
 use crate::core::Core;
 use crate::links::PeerEvent;
+
 
 const INETV4_PREFIXES: &[&str] = &[
     "0.0.0.0/5", "8.0.0.0/7", "11.0.0.0/8", "12.0.0.0/6", "16.0.0.0/4", "32.0.0.0/3", "64.0.0.0/2", "128.0.0.0/3",
@@ -86,6 +89,7 @@ impl CryptoKey {
 
             // Combine config entries with downloaded HTTP/HTTPS route lists
             let mut effective_entries = cidrs.clone();
+            #[cfg(feature = "ckr-advanced")]
             effective_entries.extend(get_downloaded_virtual_file_entries(pubkey_hex));
             // Append peer underlay exclusions (from config.peers, resolved at startup after network is up).
             // These "!IP"/"!IPv6" entries are applied to *every* remote_subnets public key so that
@@ -215,7 +219,7 @@ pub fn expand_cidrs(entries: &[String]) -> Result<Vec<IpNet>, String> {
     let mut resolved_entries: Vec<String> = Vec::new();
     for entry in entries {
         let trimmed = entry.trim().to_owned();
-        if !(trimmed.starts_with("file:///") || trimmed.starts_with("~file:///") || trimmed.starts_with("!file:///") || trimmed.starts_with("_file:///") ||
+        if cfg!(not(feature = "ckr-advanced")) || !(trimmed.starts_with("file:///") || trimmed.starts_with("~file:///") || trimmed.starts_with("!file:///") || trimmed.starts_with("_file:///") ||
              trimmed.starts_with("http://") || trimmed.starts_with("https://") || trimmed.starts_with("~http://") || trimmed.starts_with("~https://") ||
              trimmed.starts_with("!http://") || trimmed.starts_with("!https://") || trimmed.starts_with("_http://") || trimmed.starts_with("_https://")) {
             resolved_entries.push(trimmed);
@@ -230,6 +234,7 @@ pub fn expand_cidrs(entries: &[String]) -> Result<Vec<IpNet>, String> {
         } else {
             ("", trimmed.as_str())
         };
+        
         let url = Url::parse(url_str)
             .map_err(|e| format!("invalid file URL '{}': {}", url_str, e))?;
         if url.scheme() != "file" && url.scheme() != "http" && url.scheme() != "https" {
@@ -457,6 +462,7 @@ pub fn install_routes(
 
         // Include downloaded route lists from yggdrasil_routes_download
         let mut effective_entries = subnet_list.clone();
+        #[cfg(feature = "ckr-advanced")]
         effective_entries.extend(get_downloaded_virtual_file_entries(pubkey_hex));
         // Append peer underlay exclusions (from config.peers, resolved at startup after network is up).
         // These "!IP"/"!IPv6" entries are applied to *every* remote_subnets public key so that
@@ -520,6 +526,7 @@ pub fn remove_routes(config: &TunnelRoutingConfig, tun_name: &str, self_key: &[u
         // Include downloaded HTTP/HTTPS route lists from yggdrasil_routes_download/<pubkey>/
         // These are treated exactly the same as "file://" entries from the config.
         let mut effective_entries = subnet_list.clone();
+        #[cfg(feature = "ckr-advanced")]
         effective_entries.extend(get_downloaded_virtual_file_entries(pubkey_hex));
         // Append peer underlay exclusions (from config.peers, resolved at startup after network is up).
         // These "!IP"/"!IPv6" entries are applied to *every* remote_subnets public key so that
@@ -572,6 +579,7 @@ fn sort_routes(a: &Route, b: &Route) -> std::cmp::Ordering {
 
 /// Returns OS-specific base directory for downloaded route lists.
 /// Matches exactly the paths specified in the task (Linux/BSD, macOS, Windows).
+#[cfg(feature = "ckr-advanced")]
 fn get_routes_download_base_dir() -> PathBuf {
     if cfg!(target_os = "macos") {
         PathBuf::from("/Library/Caches/yggdrasil_routes_download")
@@ -585,6 +593,7 @@ fn get_routes_download_base_dir() -> PathBuf {
 
 /// Returns true if filename starts with index >= current_count (e.g. "2-..." when only 0,1 exist).
 /// Used to remove stale files after config change.
+#[cfg(feature = "ckr-advanced")]
 fn is_stale_index_file(name: &str, current_count: usize) -> bool {
     if let Some(dash_pos) = name.find('-') {
         if let Ok(idx) = name[..dash_pos].parse::<usize>() {
@@ -596,6 +605,7 @@ fn is_stale_index_file(name: &str, current_count: usize) -> bool {
 
 /// Extracts optional prefix (~, _, !) and the bare http(s):// URL.
 /// Reuses the same strip_prefix logic already present in expand_cidrs.
+#[cfg(feature = "ckr-advanced")]
 fn extract_prefix_url(entry: &str) -> (Option<char>, &str) {
     let t = entry.trim();
     if let Some(rest) = t.strip_prefix('~') {
@@ -611,6 +621,7 @@ fn extract_prefix_url(entry: &str) -> (Option<char>, &str) {
 
 /// Blocking download with exactly 3 attempts and 10s timeout each.
 /// Returns body only on final 200 + successful read. Warn is done by caller.
+#[cfg(feature = "ckr-advanced")]
 fn download_with_retries(url: &str, max_attempts: u32, timeout: Duration) -> Result<Vec<u8>, String> {
     // Delay before the very first download attempt
     std::thread::sleep(Duration::from_millis(2000));
@@ -650,6 +661,7 @@ fn download_with_retries(url: &str, max_attempts: u32, timeout: Duration) -> Res
 }
 
 /// Removes empty subdirectories inside base (after stale file cleanup).
+#[cfg(feature = "ckr-advanced")]
 fn remove_empty_dirs(base: &PathBuf) {
     if let Ok(rd) = fs::read_dir(base) {
         for e in rd.flatten() {
@@ -671,11 +683,57 @@ fn remove_empty_dirs(base: &PathBuf) {
 /// - Finally removes any empty subdirs.
 /// - 3 attempts, 10s timeout. Warn only on final failure per URL.
 /// - Blocking call — we wait until finished before next startup stage.
+#[cfg(feature = "ckr-advanced")]
 pub fn download_route_lists(config: &TunnelRoutingConfig, core: &Core) {
-    // Delay before checking for connected peers
-    std::thread::sleep(Duration::from_millis(2000));
-    // === Wait for the first peer or 15s timeout ===
+if !config.enable {
+        return;
+    }
+
+    // Fast check: do we have any http(s) entries at all?
+    let has_http_entries = config.remote_subnets.values().any(|entries| {
+        entries.iter().any(|e| {
+            let t = e.trim();
+            t.starts_with("http://")
+                || t.starts_with("https://")
+                || t.starts_with("~http://")
+                || t.starts_with("~https://")
+                || t.starts_with("_http://")
+                || t.starts_with("_https://")
+                || t.starts_with("!http://")
+                || t.starts_with("!https://")
+        })
+    });
+
+    if !has_http_entries {
+        // No http(s) route lists in config → skip long peer wait and all logging,
+        // but still clean up any previously downloaded files so they don't
+        // keep generating routes.
+        let base_dir = get_routes_download_base_dir();
+        if base_dir.exists() {
+            if let Ok(rd) = fs::read_dir(&base_dir) {
+                for dent in rd.flatten() {
+                    let subdir = dent.path();
+                    if subdir.is_dir() {
+                        if let Ok(rd2) = fs::read_dir(&subdir) {
+                            for f in rd2.flatten() {
+                                let fname = f.file_name().to_string_lossy().into_owned();
+                                if is_stale_index_file(&fname, 0) {
+                                    let _ = fs::remove_file(f.path());
+                                }
+                            }
+                        }
+                        let _ = fs::remove_dir(&subdir);
+                    }
+                }
+            }
+        }
+        return;
+    }
+
     {
+        // Delay before checking for connected peers
+        std::thread::sleep(Duration::from_millis(2000));
+
         // First check: maybe static peers from config.peers already connected
         // during core.start() (before we subscribed to events).
         let already_has_peers = tokio::task::block_in_place(|| {
@@ -683,7 +741,7 @@ pub fn download_route_lists(config: &TunnelRoutingConfig, core: &Core) {
         });
 
         if already_has_peers {
-            tracing::info!("Peers already connected. Prepare to launch CKR immediately");
+            tracing::info!("Peers already connected. Prepare to download route list(s)");
         } else {
             let mut peer_rx = core.subscribe_peer_events();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
@@ -696,7 +754,7 @@ pub fn download_route_lists(config: &TunnelRoutingConfig, core: &Core) {
                 match peer_rx.try_recv() {
                     Ok(PeerEvent::Connected { key, .. }) => {
                         tracing::info!(
-                            "First peer connected ({}). Preparing to launch CKR",
+                            "First peer connected ({}). Preparing to download route list(s)",
                             hex::encode(&key[..8])
                         );
                         first_peer_connected = true;
@@ -714,7 +772,7 @@ pub fn download_route_lists(config: &TunnelRoutingConfig, core: &Core) {
             }
 
             if !first_peer_connected && !already_has_peers {
-                tracing::info!("No peers connected within 15 seconds. Proceeding anyway.");
+                tracing::info!("No peers connected within 15 seconds. Proceeding download route list(s) anyway.");
             }
         }
     }
@@ -863,6 +921,7 @@ pub fn download_route_lists(config: &TunnelRoutingConfig, core: &Core) {
 /// Scans the download directory for a given pubkey and returns virtual
 /// "file://" entries (with correct ~, _, ! prefixes) so they can be
 /// processed by the existing expand_cidrs + ROUTE_FILE_CACHE logic.
+#[cfg(feature = "ckr-advanced")]
 fn get_downloaded_virtual_file_entries(pubkey: &str) -> Vec<String> {
     let base = get_routes_download_base_dir();
     let dir = base.join(pubkey);
@@ -949,7 +1008,74 @@ fn extract_peer_host(peer: &str) -> Option<String> {
 /// These exclusions then apply to *all* public keys in tunnel_routing.remote_subnets.
 /// Non-Android only. Safe to call even if peers list is empty or contains only IPs.
 #[cfg(not(target_os = "android"))]
-pub fn prepare_peer_exclusions(peers: &[String]) {
+pub fn prepare_peer_exclusions(tunnel_routing: &TunnelRoutingConfig, core: &Core, peers: &[String]) {
+    if tunnel_routing.remote_subnets.is_empty() {
+        // If there are no entries in `tunnel_routing.remote_subnets` (or the section is missing) —
+        // there is no need to prepare peer exceptions or write anything to the log.
+        {
+            let mut guard = PEER_EXCLUSIONS.lock().unwrap();
+            *guard = Some(Vec::new());
+        }
+        return;
+    }
+
+    // If at least one peer uses a domain name, wait for network connectivity
+    // (max 15 seconds) before resolving domains, then sleep extra 1500ms.
+    let has_domain_peer = peers.iter().any(|peer| {
+        if let Some(host) = extract_peer_host(peer) {
+            host.parse::<IpAddr>().is_err()
+        } else {
+            false
+        }
+    });
+
+    if has_domain_peer {
+        // First check if peers are already connected
+        let already_has_peers = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(core.has_any_peers())
+        });
+
+        if already_has_peers {
+            tracing::info!("Peer(s) already connected. Resolving peer domains immediately");
+        } else {
+            let mut peer_rx = core.subscribe_peer_events();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+
+            tracing::info!("Waiting for first peer connection (max 15s) before resolving domains...");
+
+            let mut first_peer_connected = false;
+
+            while std::time::Instant::now() < deadline {
+                match peer_rx.try_recv() {
+                    Ok(PeerEvent::Connected { key, .. }) => {
+                        tracing::info!(
+                            "First peer connected ({}). Preparing to resolve domains",
+                            hex::encode(&key[..8])
+                        );
+                        first_peer_connected = true;
+                        break;
+                    }
+                    Ok(_) => {} // ignore Disconnected
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                }
+            }
+
+            if !first_peer_connected && !already_has_peers {
+                tracing::info!("No peers connected within 15 seconds. Proceeding with domain resolution anyway.");
+            }
+        }
+
+        // Additional 3000ms delay after peer connection (or timeout)
+        // to ensure the Yggdrasil network is ready for DNS resolution.
+        std::thread::sleep(std::time::Duration::from_millis(3000));
+    }
+
     let mut exclusions: Vec<String> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -1030,9 +1156,8 @@ fn get_peer_exclusion_entries() -> Vec<String> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    #[cfg(feature = "ckr-advanced")]
     use std::env;
-    use std::fs;
-    use url::Url;
 
     fn make_config(subnets: HashMap<String, Vec<String>>) -> TunnelRoutingConfig {
         TunnelRoutingConfig {
@@ -1490,6 +1615,7 @@ mod tests {
         // and that CKR route parsing still succeeds (the core of the "TUN assignment only" intent of the original test).
     }
 
+    #[cfg(feature = "ckr-advanced")]
     #[test]
     fn test_expand_cidrs_file_url_lists() {
         // Creates portable temp files (works on Linux/Windows) and exercises plain file:///, !file:///, and ~file:/// exactly as specified.
@@ -1534,6 +1660,7 @@ mod tests {
         assert_eq!(out, out2);
     }
 
+    #[cfg(feature = "ckr-advanced")]
     #[test]
     fn test_get_downloaded_virtual_file_entries() {
         let tmp = env::temp_dir();
