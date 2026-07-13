@@ -60,7 +60,7 @@ ctl = []
 tun = ["dep:tun-rs"]
 ckr = ["dep:route_manager"]
 systemd = ["dep:sd-notify"]
-# ws costs ~150 KiB of binary size, quic ~1.3 MiB; slim builds (e.g. OpenWrt)
+# ws costs ~300 KiB of binary size, quic ~1.2 MiB; slim builds (e.g. OpenWrt)
 # can drop either via --no-default-features with a hand-picked feature list.
 ws = ["dep:tokio-tungstenite", "dep:futures-util"]
 quic = ["dep:quinn"]

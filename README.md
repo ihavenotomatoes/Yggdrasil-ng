@@ -252,7 +252,7 @@ Both `peers` and `listen` accept the following URI schemes:
 | `wss://` | WebSocket over TLS — e.g. behind nginx with a real certificate | `ws` (default) |
 | `quic://` | QUIC over UDP | `quic` (default) |
 
-`ws://host` and `wss://host` default to ports 80/443; a path (e.g. `wss://host/yggdrasil`) is honored when dialing, which allows reverse proxies to route by path. For slim builds (e.g. OpenWrt), `ws` (~150 KiB) and `quic` (~1.3 MiB) can be excluded via `--no-default-features` with a hand-picked feature list.
+`ws://host` and `wss://host` default to ports 80/443; a path (e.g. `wss://host/yggdrasil`) is honored when dialing, which allows reverse proxies to route by path. For slim builds (e.g. OpenWrt), `ws` (~300 KiB) and `quic` (~1.2 MiB) can be excluded via `--no-default-features` with a hand-picked feature list, e.g. `--no-default-features --features ctl,tun,systemd` for the smallest useful daemon.
 
 ### Peer URI Query Parameters
 
