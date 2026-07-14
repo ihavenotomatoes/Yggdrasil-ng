@@ -504,7 +504,6 @@ impl Core {
     }
 
     /// Returns whether at least one peer is currently connected.
-    #[cfg(feature = "ckr-advanced")]
     pub async fn has_any_peers(&self) -> bool {
         self.active_links.has_active_connections().await
     }

@@ -240,6 +240,20 @@ name = "my-node"
 location = "datacenter-1"
 ```
 
+### Transports
+
+Both `peers` and `listen` accept the following URI schemes:
+
+| Scheme | Description | Cargo feature |
+|--------|-------------|---------------|
+| `tcp://` | Plain TCP | always available |
+| `tls://` | TLS over TCP (self-signed certs, authenticated by the Yggdrasil handshake) | always available |
+| `ws://` | WebSocket — useful behind HTTP reverse proxies | `ws` (default) |
+| `wss://` | WebSocket over TLS — e.g. behind nginx with a real certificate | `ws` (default) |
+| `quic://` | QUIC over UDP | `quic` (default) |
+
+`ws://host` and `wss://host` default to ports 80/443; a path (e.g. `wss://host/yggdrasil`) is honored when dialing, which allows reverse proxies to route by path. For slim builds (e.g. OpenWrt), `ws` (~300 KiB) and `quic` (~1.2 MiB) can be excluded via `--no-default-features` with a hand-picked feature list, e.g. `--no-default-features --features ctl,tun,systemd` for the smallest useful daemon.
+
 ### Peer URI Query Parameters
 
 Both `peers` entries and `listen` addresses support optional query-string parameters:
@@ -296,13 +310,13 @@ peers = [
   - `node_info_privacy` instead of `NodeInfoPrivacy`
   - `allowed_public_keys` instead of `AllowedPublicKeys`
 - **Single binary**: Daemon and control tool are combined (no separate `yggdrasilctl`)
-- **Transport support**: TCP and TLS only
+- **Transport support**: TCP, TLS, WebSocket (ws/wss) and QUIC — same schemes as Go
 - **Admin socket**: Defaults to TCP `localhost:9001` instead of Unix socket
 
 **Migration from Go config:**
 1. Convert HJSON/JSON to TOML format
 2. Rename all fields from PascalCase to snake_case
-3. Change transport URIs as needed (QUIC and WebSocket are not supported — use `tcp://` or `tls://`)
+3. Transport URIs (`tcp://`, `tls://`, `ws://`, `wss://`, `quic://`) work unchanged
 4. Update admin socket to TCP format if using Unix socket
 
 ## Crypto-Key Routing (CKR)

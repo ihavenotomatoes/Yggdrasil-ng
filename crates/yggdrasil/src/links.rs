@@ -444,7 +444,6 @@ impl ActiveLinks {
     }
 
     /// Returns true if there is at least one active peer connection right now.
-    #[cfg(feature = "ckr-advanced")]
     pub async fn has_active_connections(&self) -> bool {
         let inner = self.inner.lock().await;
         !inner.connections.is_empty()

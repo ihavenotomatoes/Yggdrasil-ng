@@ -54,7 +54,7 @@ futures-util = { version = "0.3", optional = true }
 # security-framework, webpki roots, ...) from the build graph.
 quinn = { version = "0.11", optional = true, default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 
-# Route list text files support (ckr-advanced)
+# CKR advanced features (ckr-advanced) Currently only route list text files support.
 md5 = { version = "0.8", default-features = false, optional = true }
 ureq = { version = "2.12", default-features = false, features = ["tls"], optional = true }
 

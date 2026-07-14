@@ -17,3 +17,7 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace
+
+      # Keep the slim build (no ws/quic — e.g. OpenWrt) compiling.
+      - name: Check slim build
+        run: cargo check -p yggdrasil --no-default-features --features ctl,tun,systemd,ckr
