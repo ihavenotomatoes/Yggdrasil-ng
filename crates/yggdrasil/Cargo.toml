@@ -44,16 +44,31 @@ socket2 = "0.6.3"
 getifaddrs = "0.6"
 rustc-hash = "2.1.2"
 arc-swap = "1.9"
+
+# WebSocket (ws:// / wss://) transport, pulled in by the `ws` feature.
+tokio-tungstenite = { version = "0.26", optional = true }
+futures-util = { version = "0.3", optional = true }
+
+# QUIC (quic://) transport, pulled in by the `quic` feature. Default features
+# are disabled to drop the unused platform certificate verifier (jni,
+# security-framework, webpki roots, ...) from the build graph.
+quinn = { version = "0.11", optional = true, default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+
+# Route list text files support (ckr-advanced)
 md5 = { version = "0.8", default-features = false, optional = true }
 ureq = { version = "2.12", default-features = false, features = ["tls"], optional = true }
 
 [features]
-default = ["ctl", "tun", "systemd", "ckr"]
+default = ["ctl", "tun", "systemd", "ckr", "ws", "quic"]
 ctl = []
 tun = ["dep:tun-rs"]
 ckr = ["dep:route_manager"]
-ckr-advanced = ["ckr", "dep:md5", "dep:ureq"]
 systemd = ["dep:sd-notify"]
+# ws costs ~300 KiB of binary size, quic ~1.2 MiB; slim builds (e.g. OpenWrt)
+# can drop either via --no-default-features with a hand-picked feature list.
+ws = ["dep:tokio-tungstenite", "dep:futures-util"]
+quic = ["dep:quinn"]
+ckr-advanced = ["ckr", "dep:md5", "dep:ureq"]
 
 [dependencies.ipnet]
 version = "2"

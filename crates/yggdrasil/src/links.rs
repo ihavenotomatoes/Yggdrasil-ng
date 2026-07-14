@@ -17,14 +17,23 @@ use url::Url;
 use rustls::pki_types::CertificateDer;
 
 use crate::core::Core;
-use crate::tls_support::extract_ed25519_pubkey_from_cert;
+use crate::transport::tls::extract_ed25519_pubkey_from_cert;
 use crate::version::Metadata;
 
-/// Enum to handle both TCP and TLS streams uniformly.
+#[cfg(feature = "quic")]
+use crate::transport::quic;
+#[cfg(feature = "ws")]
+use crate::transport::ws;
+
+/// Enum to handle TCP, TLS, WebSocket and QUIC streams uniformly.
 pub(crate) enum Stream {
     Tcp(TcpStream),
     Tls(tokio_rustls::server::TlsStream<TcpStream>),
     TlsClient(tokio_rustls::client::TlsStream<TcpStream>),
+    #[cfg(feature = "ws")]
+    Ws(ws::WsStream),
+    #[cfg(feature = "quic")]
+    Quic(quic::QuicStream),
 }
 
 impl Stream {
@@ -33,11 +42,16 @@ impl Stream {
             Stream::Tcp(s) => s.peer_addr(),
             Stream::Tls(s) => s.get_ref().0.peer_addr(),
             Stream::TlsClient(s) => s.get_ref().0.peer_addr(),
+            #[cfg(feature = "ws")]
+            Stream::Ws(s) => Ok(s.peer_addr()),
+            #[cfg(feature = "quic")]
+            Stream::Quic(s) => Ok(s.peer_addr()),
         }
     }
 
-    /// Extract the first peer certificate from a TLS connection.
-    /// Returns `None` for plain TCP or if no peer certificate is available.
+    /// Extract the first peer certificate from a TLS-carrying connection
+    /// (tls, wss, quic). Returns `None` for plain TCP/ws or if no peer
+    /// certificate is available.
     fn peer_tls_cert(&self) -> Option<&CertificateDer<'static>> {
         match self {
             Stream::Tcp(_) => None,
@@ -49,6 +63,10 @@ impl Stream {
                 // Client-side: server's certificate
                 s.get_ref().1.peer_certificates()?.first()
             }
+            #[cfg(feature = "ws")]
+            Stream::Ws(s) => s.peer_cert(),
+            #[cfg(feature = "quic")]
+            Stream::Quic(s) => s.peer_cert(),
         }
     }
 }
@@ -63,6 +81,10 @@ impl AsyncRead for Stream {
             Stream::Tcp(s) => Pin::new(s).poll_read(cx, buf),
             Stream::Tls(s) => Pin::new(s).poll_read(cx, buf),
             Stream::TlsClient(s) => Pin::new(s).poll_read(cx, buf),
+            #[cfg(feature = "ws")]
+            Stream::Ws(s) => Pin::new(s).poll_read(cx, buf),
+            #[cfg(feature = "quic")]
+            Stream::Quic(s) => Pin::new(s).poll_read(cx, buf),
         }
     }
 }
@@ -77,6 +99,10 @@ impl AsyncWrite for Stream {
             Stream::Tcp(s) => Pin::new(s).poll_write(cx, buf),
             Stream::Tls(s) => Pin::new(s).poll_write(cx, buf),
             Stream::TlsClient(s) => Pin::new(s).poll_write(cx, buf),
+            #[cfg(feature = "ws")]
+            Stream::Ws(s) => Pin::new(s).poll_write(cx, buf),
+            #[cfg(feature = "quic")]
+            Stream::Quic(s) => Pin::new(s).poll_write(cx, buf),
         }
     }
 
@@ -85,6 +111,10 @@ impl AsyncWrite for Stream {
             Stream::Tcp(s) => Pin::new(s).poll_flush(cx),
             Stream::Tls(s) => Pin::new(s).poll_flush(cx),
             Stream::TlsClient(s) => Pin::new(s).poll_flush(cx),
+            #[cfg(feature = "ws")]
+            Stream::Ws(s) => Pin::new(s).poll_flush(cx),
+            #[cfg(feature = "quic")]
+            Stream::Quic(s) => Pin::new(s).poll_flush(cx),
         }
     }
 
@@ -93,6 +123,10 @@ impl AsyncWrite for Stream {
             Stream::Tcp(s) => Pin::new(s).poll_shutdown(cx),
             Stream::Tls(s) => Pin::new(s).poll_shutdown(cx),
             Stream::TlsClient(s) => Pin::new(s).poll_shutdown(cx),
+            #[cfg(feature = "ws")]
+            Stream::Ws(s) => Pin::new(s).poll_shutdown(cx),
+            #[cfg(feature = "quic")]
+            Stream::Quic(s) => Pin::new(s).poll_shutdown(cx),
         }
     }
 }
@@ -410,11 +444,13 @@ impl ActiveLinks {
     }
 
     /// Returns true if there is at least one active peer connection right now.
+    #[cfg(feature = "ckr-advanced")]
     pub async fn has_active_connections(&self) -> bool {
         let inner = self.inner.lock().await;
         !inner.connections.is_empty()
     }
     
+
     async fn register(&self, uri: String, inbound: bool, key: [u8; 32], priority: u8) -> Option<(u64, Arc<AtomicUsize>, Arc<AtomicUsize>)> {
         let mut inner = self.inner.lock().await;
         // Reject duplicate: same key + same direction
@@ -611,15 +647,11 @@ impl Links {
         self.core.clone().ok_or_else(|| "core not initialized".to_string())
     }
 
-    /// Start listening on an address (e.g. "tcp://0.0.0.0:1234" or "tls://0.0.0.0:2345").
+    /// Start listening on an address (e.g. "tcp://0.0.0.0:1234", "tls://0.0.0.0:2345",
+    /// "ws://0.0.0.0:80", "wss://0.0.0.0:443" or "quic://0.0.0.0:4567").
     pub async fn listen(&mut self, addr: &str) -> Result<(), String> {
         let url = Url::parse(addr).map_err(|e| format!("invalid URL: {}", e))?;
-        let scheme = url.scheme();
-        let use_tls = match scheme {
-            "tcp" => false,
-            "tls" => true,
-            _ => return Err(format!("unsupported scheme: {}", scheme)),
-        };
+        let scheme = url.scheme().to_string();
 
         let host_port = url
             .socket_addrs(|| Some(0))
@@ -634,6 +666,74 @@ impl Links {
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
         let addr_str = addr.to_string();
+
+        // QUIC listens on a UDP endpoint with its own channel-based accept loop.
+        #[cfg(feature = "quic")]
+        if scheme == "quic" {
+            let bind_addr: SocketAddr = host_port
+                .parse()
+                .map_err(|e| format!("invalid bind address {}: {}", host_port, e))?;
+            let server_config = core.tls_server_config.read().await.clone();
+            let listener =
+                quic::quic_listen(bind_addr, server_config, self.connection_limiter.clone())
+                    .await?;
+            tracing::info!("Listening on quic://{}", listener.local_addr());
+
+            let handle = tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = cancel_clone.cancelled() => {
+                            listener.close();
+                            break;
+                        }
+                        result = listener.accept() => {
+                            let Ok(qs) = result else { break }; // listener closed
+                            let remote = qs.peer_addr();
+                            tracing::debug!("Accepted quic connection from {}", remote);
+                            let core = core.clone();
+                            let opts = options.clone();
+                            let active = active.clone();
+                            let remote_str = format_peer_uri("quic", &remote);
+                            tokio::spawn(async move {
+                                // The connection-limiter permit rides inside the
+                                // QuicStream and is released when it drops.
+                                let _ = handle_connection(
+                                    LinkType::Incoming,
+                                    opts,
+                                    Stream::Quic(qs),
+                                    &core,
+                                    &active,
+                                    &remote_str,
+                                ).await;
+                            });
+                        }
+                    }
+                }
+            });
+
+            self.listeners.insert(addr_str, (cancel, handle));
+            return Ok(());
+        }
+
+        // tcp / tls / ws / wss all listen on a TCP socket; tls/wss add a TLS
+        // handshake and ws/wss add a WebSocket handshake on top.
+        let (use_tls, use_ws) = match scheme.as_str() {
+            "tcp" => (false, false),
+            "tls" => (true, false),
+            #[cfg(feature = "ws")]
+            "ws" => (false, true),
+            #[cfg(feature = "ws")]
+            "wss" => (true, true),
+            #[cfg(not(feature = "ws"))]
+            "ws" | "wss" => {
+                return Err("ws/wss support not compiled in (enable the `ws` feature)".to_string())
+            }
+            #[cfg(not(feature = "quic"))]
+            "quic" => {
+                return Err("quic support not compiled in (enable the `quic` feature)".to_string())
+            }
+            _ => return Err(format!("unsupported scheme: {}", scheme)),
+        };
 
         let listener = TcpListener::bind(&host_port)
             .await
@@ -683,26 +783,19 @@ impl Links {
                                 let opts = options.clone();
                                 let active = active.clone();
                                 let acceptor = tls_acceptor.clone();
-                                let remote_str = format_peer_uri(
-                                    if acceptor.is_some() { "tls" } else { "tcp" },
-                                    &remote,
-                                );
+                                let remote_str = format_peer_uri(&scheme, &remote);
 
                                 tokio::spawn(async move {
                                     // Permit is held for the duration of this task
 
-                                    // Perform TLS handshake if needed
-                                    let wrapped_stream = if let Some(acceptor) = acceptor {
-                                        match acceptor.accept(stream).await {
-                                            Ok(tls_stream) => Stream::Tls(tls_stream),
-                                            Err(e) => {
-                                                tracing::debug!("TLS handshake failed from {}: {}", remote, e);
-                                                drop(permit);
-                                                return;
-                                            }
+                                    // Perform TLS and/or WebSocket handshakes as needed
+                                    let wrapped_stream = match wrap_incoming(stream, acceptor, use_ws, remote).await {
+                                        Ok(s) => s,
+                                        Err(e) => {
+                                            tracing::debug!("{} from {}", e, remote);
+                                            drop(permit);
+                                            return;
                                         }
-                                    } else {
-                                        Stream::Tcp(stream)
                                     };
 
                                     let _ = handle_connection(
@@ -738,13 +831,34 @@ impl Links {
         }
 
         let url = Url::parse(uri).map_err(|e| format!("invalid URI: {}", e))?;
-        let scheme = url.scheme();
-        if scheme != "tcp" && scheme != "tls" {
-            return Err(format!("unsupported scheme: {}", scheme));
-        }
+        let scheme = url.scheme().to_string();
+        // `use_quic` is only read when the quic feature is enabled.
+        #[cfg_attr(not(feature = "quic"), allow(unused_variables))]
+        let (use_tls, use_ws, use_quic) = match scheme.as_str() {
+            "tcp" => (false, false, false),
+            "tls" => (true, false, false),
+            #[cfg(feature = "ws")]
+            "ws" => (false, true, false),
+            #[cfg(feature = "ws")]
+            "wss" => (true, true, false),
+            #[cfg(feature = "quic")]
+            "quic" => (false, false, true),
+            #[cfg(not(feature = "ws"))]
+            "ws" | "wss" => {
+                return Err("ws/wss support not compiled in (enable the `ws` feature)".to_string())
+            }
+            #[cfg(not(feature = "quic"))]
+            "quic" => {
+                return Err("quic support not compiled in (enable the `quic` feature)".to_string())
+            }
+            _ => return Err(format!("unsupported scheme: {}", scheme)),
+        };
 
         let host = url.host_str().ok_or("missing host")?.to_string();
-        let port = url.port().ok_or("missing port")?;
+        // `port_or_known_default()` so `ws://host` / `wss://host` infer 80/443.
+        // (The `url` crate omits a port equal to the scheme's known default, so
+        // even an explicit `wss://host:443` reports `port() == None`.)
+        let port = url.port_or_known_default().ok_or("missing port")?;
         let target = format!("{}:{}", host, port);
 
         // Attempt DNS resolution for duplicate detection.
@@ -778,10 +892,16 @@ impl Links {
         let uri_str = uri.to_string();
         let retry_notify = self.retry_notify.clone();
 
-        let use_tls = scheme == "tls";
+        // tls/wss use a TLS connector; quic needs the raw rustls client config.
         let tls_connector = if use_tls {
             let client_config = core.tls_client_config.read().await.clone();
             Some(TlsConnector::from(client_config))
+        } else {
+            None
+        };
+        #[cfg(feature = "quic")]
+        let quic_client_config = if use_quic {
+            Some(core.tls_client_config.read().await.clone())
         } else {
             None
         };
@@ -797,51 +917,43 @@ impl Links {
                     break;
                 }
 
-                let result = tokio::time::timeout(
-                    DIAL_TIMEOUT,
-                    TcpStream::connect(&target),
+                // Dial according to scheme. tcp/tls/ws/wss go through dial_stream
+                // (TCP + optional TLS + optional WebSocket); quic uses its own
+                // UDP-based dialer.
+                #[cfg(feature = "quic")]
+                let dial_result: Result<Stream, String> = if use_quic {
+                    quic::quic_connect(
+                        &url,
+                        quic_client_config.clone().expect("quic client config"),
+                    )
+                    .await
+                    .map(Stream::Quic)
+                } else {
+                    dial_stream(
+                        &target,
+                        &host,
+                        port,
+                        url.path(),
+                        options.tls_sni.as_deref(),
+                        tls_connector.as_ref(),
+                        use_ws,
+                    )
+                    .await
+                };
+                #[cfg(not(feature = "quic"))]
+                let dial_result: Result<Stream, String> = dial_stream(
+                    &target,
+                    &host,
+                    port,
+                    url.path(),
+                    options.tls_sni.as_deref(),
+                    tls_connector.as_ref(),
+                    use_ws,
                 )
                 .await;
 
-                match result {
-                    Ok(Ok(stream)) => {
-                        stream.set_nodelay(true).ok();
-
-                        // Perform TLS handshake if needed
-                        let wrapped_stream = if let Some(ref connector) = tls_connector {
-                            // Use SNI from options (explicit ?sni= or hostname fallback), else raw host
-                            let sni_host = options.tls_sni.clone().unwrap_or_else(|| host.clone());
-                            let server_name = rustls::pki_types::ServerName::try_from(sni_host.as_str().to_owned())
-                                .unwrap_or_else(|_| {
-                                    // Fallback to using IP address as server name if hostname parsing fails
-                                    rustls::pki_types::ServerName::IpAddress(
-                                        rustls::pki_types::IpAddr::try_from(host.as_str())
-                                            .expect("invalid hostname")
-                                    )
-                                });
-
-                            match connector.connect(server_name, stream).await {
-                                Ok(tls_stream) => Stream::TlsClient(tls_stream),
-                                Err(e) => {
-                                    let err_msg = format!("TLS handshake failed: {}", e);
-                                    tracing::debug!("{} to {}", err_msg, target);
-                                    peer_errors.lock().await.insert(uri_str.clone(), Some(err_msg));
-                                    // Continue to backoff logic below
-                                    backoff = (backoff + 1).min(BACKOFF_SHIFT_MAX);
-                                    let wait = Duration::from_secs(1u64 << backoff.min(BACKOFF_SHIFT_MAX))
-                                        .min(options.max_backoff);
-                                    tokio::select! {
-                                        _ = cancel_clone.cancelled() => break,
-                                        _ = tokio::time::sleep(wait) => {}
-                                        _ = retry_notify.notified() => {}
-                                    }
-                                    continue;
-                                }
-                            }
-                        } else {
-                            Stream::Tcp(stream)
-                        };
-
+                match dial_result {
+                    Ok(wrapped_stream) => {
                         // Connected successfully — clear error
                         peer_errors.lock().await.insert(uri_str.clone(), None);
 
@@ -864,14 +976,8 @@ impl Links {
                             }
                         }
                     }
-                    Ok(Err(e)) => {
-                        let err_msg = format!("Failed to connect: {}", e);
+                    Err(err_msg) => {
                         tracing::debug!("{} to {}", err_msg, target);
-                        peer_errors.lock().await.insert(uri_str.clone(), Some(err_msg));
-                    }
-                    Err(_) => {
-                        let err_msg = "Connection timed out".to_string();
-                        tracing::debug!("{}: {}", err_msg, target);
                         peer_errors.lock().await.insert(uri_str.clone(), Some(err_msg));
                     }
                 }
@@ -966,6 +1072,14 @@ pub(crate) async fn handle_connection(
             .write_all(&encoded)
             .await
             .map_err(|e| format!("write handshake: {}", e))?;
+        // Flush is mandatory for buffered transports (WebSocket): `write_all`
+        // only queues into the sink, so without this the metadata frame never
+        // reaches the peer and both sides stall until the handshake times out.
+        // No-op for raw TCP.
+        stream
+            .flush()
+            .await
+            .map_err(|e| format!("flush handshake: {}", e))?;
 
         // Read directly from stream without BufReader to avoid consuming
         // ironwood protocol data that arrives right after the handshake.
@@ -1155,6 +1269,118 @@ pub(crate) async fn handle_connection(
     }
 
     result
+}
+
+/// Wrap an accepted TCP connection according to the listener's scheme:
+/// optional TLS handshake (tls/wss), then optional WebSocket handshake (ws/wss).
+async fn wrap_incoming(
+    stream: TcpStream,
+    acceptor: Option<TlsAcceptor>,
+    use_ws: bool,
+    remote: SocketAddr,
+) -> Result<Stream, String> {
+    #[cfg(not(feature = "ws"))]
+    let _ = (use_ws, remote); // ws:// and wss:// are rejected at listen() time
+
+    #[cfg(feature = "ws")]
+    if use_ws {
+        return match acceptor {
+            Some(acceptor) => {
+                let tls_stream = acceptor
+                    .accept(stream)
+                    .await
+                    .map_err(|e| format!("TLS handshake failed: {}", e))?;
+                // Client cert (if presented) for cert/identity binding in
+                // handle_connection.
+                let peer_cert = tls_stream
+                    .get_ref()
+                    .1
+                    .peer_certificates()
+                    .and_then(|certs| certs.first().cloned());
+                let ws = ws::ws_server_handshake(Box::new(tls_stream), remote, peer_cert).await?;
+                Ok(Stream::Ws(ws))
+            }
+            None => {
+                let ws = ws::ws_server_handshake(Box::new(stream), remote, None).await?;
+                Ok(Stream::Ws(ws))
+            }
+        };
+    }
+
+    match acceptor {
+        Some(acceptor) => {
+            let tls_stream = acceptor
+                .accept(stream)
+                .await
+                .map_err(|e| format!("TLS handshake failed: {}", e))?;
+            Ok(Stream::Tls(tls_stream))
+        }
+        None => Ok(Stream::Tcp(stream)),
+    }
+}
+
+/// Dial a TCP-based peer (tcp/tls/ws/wss): TCP connect, then an optional TLS
+/// handshake (tls/wss) and an optional WebSocket handshake (ws/wss), producing
+/// a ready `Stream`.
+async fn dial_stream(
+    target: &str,
+    host: &str,
+    port: u16,
+    path: &str,
+    sni: Option<&str>,
+    tls_connector: Option<&TlsConnector>,
+    use_ws: bool,
+) -> Result<Stream, String> {
+    #[cfg(not(feature = "ws"))]
+    let _ = (port, path, use_ws); // ws:// and wss:// are rejected at add_peer() time
+
+    let stream = tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect(target))
+        .await
+        .map_err(|_| "Connection timed out".to_string())?
+        .map_err(|e| format!("Failed to connect: {}", e))?;
+    stream.set_nodelay(true).ok();
+    #[cfg(feature = "ws")]
+    let remote_addr = stream
+        .peer_addr()
+        .map_err(|e| format!("peer_addr: {}", e))?;
+
+    if let Some(connector) = tls_connector {
+        // Use SNI from options (explicit ?sni= or hostname fallback), else raw host
+        let sni_host = sni.map(str::to_string).unwrap_or_else(|| host.to_string());
+        let server_name = rustls::pki_types::ServerName::try_from(sni_host)
+            .unwrap_or_else(|_| {
+                // Fallback to using IP address as server name if hostname parsing fails
+                rustls::pki_types::ServerName::IpAddress(
+                    rustls::pki_types::IpAddr::try_from(host).expect("invalid hostname"),
+                )
+            });
+        let tls_stream = connector
+            .connect(server_name, stream)
+            .await
+            .map_err(|e| format!("TLS handshake failed: {}", e))?;
+        #[cfg(feature = "ws")]
+        if use_ws {
+            // Server cert for cert/identity binding in handle_connection.
+            let peer_cert = tls_stream
+                .get_ref()
+                .1
+                .peer_certificates()
+                .and_then(|certs| certs.first().cloned());
+            let ws =
+                ws::ws_client_handshake(Box::new(tls_stream), host, port, path, remote_addr, peer_cert)
+                    .await?;
+            return Ok(Stream::Ws(ws));
+        }
+        Ok(Stream::TlsClient(tls_stream))
+    } else {
+        #[cfg(feature = "ws")]
+        if use_ws {
+            let ws = ws::ws_client_handshake(Box::new(stream), host, port, path, remote_addr, None)
+                .await?;
+            return Ok(Stream::Ws(ws));
+        }
+        Ok(Stream::Tcp(stream))
+    }
 }
 
 /// Parse a duration string that accepts either plain seconds ("300") or
