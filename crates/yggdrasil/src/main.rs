@@ -432,7 +432,7 @@ async fn run_node(
     // This is a no-op when not running under systemd (NOTIFY_SOCKET unset).
     #[cfg(all(feature = "systemd", target_os = "linux"))]
     {
-        if let Err(e) = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]) {
+        if let Err(e) = sd_notify::notify(&[sd_notify::NotifyState::Ready]) {
             tracing::warn!("Failed to notify systemd of readiness: {}", e);
         }
     }
