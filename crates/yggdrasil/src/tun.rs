@@ -62,6 +62,12 @@ impl TunAdapter {
         let tun_name = if name == "auto" {
             if cfg!(windows) {
                 "Yggdrasil"
+            } else if cfg!(target_os = "macos") {
+                // On macOS "auto" we pass "utun" (or empty) to DeviceBuilder.
+                // Per tun-rs 2.8+ behaviour the kernel always ignores the name for TUN
+                // and auto-assigns the next free utunN interface. We still set "utun"
+                // here so the intent is explicit and matches library recommendations.
+                "utun"
             } else {
                 "ygg0"
             }
@@ -78,9 +84,15 @@ impl TunAdapter {
         // Create TUN device using tun-rs DeviceBuilder
         #[allow(unused_mut)]
         let mut builder = tun_rs::DeviceBuilder::new()
-            .name(tun_name)
             .ipv6(ip, 7u8)
             .mtu(mtu);
+
+        // On macOS + "auto" do NOT call .name(). The kernel always assigns the next free
+        // utunN. Passing "utun" (or any name without a numeric suffix) makes tun-rs try
+        // to parse an empty unit number and fails with "cannot parse integer from empty string".
+        if !(cfg!(target_os = "macos") && name == "auto") {
+            builder = builder.name(tun_name);
+        }
 
         // Assign IPv4 address to TUN if configured in CKR
         #[cfg(feature = "ckr")]
@@ -137,6 +149,28 @@ impl TunAdapter {
             .build_async()
             .map_err(|e| format!("failed to create TUN device: {}", e))?;
 
+        // On macOS + "auto" the name passed to DeviceBuilder is ignored by the
+        // kernel (utunN is always auto-assigned). We retrieve the real name here
+        // so that the log message and CKR install_routes() receive the correct
+        // utunX value. On all other platforms and when the user specified a name
+        // manually we keep the existing tun_name. This is the only place where
+        // the actual interface name is needed after creation.
+        let effective_tun_name = if cfg!(target_os = "macos") && name == "auto" {
+            match device.name() {
+                Ok(real_name) => real_name,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to get real ‘utun’ name on macOS after creation: {}. \
+                         Falling back to generic ‘utun’.",
+                        e
+                    );
+                    "utun".to_string()                  
+                }
+            }
+        } else {
+            tun_name.to_string()
+        };
+
         let device = Arc::new(device);
 
         #[cfg(feature = "ckr")]
@@ -146,13 +180,13 @@ impl TunAdapter {
                 .map_err(|e| format!("failed to add IPv4 address to TUN: {}", e))?;
         }
 
-        tracing::info!("TUN device '{}' created with address {} and MTU {}", tun_name, addr, mtu);
+        tracing::info!("TUN device '{}' created with address {} and MTU {}", effective_tun_name, addr, mtu);
 
         // Install CKR routes if configured
         #[cfg(feature = "ckr")]
         if let Some(ckr_cfg) = ckr_config {
             if ckr_cfg.install_system_routes {
-                if let Err(e) = crate::ckr::install_routes(ckr_cfg, tun_name, self_key) {
+                if let Err(e) = crate::ckr::install_routes(ckr_cfg, &effective_tun_name, self_key) {
                     tracing::error!("Failed to install CKR routes: {}", e);
                 }
             }
