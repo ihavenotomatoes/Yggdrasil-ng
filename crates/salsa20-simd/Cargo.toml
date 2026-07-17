@@ -7,7 +7,7 @@
 # the transitive dependency; only the directory is `salsa20-simd`.
 [package]
 name = "salsa20"
-version = "0.10.2"
+version = "0.10.3"
 edition = "2021"
 rust-version = "1.61"
 description = "Salsa20 Stream Cipher (SIMD fork: AVX2/SSE2/NEON backends)"
@@ -16,14 +16,19 @@ repository = "https://github.com/RustCrypto/stream-ciphers"
 publish = false
 
 [dependencies]
+# Pinned to 0.4: this fork must stay API-compatible with crates.io salsa20 0.10
+# because crypto_box 0.9 / crypto_secretbox 0.1 (our consumers via the
+# [patch.crates-io] in the workspace root) are built against cipher 0.4 traits.
+# Bump to cipher 0.5 only together with crypto_box >= 0.10 stable (which pulls
+# salsa20 0.11) — that also requires porting this fork to the new cipher API.
 cipher = "0.4.2"
 
 [target.'cfg(any(target_arch = "x86_64", target_arch = "x86"))'.dependencies]
-cpufeatures = "0.2"
+cpufeatures = "0.3"
 
 [dev-dependencies]
 cipher = { version = "0.4.2", features = ["dev"] }
-hex-literal = "0.3.3"
+hex-literal = "1.1.0"
 
 [features]
 std = ["cipher/std"]
