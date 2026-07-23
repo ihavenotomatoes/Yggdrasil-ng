@@ -413,10 +413,18 @@ async fn run_node(
     // that already exists in the shutdown/remove_routes block below.
     #[cfg(feature = "ckr")]
     if config.tunnel_routing.enable && config.tunnel_routing.install_system_routes && config.if_name != "none" {
-        let tun_name = if config.if_name == "auto" {
-            if cfg!(windows) { "Yggdrasil" } else { "ygg0" }
-        } else {
-            &config.if_name
+        // Prefer the real interface name reported by TunAdapter
+        // (on macOS this is the kernel-assigned utunN).
+        let tun_name = match &tun {
+            Some(t) => t.name(),
+            None => {
+                // Fallback (should not happen when if_name != "none")
+                if config.if_name == "auto" {
+                    if cfg!(windows) { "Yggdrasil" } else { "ygg0" }
+                } else {
+                    config.if_name.as_str()
+                }
+            }
         };
         if let Err(e) = yggdrasil::ckr::install_routes(&config.tunnel_routing, tun_name, core.public_key()) {
             tracing::error!("Failed to install CKR routes: {}", e);
@@ -445,10 +453,18 @@ async fn run_node(
     // routes don't auto-dissolve when the interface goes away).
     #[cfg(feature = "ckr")]
     if config.tunnel_routing.enable && config.if_name != "none" {
-        let tun_name = if config.if_name == "auto" {
-            if cfg!(windows) { "Yggdrasil" } else { "ygg0" }
-        } else {
-            &config.if_name
+        // Prefer the real interface name reported by TunAdapter
+        // (on macOS this is the kernel-assigned utunN).
+        let tun_name = match &tun {
+            Some(t) => t.name(),
+            None => {
+                // Fallback (should not happen when if_name != "none")
+                if config.if_name == "auto" {
+                    if cfg!(windows) { "Yggdrasil" } else { "ygg0" }
+                } else {
+                    config.if_name.as_str()
+                }
+            }
         };
         yggdrasil::ckr::remove_routes(&config.tunnel_routing, tun_name, core.public_key());
     }

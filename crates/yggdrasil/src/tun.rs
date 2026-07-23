@@ -32,6 +32,10 @@ static SET_INTERFACE_DNS_PTR: OnceLock<
 /// TUN adapter: bridges a TUN network device with the IPv6 RWC.
 pub struct TunAdapter {
     device: Arc<AsyncDevice>,
+    /// Actual OS-level name of the interface.
+    /// On macOS with "auto" this will be the kernel-assigned utunN
+    /// (e.g. "utun3"), which may differ from the requested name.
+    name: String,
     read_handle: tokio::task::JoinHandle<()>,
     write_handle: tokio::task::JoinHandle<()>,
 }
@@ -59,14 +63,27 @@ impl TunAdapter {
             return Err("TUN disabled".to_string());
         }
 
-        let tun_name = if name == "auto" {
+        // Determine the requested interface name.
+        // On macOS "auto" must leave the name empty so that tun-rs lets the
+        // kernel allocate the next free utunN. On other platforms we keep
+        // the historic defaults.
+        // `mut` is required only on macOS (we overwrite the empty name with
+        // the real utunN after device creation). On other OSes the compiler
+        // would warn about unused_mut, hence the allow.
+        #[allow(unused_mut)]
+        let mut tun_name: String = if name == "auto" {
             if cfg!(windows) {
-                "Yggdrasil"
+                "Yggdrasil".to_string()
+            } else if cfg!(target_os = "macos") {
+                // Empty string → do not call DeviceBuilder::name().
+                // Kernel will pick the lowest free utun* and we will read
+                // the real name afterwards via device.name().
+                String::new()
             } else {
-                "ygg0"
+                "ygg0".to_string()
             }
         } else {
-            name
+            name.to_string()
         };
 
         // Parse the address - strip any /prefix and get just the IP
@@ -78,9 +95,14 @@ impl TunAdapter {
         // Create TUN device using tun-rs DeviceBuilder (only primary Yggdrasil IPv6)
         #[allow(unused_mut)]
         let mut builder = tun_rs::DeviceBuilder::new()
-            .name(tun_name)
             .ipv6(ip, 7u8)
             .mtu(mtu);
+
+        // Only set an explicit name when we have one.
+        // On macOS + "auto" the name stays empty → kernel auto-selects utunN.
+        if !tun_name.is_empty() {
+            builder = builder.name(tun_name.as_str());
+        }
 
         #[cfg(windows)]
         {
@@ -93,6 +115,15 @@ impl TunAdapter {
             .map_err(|e| format!("failed to create TUN device: {}", e))?;
 
         let device = Arc::new(device);
+
+        // On macOS with auto-selection the kernel has assigned a free utunN.
+        // Retrieve the real name so that logs and route installation use it.
+        #[cfg(target_os = "macos")]
+        if tun_name.is_empty() {
+            tun_name = device
+                .name()
+                .map_err(|e| format!("failed to get assigned TUN interface name: {}", e))?;
+        }
 
         tracing::info!("TUN device '{}' created with address {} and MTU {}", tun_name, addr, mtu);
 
@@ -132,9 +163,16 @@ impl TunAdapter {
 
         Ok(Self {
             device,
+            name: tun_name,
             read_handle,
             write_handle,
         })
+    }
+
+    /// Returns the actual name of the TUN network interface as seen by the OS.
+    /// On macOS this is the kernel-assigned utunN when "auto" was requested.
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     /// Tear down the TUN adapter explicitly: abort the I/O tasks, wait for
@@ -207,7 +245,7 @@ impl TunAdapter {
     }
 
     pub async fn close(self) {
-        let TunAdapter { device, read_handle, write_handle } = self;
+        let TunAdapter { device, name: _, read_handle, write_handle } = self;
         read_handle.abort();
         write_handle.abort();
         let _ = read_handle.await;
