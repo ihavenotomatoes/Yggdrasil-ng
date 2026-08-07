@@ -1,7 +1,8 @@
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::net::IpAddr;
-use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{LazyLock, Mutex};
 #[cfg(feature = "ckr-advanced")]
 use {
@@ -11,7 +12,7 @@ std::path::PathBuf,
 std::time::Duration,
 };
 use url::Url;
-use ipnet::IpNet;
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 #[cfg(not(target_os = "android"))]
 use route_manager::RouteManager;
 
@@ -45,17 +46,82 @@ static ROUTE_FILE_CACHE: LazyLock<Mutex<HashMap<String, Option<Vec<String>>>>> =
 #[cfg(not(target_os = "android"))]
 static PEER_EXCLUSIONS: LazyLock<Mutex<Option<Vec<String>>>> = LazyLock::new(|| Mutex::new(None));
 
-/// A single CKR route: CIDR prefix -> destination public key.
-struct Route {
-    prefix: IpNet,
-    destination: [u8; 32],
+/// Longest-prefix-match table for a single address family.
+///
+/// One hash map per distinct prefix length, iterated longest prefix first, so
+/// the first hit is the longest-prefix match. A lookup therefore costs one
+/// probe per *distinct prefix length* present — a couple of dozen for a
+/// generated CIDR list — rather than a scan of the whole table. That matters
+/// most on a miss: traffic that is not CKR-routed used to walk every route.
+struct RouteTable {
+    /// Address width of the family: 32 for IPv4, 128 for IPv6.
+    bits: u32,
+    /// Keyed by `Reverse(prefix_len)`, so map iteration yields the longest
+    /// prefix first. Values map masked network address -> destination key.
+    levels: BTreeMap<Reverse<u8>, HashMap<u128, [u8; 32]>>,
+    len: usize,
+}
+
+impl RouteTable {
+    fn new(bits: u32) -> Self {
+        Self {
+            bits,
+            levels: BTreeMap::new(),
+            len: 0,
+        }
+    }
+
+    /// Insert a route. Returns `false` if that exact prefix was already
+    /// present — the caller treats that as a silent skip (to preserve
+    /// existing behaviour with large route-list files that may contain
+    /// duplicates).
+    fn insert(&mut self, prefix: IpNet, destination: [u8; 32]) -> bool {
+        let key = mask_addr(addr_bits(prefix.network()), prefix.prefix_len(), self.bits);
+        let level = self.levels.entry(Reverse(prefix.prefix_len())).or_default();
+        if level.insert(key, destination).is_some() {
+            return false;
+        }
+        self.len += 1;
+        true
+    }
+
+    fn get(&self, addr: u128) -> Option<[u8; 32]> {
+        for (Reverse(prefix_len), level) in &self.levels {
+            if let Some(dest) = level.get(&mask_addr(addr, *prefix_len, self.bits)) {
+                return Some(*dest);
+            }
+        }
+        None
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Every route, longest prefix first and ascending by address within a
+    /// prefix length. Only used for the debug listing, so the per-level sort
+    /// is paid only when debug logging is on.
+    fn iter_sorted(&self) -> impl Iterator<Item = (IpNet, [u8; 32])> + '_ {
+        self.levels.iter().flat_map(move |(Reverse(len), level)| {
+            let mut entries: Vec<(u128, [u8; 32])> =
+                level.iter().map(|(k, v)| (*k, *v)).collect();
+            entries.sort_unstable_by_key(|(k, _)| *k);
+            entries
+                .into_iter()
+                .map(move |(k, dest)| (make_net(k, *len, self.bits), dest))
+        })
+    }
 }
 
 /// CKR routing table. Maps IP subnets to Yggdrasil node public keys.
 pub struct CryptoKey {
     yggdrasil_routing: bool,
-    v4_routes: Vec<Route>,
-    v6_routes: Vec<Route>,
+    v4: RouteTable,
+    v6: RouteTable,
 }
 
 impl CryptoKey {
@@ -65,14 +131,14 @@ impl CryptoKey {
     /// shared config can thus be distributed to every node without each
     /// needing a node-specific copy.
     pub fn new(config: &TunnelRoutingConfig, self_key: &[u8; 32]) -> Result<Self, String> {
-        let mut v4_routes = Vec::new();
-        let mut v6_routes = Vec::new();
+        let mut v4 = RouteTable::new(32);
+        let mut v6 = RouteTable::new(128);
 
         if !config.enable {
             return Ok(Self {
                 yggdrasil_routing: config.yggdrasil_routing,
-                v4_routes,
-                v6_routes,
+                v4,
+                v6,
             });
         }
 
@@ -104,7 +170,7 @@ impl CryptoKey {
                 .collect();
 
             for prefix in expand_cidrs(&ckr_cidrs)? {
-                match prefix {
+                let table = match prefix {
                     IpNet::V6(_) => {
                         if is_yggdrasil_destination(prefix.addr()) {
                             return Err(format!(
@@ -112,48 +178,35 @@ impl CryptoKey {
                                 prefix
                             ));
                         }
-                        if v6_routes.iter().any(|r| r.prefix == prefix) {
-                            continue;
-                        }
-                        v6_routes.push(Route {
-                            prefix,
-                            destination: dest,
-                        });
+                        &mut v6
                     }
-                    IpNet::V4(_) => {
-                        if v4_routes.iter().any(|r| r.prefix == prefix) {
-                            continue;
-                        }
-                        v4_routes.push(Route {
-                            prefix,
-                            destination: dest,
-                        });
-                    }
-                }
+                    IpNet::V4(_) => &mut v4,
+                };
+                // Silent skip on duplicate (preserves existing behaviour with large route-list files)
+                let _ = table.insert(prefix, dest);
             }
         }
 
-        // Sort: most specific (longest prefix) first; ties broken by address.
-        v4_routes.sort_by(sort_routes);
-        v6_routes.sort_by(sort_routes);
-
-        if !v6_routes.is_empty() {
-            tracing::info!("Active CKR IPv6 routes:");
-            for r in &v6_routes {
-                tracing::info!("  {} via {}", r.prefix, hex::encode(r.destination));
-            }
+        // Summarise at info, list at debug: one info line per route meant
+        // >100k synchronous writes (each allocating via hex::encode) before
+        // the TUN came up. Especially important for large route list files.
+        if !v4.is_empty() || !v6.is_empty() {
+            tracing::info!(
+                "Active CKR routes: {} IPv4, {} IPv6",
+                v4.len(),
+                v6.len()
+            );
         }
-        if !v4_routes.is_empty() {
-            tracing::info!("Active CKR IPv4 routes:");
-            for r in &v4_routes {
-                tracing::info!("  {} via {}", r.prefix, hex::encode(r.destination));
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            for (prefix, dest) in v6.iter_sorted().chain(v4.iter_sorted()) {
+                tracing::debug!("  {} via {}", prefix, hex::encode(dest));
             }
         }
 
         Ok(Self {
             yggdrasil_routing: config.yggdrasil_routing,
-            v4_routes,
-            v6_routes,
+            v4,
+            v6,
         })
     }
 
@@ -165,25 +218,15 @@ impl CryptoKey {
     /// Look up the destination public key for an IP address using
     /// longest-prefix-match. Returns `None` if no route matches.
     pub fn get_public_key_for_address(&self, addr: IpAddr) -> Option<[u8; 32]> {
-        if let IpAddr::V6(_) = addr {
-            if is_yggdrasil_destination(addr) {
-                return None;
+        match addr {
+            IpAddr::V4(a) => self.v4.get(u32::from(a) as u128),
+            IpAddr::V6(a) => {
+                if is_yggdrasil_destination(addr) {
+                    return None;
+                }
+                self.v6.get(u128::from(a))
             }
         }
-
-        let routes = match addr {
-            IpAddr::V4(_) => &self.v4_routes,
-            IpAddr::V6(_) => &self.v6_routes,
-        };
-
-        // Routes are sorted most-specific-first, so first match wins.
-        for route in routes {
-            if route.prefix.contains(&addr) {
-                return Some(route.destination);
-            }
-        }
-
-        None
     }
 }
 
@@ -199,6 +242,41 @@ pub fn is_yggdrasil_destination(ip: IpAddr) -> bool {
             subnet_bytes.copy_from_slice(&octets[..8]);
             is_valid_address(&addr_bytes) || is_valid_subnet(&subnet_bytes)
         }
+    }
+}
+
+/// The bits of an address, right-aligned in a `u128`. IPv4 and IPv6 are always
+/// kept in separate tables, so the two never share a key space.
+fn addr_bits(addr: IpAddr) -> u128 {
+    match addr {
+        IpAddr::V4(a) => u32::from(a) as u128,
+        IpAddr::V6(a) => u128::from(a),
+    }
+}
+
+/// Clear all but the top `prefix_len` bits of a `bits`-wide address.
+fn mask_addr(addr: u128, prefix_len: u8, bits: u32) -> u128 {
+    if prefix_len == 0 {
+        return 0;
+    }
+    let shift = bits - prefix_len as u32;
+    (addr >> shift) << shift
+}
+
+/// Rebuild an `IpNet` from a masked address and prefix length.
+fn make_net(addr: u128, prefix_len: u8, bits: u32) -> IpNet {
+    // Both constructors only reject a prefix length wider than the family, and
+    // every caller derives `prefix_len` from an existing net of that family.
+    if bits == 32 {
+        IpNet::V4(
+            Ipv4Net::new(Ipv4Addr::from(addr as u32), prefix_len)
+                .expect("prefix length bounded by family width"),
+        )
+    } else {
+        IpNet::V6(
+            Ipv6Net::new(Ipv6Addr::from(addr), prefix_len)
+                .expect("prefix length bounded by family width"),
+        )
     }
 }
 
@@ -336,6 +414,13 @@ pub fn expand_cidrs(entries: &[String]) -> Result<Vec<IpNet>, String> {
         }
     }
 
+    // Collapse the excludes into disjoint sorted ranges once, so each include
+    // costs a binary search plus a walk of the ranges that actually overlap it.
+    // This is critical for the common "0.0.0.0/0 (or inetv4) minus many host
+    // exclusions" shape produced by peer-exclusion lists + country route files.
+    let v4_exc = merge_excludes(&v4_exc);
+    let v6_exc = merge_excludes(&v6_exc);
+
     let mut out = Vec::new();
     for inc in v4_inc {
         out.extend(subtract_many(inc, &v4_exc));
@@ -346,55 +431,108 @@ pub fn expand_cidrs(entries: &[String]) -> Result<Vec<IpNet>, String> {
     Ok(out)
 }
 
-/// Subtract a set of exclude prefixes from a single include prefix.
-/// All prefixes must share an address family.
-fn subtract_many(include: IpNet, excludes: &[IpNet]) -> Vec<IpNet> {
-    let mut pieces = vec![include];
-    for ex in excludes {
-        let mut next = Vec::with_capacity(pieces.len());
-        for p in pieces {
-            if ex.contains(&p) {
-                // Piece fully covered by exclude → drop.
-            } else if p.contains(ex) {
-                next.extend(subtract_one(p, *ex));
-            } else {
-                // Disjoint (prefix-aligned ranges can't partially overlap).
-                next.push(p);
-            }
-        }
-        pieces = next;
+/// The inclusive address range a prefix covers, as integers.
+fn net_bounds(net: &IpNet) -> (u128, u128) {
+    match net {
+        IpNet::V4(n) => (
+            u32::from(n.network()) as u128,
+            u32::from(n.broadcast()) as u128,
+        ),
+        IpNet::V6(n) => (u128::from(n.network()), u128::from(n.broadcast())),
     }
-    pieces
 }
 
-/// Subtract `b` from `a`, requiring `a.contains(&b)` and `a != b`.
-/// Produces `log2(|a|/|b|)` disjoint covering prefixes.
-fn subtract_one(a: IpNet, b: IpNet) -> Vec<IpNet> {
-    let mut result = Vec::new();
-    let mut current = a;
-    while current != b {
-        let new_len = current.prefix_len() + 1;
-        let mut halves = match current.subnets(new_len) {
-            Ok(it) => it,
-            Err(_) => return result,
-        };
-        let left = match halves.next() {
-            Some(x) => x,
-            None => return result,
-        };
-        let right = match halves.next() {
-            Some(x) => x,
-            None => return result,
-        };
-        if left.contains(&b) {
-            result.push(right);
-            current = left;
-        } else {
-            result.push(left);
-            current = right;
+/// Collapse excludes of one family into disjoint inclusive ranges, sorted
+/// ascending. Overlapping, nested and adjacent excludes all merge, so the
+/// result describes the same address set with no redundancy.
+fn merge_excludes(excludes: &[IpNet]) -> Vec<(u128, u128)> {
+    let mut ranges: Vec<(u128, u128)> = excludes.iter().map(net_bounds).collect();
+    ranges.sort_unstable();
+
+    let mut merged: Vec<(u128, u128)> = Vec::with_capacity(ranges.len());
+    for (lo, hi) in ranges {
+        match merged.last_mut() {
+            // `saturating_add` only saturates at the very top of the address
+            // space, where there is nothing left to be adjacent to anyway.
+            Some(last) if lo <= last.1.saturating_add(1) => last.1 = last.1.max(hi),
+            _ => merged.push((lo, hi)),
         }
     }
-    result
+    merged
+}
+
+/// Subtract a set of excludes from a single include prefix, returning the
+/// minimal set of prefixes covering the remainder.
+///
+/// `excludes` must be the merged, sorted output of [`merge_excludes`] for the
+/// same address family. Walking the include's range and emitting the gaps
+/// costs one pass over the overlapping excludes. The previous approach split
+/// the include into pieces and re-scanned every piece for every exclude, which
+/// is quadratic in the exclude count once a single include (`0.0.0.0/0`,
+/// `inetv4`) covers most of them.
+fn subtract_many(include: IpNet, excludes: &[(u128, u128)]) -> Vec<IpNet> {
+    let (inc_lo, inc_hi) = net_bounds(&include);
+    let bits = match include {
+        IpNet::V4(_) => 32,
+        IpNet::V6(_) => 128,
+    };
+
+    // Ranges are disjoint and ascending, so `hi` is ascending too: the first
+    // range that can overlap is the first whose end reaches `inc_lo`.
+    let start = excludes.partition_point(|&(_, hi)| hi < inc_lo);
+
+    let mut out = Vec::new();
+    let mut cur = inc_lo;
+    for &(lo, hi) in &excludes[start..] {
+        if lo > inc_hi {
+            break;
+        }
+        if lo > cur {
+            emit_range(cur, lo - 1, bits, &mut out);
+        }
+        if hi >= inc_hi {
+            // This exclude runs to the end of the include (or past it, which
+            // is how a containing exclude drops the include entirely).
+            return out;
+        }
+        cur = hi + 1;
+    }
+    emit_range(cur, inc_hi, bits, &mut out);
+    out
+}
+
+/// Append the minimal set of prefix-aligned blocks covering the inclusive
+/// range `[lo, hi]`. Each step takes the largest block that both starts at
+/// `lo`'s alignment and fits in what is left.
+fn emit_range(lo: u128, hi: u128, bits: u32, out: &mut Vec<IpNet>) {
+    let mut cur = lo;
+    loop {
+        let align = if cur == 0 {
+            bits
+        } else {
+            cur.trailing_zeros().min(bits)
+        };
+        let remaining = hi - cur;
+        // Largest k with 2^k - 1 <= remaining, i.e. floor(log2(remaining + 1)).
+        let span = if remaining == u128::MAX {
+            128
+        } else {
+            127 - (remaining + 1).leading_zeros()
+        };
+        let size = align.min(span).min(bits);
+        out.push(make_net(cur, (bits - size) as u8, bits));
+
+        if size == 128 {
+            break; // the block covered the whole address space
+        }
+        // `cur` is aligned to at least `size`, so this cannot overflow, and
+        // `size <= span` guarantees `end <= hi`.
+        let end = cur + (1u128 << size) - 1;
+        if end >= hi {
+            break;
+        }
+        cur = end + 1;
+    }
 }
 
 fn normalize_subnet_entries(entries: &[String]) -> Vec<String> {
@@ -455,6 +593,7 @@ pub fn install_routes(
     // Skip entries whose destination is this node itself — those are handled
     // by the OS's native routing and should not be steered into the TUN.
     let mut cidrs: Vec<IpNet> = Vec::new();
+    let mut seen: HashSet<IpNet> = HashSet::new();
     for (pubkey_hex, subnet_list) in &config.remote_subnets {
         if parse_pubkey(pubkey_hex).ok().as_ref() == Some(self_key) {
             continue;
@@ -477,7 +616,11 @@ pub fn install_routes(
 
         let route_list = normalize_subnet_entries(&non_tilde_entries);
         for prefix in expand_cidrs(&route_list)? {
-            if !cidrs.contains(&prefix) {
+            // Set-based dedup: the old `cidrs.contains(&prefix)` was a linear
+            // scan per prefix, O(N^2) over the whole config. Insertion order
+            // is preserved by keeping the Vec and using the set only as an
+            // index.
+            if seen.insert(prefix) {
                 cidrs.push(prefix);
             }
         }
@@ -489,6 +632,8 @@ pub fn install_routes(
 
     let mut manager =
         RouteManager::new().map_err(|e| format!("failed to create route manager: {}", e))?;
+    let mut installed: usize = 0;
+    let mut failed: usize = 0;
 
     for cidr in &cidrs {
         let route = route_manager::Route::new(cidr.network(), cidr.prefix_len())
@@ -496,12 +641,23 @@ pub fn install_routes(
 
         match manager.add(&route) {
             Ok(()) => {
-                tracing::info!("Installed route: {} via {}", cidr, tun_name);
+                installed += 1;
+                tracing::debug!("Installed route: {} via {}", cidr, tun_name);
             }
             Err(e) => {
+                failed += 1;
                 tracing::warn!("Failed to install route {} via {}: {}", cidr, tun_name, e);
             }
         }
+    }
+
+    if failed > 0 {
+        tracing::info!(
+            "Installed {} network route(s) via {} ({} failed)",
+            installed, tun_name, failed
+        );
+    } else {
+        tracing::info!("Installed {} network route(s) via {}", installed, tun_name);
     }
 
     Ok(())
@@ -518,6 +674,7 @@ pub fn remove_routes(config: &TunnelRoutingConfig, tun_name: &str, self_key: &[u
     }
 
     let mut cidrs: Vec<IpNet> = Vec::new();
+    let mut seen: HashSet<IpNet> = HashSet::new();
     for (pubkey_hex, subnet_list) in &config.remote_subnets {
         if parse_pubkey(pubkey_hex).ok().as_ref() == Some(self_key) {
             continue;
@@ -542,7 +699,7 @@ pub fn remove_routes(config: &TunnelRoutingConfig, tun_name: &str, self_key: &[u
         let route_list = normalize_subnet_entries(&non_tilde_entries);
         if let Ok(expanded) = expand_cidrs(&route_list) {
             for prefix in expanded {
-                if !cidrs.contains(&prefix) {
+                if seen.insert(prefix) {
                     cidrs.push(prefix);
                 }
             }
@@ -563,17 +720,6 @@ pub fn remove_routes(config: &TunnelRoutingConfig, tun_name: &str, self_key: &[u
         if let Err(e) = manager.delete(&route) {
             tracing::debug!("Failed to remove route {}: {}", cidr, e);
         }
-    }
-}
-
-/// Sort routes: longest prefix first, then by address for ties.
-fn sort_routes(a: &Route, b: &Route) -> std::cmp::Ordering {
-    let bits_a = a.prefix.prefix_len();
-    let bits_b = b.prefix.prefix_len();
-    // Reverse: longer prefix = higher priority = comes first
-    match bits_b.cmp(&bits_a) {
-        std::cmp::Ordering::Equal => a.prefix.addr().cmp(&b.prefix.addr()),
-        other => other,
     }
 }
 
@@ -1221,8 +1367,8 @@ mod tests {
     fn test_empty_config() {
         let config = TunnelRoutingConfig::default();
         let ckr = CryptoKey::new(&config, &SELF_KEY).unwrap();
-        assert!(ckr.v4_routes.is_empty());
-        assert!(ckr.v6_routes.is_empty());
+        assert!(ckr.v4.is_empty());
+        assert!(ckr.v6.is_empty());
     }
 
     #[test]
@@ -1238,7 +1384,7 @@ mod tests {
             install_system_routes: true,
         };
         let ckr = CryptoKey::new(&config, &SELF_KEY).unwrap();
-        assert!(ckr.v4_routes.is_empty());
+        assert!(ckr.v4.is_empty());
     }
 
     #[test]
@@ -1315,14 +1461,14 @@ mod tests {
     }
 
     #[test]
-    fn test_duplicate_route_rejected() {
+    fn test_duplicate_route_silently_skipped() {
         let mut subnets = HashMap::new();
         subnets.insert(
             dummy_key_hex(),
             vec!["10.0.0.0/24".to_string(), "10.0.0.0/24".to_string()],
         );
         let ckr = CryptoKey::new(&make_config(subnets), &SELF_KEY).unwrap();
-        assert_eq!(ckr.v4_routes.len(), 1);
+        assert_eq!(ckr.v4.len(), 1);
     }
 
     #[test]
@@ -1377,8 +1523,8 @@ mod tests {
         );
         let ckr = CryptoKey::new(&make_config(subnets), &SELF_KEY).unwrap();
 
-        assert_eq!(ckr.v4_routes.len(), 2);
-        assert_eq!(ckr.v6_routes.len(), 1);
+        assert_eq!(ckr.v4.len(), 2);
+        assert_eq!(ckr.v6.len(), 1);
 
         assert!(ckr.get_public_key_for_address("10.0.0.1".parse().unwrap()).is_some());
         assert!(ckr.get_public_key_for_address("192.168.1.100".parse().unwrap()).is_some());
@@ -1491,7 +1637,7 @@ mod tests {
         let self_key = [0x01u8; 32]; // matches dummy_key_hex
         let ckr = CryptoKey::new(&make_config(subnets), &self_key).unwrap();
 
-        assert_eq!(ckr.v4_routes.len(), 1);
+        assert_eq!(ckr.v4.len(), 1);
         assert_eq!(
             ckr.get_public_key_for_address("10.0.0.5".parse().unwrap()),
             None
@@ -1500,19 +1646,6 @@ mod tests {
             ckr.get_public_key_for_address("10.1.0.5".parse().unwrap()),
             Some([0x02u8; 32])
         );
-    }
-
-    #[test]
-    fn test_route_sorting_order() {
-        let mut subnets = HashMap::new();
-        // Insert in non-sorted order
-        subnets.insert(dummy_key_hex(), vec!["10.0.0.0/8".to_string()]);
-        subnets.insert(other_key_hex(), vec!["10.0.0.0/16".to_string()]);
-        let ckr = CryptoKey::new(&make_config(subnets), &SELF_KEY).unwrap();
-
-        // /16 should come before /8 (more specific first)
-        assert_eq!(ckr.v4_routes[0].prefix.prefix_len(), 16);
-        assert_eq!(ckr.v4_routes[1].prefix.prefix_len(), 8);
     }
 
     #[test]
@@ -1526,8 +1659,8 @@ mod tests {
             install_system_routes: true,
         };
         let ckr = CryptoKey::new(&config, &SELF_KEY).unwrap();
-        assert!(ckr.v4_routes.is_empty());
-        assert!(ckr.v6_routes.is_empty());
+        assert!(ckr.v4.is_empty());
+        assert!(ckr.v6.is_empty());
     }
 
     #[test]
@@ -1612,7 +1745,7 @@ mod tests {
         };
         let ckr = CryptoKey::new(&config, &SELF_KEY).unwrap();
         // ensures CKR still works with ip_addresses present (TUN assignment only); one remote IPv4 subnet configured
-        assert_eq!(ckr.v4_routes.len(), 1);  
+        assert_eq!(ckr.v4.len(), 1);  
     }
 
     #[test]
@@ -1643,8 +1776,8 @@ mod tests {
             install_system_routes: true,
         };
         let ckr = CryptoKey::new(&config, &SELF_KEY).unwrap();
-        assert_eq!(ckr.v4_routes.len(), 1);
-        assert!(ckr.v6_routes.is_empty());
+        assert_eq!(ckr.v4.len(), 1);
+        assert!(ckr.v6.is_empty());
         // Covers: multiple entries in ip_addresses (IPv4 + bare + IPv6), deprecated ipv4_address present but ignored per the new precedence rule,
         // and that CKR route parsing still succeeds (the core of the "TUN assignment only" intent of the original test).
     }
@@ -1723,5 +1856,73 @@ mod tests {
         let expanded = expand_cidrs(&virtual_entries).unwrap();
         assert!(expanded.iter().any(|p| p.to_string() == "10.0.0.0/24"));
         assert!(expanded.iter().any(|p| p.to_string() == "192.168.0.0/16"));
+    }
+
+    #[test]
+    fn test_default_route_minus_many_excludes() {
+        // descending order so the sweep cannot rely on input ordering.
+        let host = |i: u32| Ipv4Addr::from(0x0a00_0000u32 + (1999 - i) * 8191);
+        let mut entries = vec!["0.0.0.0/0".to_string()];
+        for i in 0..2000u32 {
+            entries.push(format!("!{}", host(i)));
+        }
+        let out = expand_cidrs(&entries).unwrap();
+        // Every host exclude must be absent; the total address space of the
+        // result must be 2^32 - 2000.
+        for i in 0..2000u32 {
+            let a: IpAddr = host(i).into();
+            assert!(!out.iter().any(|n| n.contains(&a)), "exclude {} still covered", a);
+        }
+        let total: u128 = out.iter().map(|n| 1u128 << (32 - n.prefix_len())).sum();
+        assert_eq!(total, (1u128 << 32) - 2000);
+    }
+
+    #[test]
+    fn test_expand_cidrs_ipv6_whole_space_and_top_edge() {
+        // ::/0 exercises the widest block emit_range can produce, and an
+        // exclude at the very top exercises the end-of-space arithmetic.
+        let out = expand_cidrs(&["::/0".to_string()]).unwrap();
+        assert_eq!(out, vec!["::/0".parse::<IpNet>().unwrap()]);
+        let entries = vec![
+            "::/0".to_string(),
+            "!ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff".to_string(),
+        ];
+        let out = expand_cidrs(&entries).unwrap();
+        let top: IpAddr = "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap();
+        assert!(!out.iter().any(|n| n.contains(&top)));
+        let mid: IpAddr = "8000::".parse().unwrap();
+        assert!(out.iter().any(|n| n.contains(&mid)));
+    }
+
+    #[test]
+    fn test_merge_excludes_collapses_overlapping_and_adjacent() {
+        let nets: Vec<IpNet> = ["10.0.1.0/24", "10.0.0.0/24", "10.0.0.128/25", "10.0.4.0/24"]
+            .iter()
+            .map(|s| s.parse().unwrap())
+            .collect();
+        let merged = merge_excludes(&nets);
+        // 10.0.0.0/24 swallows 10.0.0.128/25 and is adjacent to 10.0.1.0/24,
+        // so those three become one range; 10.0.4.0/24 stays separate.
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0], (0x0a00_0000u128, 0x0a00_01ffu128)); // 10.0.0.0–10.0.1.255
+        assert_eq!(merged[1], (0x0a00_0400u128, 0x0a00_04ffu128)); // 10.0.4.0–10.0.4.255
+    }
+
+    #[test]
+    fn test_lookup_is_longest_prefix_across_many_lengths() {
+        let mut subnets = HashMap::new();
+        // Insert in reverse order of specificity so the table must still pick LPM.
+        subnets.insert(dummy_key_hex(), vec![
+            "10.0.0.0/8".to_string(),
+            "10.0.0.0/16".to_string(),
+            "10.0.0.0/24".to_string(),
+            "10.0.0.0/28".to_string(),
+        ]);
+        let ckr = CryptoKey::new(&make_config(subnets), &SELF_KEY).unwrap();
+        let addr: IpAddr = "10.0.0.5".parse().unwrap();
+        // Must match the /28, not any of the shorter ones.
+        assert_eq!(ckr.get_public_key_for_address(addr), Some([0x01u8; 32]));
+        // And the table really contains all four lengths.
+        assert_eq!(ckr.v4.len(), 4);
     }
 }
