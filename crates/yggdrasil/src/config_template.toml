@@ -125,11 +125,16 @@ listen = true
 
 # Crypto-Key Routing (CKR) — tunnel arbitrary IPv4/IPv6 subnets through the Yggdrasil mesh.
 # Bare IPv4/IPv6 addresses without prefix are also accepted (/32 and /128 respectively; 
-# applies to ~ and ! prefixed entries too)
-# ‘~’ prefix means CKR tunnels without system routes. "inetv4"/"~inetv4" and 
+# applies to ‘~’, ‘_’ and ‘!’ prefixed entries too)
+# ‘~’ prefix means CKR tunnels without system routes.
+# ‘_’ prefix means system routes without CKR tunnels. "inetv4"/"~inetv4" and 
 # "inetv6"/"~inetv6" expand to internet prefixes excluding internal networks. 
 # "!" excludes range from CKR, (e.g., "!142.250.109.0/24") for both normal 
 # and "~" prefixed includes. No "!inetv4" or "!inetv6" are supported.
+# "file:///absolute/path/to/list.txt" include CIDRs/IPs from the text file
+# "https://example.com/routelist.txt" CIDRs/IPs from the text file via HTTP(S)
+# The paths "~http(s)://", "_http(s)://" and "!http(s)://" are also supported
+# along with "~file://", "_file://",  and "!file://".
 # [tunnel_routing]
 # enable = true
 # yggdrasil_routing = true
