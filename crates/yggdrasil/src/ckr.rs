@@ -727,7 +727,7 @@ pub fn remove_routes(config: &TunnelRoutingConfig, tun_name: &str, self_key: &[u
 /// Matches exactly the paths specified in the task (Linux/BSD, macOS, Windows).
 #[cfg(feature = "ckr-advanced")]
 fn get_routes_download_base_dir() -> PathBuf {
-    // When --prefix-port was given, isolate the cache directory so multiple
+    // When a custom prefix/port was applied, isolate the cache directory so multiple
     // instances with different prefixes/ports do not share downloaded lists.
     let dir_name = if crate::address::prefix_port_set() {
         format!(

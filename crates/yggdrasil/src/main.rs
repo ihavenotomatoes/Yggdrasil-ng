@@ -1,4 +1,5 @@
 use std::fs::{File, OpenOptions};
+use std::path::Path;
 use ed25519_dalek::SigningKey;
 use getopts::Options;
 use time::macros::format_description;
@@ -87,20 +88,19 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // --prefix-port: set the atomics early so --address / --subnet see the new prefix.
+    // Resolve prefix/port early (CLI --prefix-port has priority over binary name suffix)
+    // so --address / --subnet and control-mode endpoint see the correct values.
     // Config mutation and the info/warn messages happen later (after logging is ready).
-    if let Some(val) = matches.opt_str("prefix-port") {
-        if let Some((prefix, port)) = parse_prefix_port(&val) {
-            yggdrasil::address::set_address_prefix(prefix);
-            yggdrasil::multicast::set_multicast_port(port);
-        }
+    if let Some((prefix, port)) = resolve_prefix_port(&matches) {
+        yggdrasil::address::set_address_prefix(prefix);
+        yggdrasil::multicast::set_multicast_port(port);
     }
 
     // If there are free (positional) arguments, treat as a control command
     #[cfg(feature = "ctl")]
     if !matches.free.is_empty() {
         let endpoint = matches.opt_str("endpoint")
-            .unwrap_or_else(|| "tcp://localhost:9001".to_string());
+            .unwrap_or_else(|| format!("tcp://localhost:{}", yggdrasil::multicast::multicast_port()));
         let json_output = matches.opt_present("json");
         let command = matches.free[0].clone();
 
@@ -296,10 +296,8 @@ async fn run_node(
         return Err("No configuration: specify --config or --autoconf".into());
     };
 
-    if let Some(val) = matches.opt_str("prefix-port") {
-        if let Some((prefix, port)) = parse_prefix_port(&val) {
-            apply_prefix_port(prefix, port, &mut config);
-        }
+    if let Some((prefix, port)) = resolve_prefix_port(&matches) {
+        apply_prefix_port(prefix, port, &mut config);
     }
 
     if let Some(val) = matches.opt_str("peers") {
@@ -709,7 +707,7 @@ fn apply_prefix_port(prefix: u8, port: u16, config: &mut Config) {
     yggdrasil::multicast::set_multicast_port(port);
 
     tracing::info!(
-        "Using address prefix 0x{:02x} and port {} from --prefix-port",
+        "Using address prefix 0x{:02x} and port {}",
         prefix, port
     );
 
@@ -733,6 +731,44 @@ fn apply_prefix_port(prefix: u8, port: u16, config: &mut Config) {
     }
 }
 
+/// Return the basename of the program as invoked (argv[0]).
+/// Works for renamed binaries, symlinks and hardlinks.
+fn program_basename() -> String {
+    std::env::args()
+        .next()
+        .map(|a| {
+            Path::new(&a)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&a)
+                .to_string()
+        })
+        .unwrap_or_default()
+}
+
+/// Extract prefix and port from the binary/symlink/hardlink name.
+/// The last '_' in the name is the marker; everything after it is parsed
+/// with the same rules as --prefix-port (e.g. "029001", "02-9001", "02.9001.exe").
+fn prefix_port_from_name(name: &str) -> Option<(u8, u16)> {
+    let idx = name.rfind('_')?;
+    let suffix = &name[idx + 1..];
+    parse_prefix_port(suffix)
+}
+
+/// Resolve (prefix, port) with priority:
+/// 1. Valid --prefix-port CLI value
+/// 2. Valid suffix after the last '_' in the binary name
+/// 3. None (keep defaults)
+fn resolve_prefix_port(matches: &getopts::Matches) -> Option<(u8, u16)> {
+    if let Some(val) = matches.opt_str("prefix-port") {
+        if let Some(pp) = parse_prefix_port(&val) {
+            return Some(pp);
+        }
+        // Invalid CLI value: fall through and try the binary name
+    }
+    prefix_port_from_name(&program_basename())
+}
+
 #[cfg(feature = "ctl")]
 fn print_ctl_commands() {
     println!("Commands (control mode):");
@@ -747,4 +783,36 @@ fn print_ctl_commands() {
     println!("    debug_remoteGetPeers key=<hex>, debug_remoteGetTree key=<hex>");
     println!("  Path diagnostics:");
     println!("    getLookup key=<hex>, forceLookup key=<hex>");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_prefix_port_existing_cases() {
+        assert_eq!(parse_prefix_port("02:9001"), Some((0x02, 9001)));
+        assert_eq!(parse_prefix_port("02-9001"), Some((0x02, 9001)));
+        assert_eq!(parse_prefix_port("029001"), Some((0x02, 9001)));
+        assert_eq!(parse_prefix_port("fc.65535"), Some((0xfc, 65535)));
+        assert_eq!(parse_prefix_port("02"), None);
+        assert_eq!(parse_prefix_port("02:1023"), None); // port too low
+        assert_eq!(parse_prefix_port("gg:9001"), None); // invalid prefix
+    }
+
+    #[test]
+    fn test_prefix_port_from_name() {
+        assert_eq!(prefix_port_from_name("yggdrasil_029001"), Some((0x02, 9001)));
+        assert_eq!(prefix_port_from_name("yggdrasil_02-9001"), Some((0x02, 9001)));
+        assert_eq!(prefix_port_from_name("yggdrasil_02.9001"), Some((0x02, 9001)));
+        assert_eq!(prefix_port_from_name("yggdrasil_02-9001.exe"), Some((0x02, 9001)));
+        assert_eq!(prefix_port_from_name("Yggdrasil_0a.12345"), Some((0x0a, 12345)));
+        assert_eq!(prefix_port_from_name("yggdrasil"), None);
+        assert_eq!(prefix_port_from_name("yggdrasil_"), None);
+        assert_eq!(prefix_port_from_name("yggdrasil_foo"), None);
+        assert_eq!(prefix_port_from_name("yggdrasil_02"), None);
+        assert_eq!(prefix_port_from_name("yggdrasil_02-999"), None); // port < 1024
+        // last '_' is the marker
+        assert_eq!(prefix_port_from_name("my_ygg_02-9001"), Some((0x02, 9001)));
+    }
 }

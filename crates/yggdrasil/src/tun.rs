@@ -15,7 +15,7 @@ use tun_rs::AsyncDevice;
 use crate::ipv6rwc::ReadWriteCloser;
 
 /// Base GUID we register the wintun adapter with. The current address prefix
-/// is added so multiple instances with different --prefix-port can coexist.
+/// is added so multiple instances with different prefix/port can coexist.
 /// Reused to target the same interface when assigning DNS servers via
 /// `SetInterfaceDnsSettings`.
 #[cfg(windows)]

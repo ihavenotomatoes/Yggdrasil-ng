@@ -12,7 +12,8 @@ pub struct Subnet(pub [u8; 8]);
 
 static ADDRESS_PREFIX: AtomicU8 = AtomicU8::new(0x02);
 static SUBNET_PREFIX: AtomicU8 = AtomicU8::new(0x03);
-/// Set to true when --prefix-port was successfully applied.
+/// Set to true when a custom prefix/port was successfully applied
+/// (via --prefix-port or via binary/symlink/hardlink name suffix).
 static PREFIX_PORT_SET: AtomicBool = AtomicBool::new(false);
 
 /// Set the address prefix used by addr_for_key / is_valid_* (and subnet = prefix + 1).
@@ -28,7 +29,8 @@ pub fn address_prefix() -> u8 {
     ADDRESS_PREFIX.load(Ordering::Relaxed)
 }
 
-/// Returns true if --prefix-port was successfully applied at startup.
+/// Returns true if a custom prefix/port was successfully applied at startup
+/// (via --prefix-port or via binary/symlink/hardlink name suffix).
 pub fn prefix_port_set() -> bool {
     PREFIX_PORT_SET.load(Ordering::Relaxed)
 }
