@@ -22,7 +22,7 @@ use crate::bloom::BloomFilter;
 use crate::config::Config;
 use crate::crypto::{Crypto, PublicKey};
 use crate::peers::{
-    dispatch_actions, peer_reader, peer_writer, PeerMessage, Peers, ReadDeadline,
+    dispatch_actions, peer_reader, peer_writer, LastWrite, PeerMessage, Peers, ReadDeadline,
 };
 use crate::router::{PeerEntry, PeerId, Router, RouterAction, RouterAnnounce};
 use crate::traffic::{DeliveryQueue, TrafficPacket};
@@ -734,6 +734,10 @@ impl crate::types::PacketConn for PacketConnImpl {
         // reader clears it on any receive.
         let read_deadline: ReadDeadline = Arc::new(std::sync::Mutex::new(None));
 
+        // Diagnostic only: lets the disconnect summary say whether we were
+        // still writing when the link ended.
+        let last_write: LastWrite = Arc::new(std::sync::Mutex::new(None));
+
         // Spawn writer task
         let writer_cancel = peer_cancel.clone();
         let _writer_handle = tokio::spawn(peer_writer(
@@ -749,6 +753,7 @@ impl crate::types::PacketConn for PacketConnImpl {
             self.config.peer_keepalive_delay,
             self.config.peer_timeout,
             read_deadline.clone(),
+            last_write.clone(),
             writer_cancel,
         ));
 
@@ -764,8 +769,10 @@ impl crate::types::PacketConn for PacketConnImpl {
             peer_cancel.clone(),
             self.config.peer_max_message_size,
             self.config.peer_timeout,
+            self.config.peer_probe_count,
             self.config.peer_keepalive_delay,
             read_deadline,
+            last_write,
         )
         .await;
 

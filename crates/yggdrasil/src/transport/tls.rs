@@ -233,6 +233,14 @@ impl rustls::server::danger::ClientCertVerifier for AcceptAllClientVerifier {
 
 /// Create TLS server configuration with optional client certificate authentication.
 /// This uses TLS 1.3 only for maximum security (matching Go implementation).
+// rustls' default 16 KB record size is deliberate here. Capping records lower
+// would deliver frames in finer increments on a lossy path (a record is
+// all-or-nothing, so one missing segment stalls everything inside it), but
+// benchmarking put 4 KB records at roughly a third of the throughput and 8 KB
+// at ~10%, because each record carries its own AEAD invocation and buffer
+// handling. Not worth it: peers that flap on lossy paths are better served by
+// the peer_timeout knob than by taxing every byte on every link.
+
 pub fn create_server_config(
     certs: Vec<CertificateDer<'static>>,
     private_key: PrivateKeyDer<'static>,

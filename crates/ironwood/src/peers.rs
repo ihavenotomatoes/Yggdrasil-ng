@@ -341,6 +341,26 @@ async fn read_uvarint<R: tokio::io::AsyncRead + Unpin>(reader: &mut R) -> Result
 
 pub(crate) type ReadDeadline = Arc<std::sync::Mutex<Option<std::time::Instant>>>;
 
+/// When the writer last got bytes out to the transport. Purely diagnostic: it
+/// lets a disconnect say whether *we* had gone quiet too, or whether we were
+/// writing fine and only the peer went silent — two very different faults that
+/// otherwise look identical in the log.
+pub(crate) type LastWrite = Arc<std::sync::Mutex<Option<std::time::Instant>>>;
+
+/// Record that a flush succeeded. Called once per flush, never per frame, so
+/// this stays off the per-packet path.
+fn mark_written(last_write: &LastWrite) {
+    *last_write.lock().unwrap() = Some(std::time::Instant::now());
+}
+
+/// Age of an optional timestamp, rendered for logs.
+fn age_of(t: &Option<std::time::Instant>) -> String {
+    match t {
+        Some(t) => format!("{:.1}s", t.elapsed().as_secs_f64()),
+        None => "never".to_string(),
+    }
+}
+
 /// The peer reader task. Reads frames from the connection and dispatches
 /// messages to the router via the shared mutex.
 /// Returns Ok(()) for clean shutdown, Err with disconnect reason otherwise.
@@ -358,8 +378,10 @@ pub(crate) async fn peer_reader(
     cancel: CancellationToken,
     max_message_size: u64,
     peer_timeout: Duration,
+    peer_probe_count: u32,
     _keepalive_delay: Duration,
     read_deadline: ReadDeadline,
+    last_write: LastWrite,
 ) -> Result<(), Error> {
     // Use a larger BufReader to reduce syscall count on high-throughput connections.
     let mut reader = BufReader::with_capacity(128 * 1024, conn_read);
@@ -368,6 +390,12 @@ pub(crate) async fn peer_reader(
     // Reusable frame buffer: grows to the largest frame seen, then stays.
     // Eliminates one heap allocation per incoming frame.
     let mut buf: Vec<u8> = Vec::with_capacity(16384);
+
+    // Consecutive deadline expiries with nothing received. Reset by any frame.
+    let mut probes_sent: u32 = 0;
+    // Last frame received, for the disconnect summary.
+    let mut last_recv: Option<std::time::Instant> = None;
+    let mut last_recv_type: Option<wire::PacketType> = None;
 
     loop {
         // Read frame length (uvarint) with periodic deadline checks.
@@ -386,19 +414,44 @@ pub(crate) async fn peer_reader(
                 // exactly peer_timeout, so we still wake before any freshly-set
                 // deadline can expire — timeout detection stays precise while an
                 // idle connection no longer wakes once per second.
-                let wait = {
+                // Time left on the outstanding deadline. `None` means it just
+                // expired; no deadline at all means idle, so wait a full
+                // interval before looking again.
+                let remaining = {
                     let deadline = *read_deadline.lock().unwrap();
                     match deadline {
-                        Some(d) => match d.checked_duration_since(std::time::Instant::now()) {
-                            Some(remaining) => remaining,
-                            None => {
-                                tracing::debug!("peer_reader[{}]: peer timeout ({}ms, no reply from {:02x?}), disconnecting",
-                                    peer_id, peer_timeout.as_millis(), hex::encode(&peer_key[..8]));
-                                disconnect_reason = Some(Error::Timeout);
-                                break 'poll None;
-                            }
-                        },
-                        None => peer_timeout,
+                        Some(d) => d.checked_duration_since(std::time::Instant::now()),
+                        None => Some(peer_timeout),
+                    }
+                };
+
+                let wait = match remaining {
+                    Some(remaining) => remaining,
+                    None => {
+                        // The peer owes us a frame and the interval elapsed.
+                        // Probe a few times before giving up: a lossy path can
+                        // stall for seconds while TCP backs off its retransmits,
+                        // and dropping the link loses far more than waiting does.
+                        // `probes_sent` intervals already elapsed, plus this one.
+                        if probes_sent + 1 >= peer_probe_count {
+                            tracing::debug!("peer_reader[{}]: peer timeout (no reply from {:02x?} after {} intervals of {}ms), disconnecting",
+                                peer_id, hex::encode(&peer_key[..8]), peer_probe_count, peer_timeout.as_millis());
+                            disconnect_reason = Some(Error::Timeout);
+                            break 'poll None;
+                        }
+                        probes_sent += 1;
+                        *read_deadline.lock().unwrap() =
+                            Some(std::time::Instant::now() + peer_timeout);
+                        // Neither implementation answers a keepalive, so this
+                        // does not draw a reply out of the peer — the reply
+                        // comes when TCP finally delivers what we sent earlier.
+                        // It does keep us visibly alive from the peer's side, so
+                        // it does not tear the link down while we are waiting.
+                        let _ = writer_tx.try_send(PeerMessage::ScheduleKeepalive);
+                        tracing::debug!("peer_reader[{}]: no reply from {:02x?} in {}ms, probe {}/{}",
+                            peer_id, hex::encode(&peer_key[..8]), peer_timeout.as_millis(),
+                            probes_sent, peer_probe_count);
+                        peer_timeout
                     }
                 };
 
@@ -417,8 +470,11 @@ pub(crate) async fn peer_reader(
             break;
         };
 
-        // Any received frame clears the deadline (peer is alive).
+        // Any received frame clears the deadline (peer is alive) and forgives
+        // whatever probes it took to get here.
         *read_deadline.lock().unwrap() = None;
+        probes_sent = 0;
+        last_recv = Some(std::time::Instant::now());
 
         let frame_len = match frame_result {
             Ok(len) => len,
@@ -460,6 +516,7 @@ pub(crate) async fn peer_reader(
         };
 
         tracing::debug!("peer_reader[{}]: received {:?} frame, {} bytes payload", peer_id, ptype, payload.len());
+        last_recv_type = Some(ptype);
 
         // Track whether we should schedule a keepalive response
         let should_schedule_keepalive = !matches!(ptype, wire::PacketType::Dummy | wire::PacketType::KeepAlive);
@@ -610,6 +667,35 @@ pub(crate) async fn peer_reader(
 
     cancel.cancel();
 
+    // Summarise why the link ended, with the state that distinguishes the
+    // plausible causes: a timeout with a fresh last-write means we were sending
+    // fine and the peer went quiet (path stall or dead peer); a stale
+    // last-write means our own writer was stuck. Clean shutdowns stay quiet.
+    if let Some(err) = &disconnect_reason {
+        let reason = match err {
+            Error::Timeout => "timeout",
+            Error::OversizedMessage => "oversized-message",
+            _ => "io",
+        };
+        let last_write_at = *last_write.lock().unwrap();
+        tracing::info!(
+            "peer_reader[{}]: disconnect from {} reason={} error=\"{}\" budget={}x{}ms probes_sent={} last_rx={} last_rx_type={} last_tx={}",
+            peer_id,
+            hex::encode(&peer_key[..8]),
+            reason,
+            err,
+            peer_probe_count,
+            peer_timeout.as_millis(),
+            probes_sent,
+            age_of(&last_recv),
+            match last_recv_type {
+                Some(t) => format!("{:?}", t),
+                None => "none".to_string(),
+            },
+            age_of(&last_write_at),
+        );
+    }
+
     // Return the disconnect reason (None = clean shutdown)
     match disconnect_reason {
         Some(err) => Err(err),
@@ -626,6 +712,12 @@ const IDLE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Size of the BufWriter buffer for each peer writer (128 KB).
 /// Outbound frames accumulate here; a single flush() drains to the OS per burst.
+///
+/// Sized to hold one whole drain batch: MAX_DRAIN_PER_ITER (96) MTU-sized
+/// frames is roughly 125 KB, so a full batch costs one write syscall. Shrinking
+/// this without shrinking MAX_DRAIN_PER_ITER too splits every batch across
+/// several flushes and costs about a third of throughput on a fast link — the
+/// two constants have to be changed together.
 const WRITE_BUF_SIZE: usize = 128 * 1024;
 
 /// Maximum packets drained from the traffic queue per writer loop iteration.
@@ -635,19 +727,49 @@ const WRITE_BUF_SIZE: usize = 128 * 1024;
 /// stream can monopolize the writer without starving lighter flows.
 const MAX_DRAIN_PER_ITER: usize = 96;
 
+/// Arm the peer read deadline unless it is already armed.
+/// Matches Go's `if m.deadlined { return }` check — once armed, the deadline
+/// stays until the reader clears it on receiving any frame.
+fn arm_read_deadline(read_deadline: &ReadDeadline, peer_timeout: Duration) {
+    let mut dl = read_deadline.lock().unwrap();
+    if dl.is_none() {
+        *dl = Some(std::time::Instant::now() + peer_timeout);
+    }
+}
+
+/// Outcome of one traffic-drain pass.
+struct DrainOutcome {
+    /// False if a write failed or timed out; the caller should disconnect.
+    ok: bool,
+    /// True if at least one traffic frame was buffered. The caller arms the
+    /// read deadline only once the following flush succeeds, so time spent in
+    /// our own send buffer never counts against the peer's response budget.
+    wrote: bool,
+}
+
 /// Drain queued traffic packets and send them with timeout.
 /// This is called by peer_writer after successfully writing a frame.
 /// Drains at most MAX_DRAIN_PER_ITER packets per call so the writer yields
 /// back to the event loop periodically, preventing a heavy stream from
 /// blocking other channel messages indefinitely.
-/// Returns false if write failed or timed out, true otherwise.
+///
+/// The batch is deliberately NOT interrupted to service a pending
+/// `ScheduleKeepalive`: the reader queues one for every non-keepalive frame it
+/// receives, so under load the channel is essentially never empty, and bailing
+/// out early would collapse the batch to a few packets plus a flush each time.
+/// It is also unnecessary — the traffic frames in this batch clear the peer's
+/// read deadline by themselves, which is exactly what Go does when it cancels
+/// the pending keepalive timer on any write (`peerMonitor.sent`).
+///
+/// If the batch fills to the cap, more traffic may still be queued, so the
+/// writer is re-notified: `Notify` holds at most one permit, and without this
+/// the remainder could strand until the next push.
 async fn drain_traffic_queue<W: tokio::io::AsyncWrite + Unpin>(
     peer_id: PeerId,
     queue: &Arc<tokio::sync::Mutex<PacketQueue>>,
     writer: &mut W,
-    peer_timeout: Duration,
-    read_deadline: &ReadDeadline,
-) -> bool {
+    traffic_notify: &Notify,
+) -> DrainOutcome {
     use tokio::io::AsyncWriteExt;
 
     // Lock once, pop a batch of packets, unlock, then write them all.
@@ -665,17 +787,15 @@ async fn drain_traffic_queue<W: tokio::io::AsyncWrite + Unpin>(
     };
 
     if batch.is_empty() {
-        return true;
+        return DrainOutcome { ok: true, wrote: false };
     }
 
-    // Arm read deadline once for the entire batch
-    {
-        let mut dl = read_deadline.lock().unwrap();
-        if dl.is_none() {
-            *dl = Some(std::time::Instant::now() + peer_timeout);
-        }
+    // Filled to the cap — assume more is queued and make sure we come back.
+    if batch.len() == MAX_DRAIN_PER_ITER {
+        traffic_notify.notify_one();
     }
 
+    let mut wrote = false;
     for traffic in batch {
         let frame = wire::encode_traffic_frame(
             &traffic.path, &traffic.from,
@@ -690,24 +810,30 @@ async fn drain_traffic_queue<W: tokio::io::AsyncWrite + Unpin>(
 
         match write_result {
             Ok(Ok(_)) => {
+                wrote = true;
                 tracing::debug!("peer_writer[{}]: sent queued traffic", peer_id);
             }
             Ok(Err(e)) => {
                 tracing::debug!("peer_writer[{}]: write error for queued traffic: {}", peer_id, e);
-                return false;
+                return DrainOutcome { ok: false, wrote };
             }
             Err(_) => {
                 tracing::debug!("peer_writer[{}]: write timeout ({:?}) for queued traffic - slow peer detected", peer_id, WRITE_TIMEOUT);
-                return false;
+                return DrainOutcome { ok: false, wrote };
             }
         }
     }
-    true
+    DrainOutcome { ok: true, wrote }
 }
 
 /// Write `frame` and flush, with WRITE_TIMEOUT on each step.
 /// Returns `false` if the write or flush failed (caller should break).
-async fn write_and_flush<W: tokio::io::AsyncWrite + Unpin>(peer_id: PeerId, writer: &mut W, frame: &[u8]) -> bool {
+async fn write_and_flush<W: tokio::io::AsyncWrite + Unpin>(
+    peer_id: PeerId,
+    writer: &mut W,
+    frame: &[u8],
+    last_write: &LastWrite,
+) -> bool {
     use tokio::io::AsyncWriteExt;
     let write_result = tokio::time::timeout(WRITE_TIMEOUT, writer.write_all(frame)).await;
     if write_result.is_err() || write_result.unwrap().is_err() {
@@ -719,6 +845,7 @@ async fn write_and_flush<W: tokio::io::AsyncWrite + Unpin>(peer_id: PeerId, writ
         tracing::debug!("peer_writer[{}]: flush failed or timed out", peer_id);
         return false;
     }
+    mark_written(last_write);
     true
 }
 
@@ -743,6 +870,7 @@ pub(crate) async fn peer_writer(
     _keepalive_delay: Duration,
     peer_timeout: Duration,
     read_deadline: ReadDeadline,
+    last_write: LastWrite,
     cancel: CancellationToken,
 ) {
     use crate::wire;
@@ -754,6 +882,19 @@ pub(crate) async fn peer_writer(
 
     // Pre-encode keepalive frame
     let keepalive_frame = wire::encode_frame(wire::PacketType::KeepAlive, &[]);
+
+    // Set when the reader reports traffic the peer expects an answer to, and
+    // cleared by any frame we actually send, because that frame is already the
+    // answer — the peer's read deadline is reset by *any* frame it receives.
+    // This mirrors Go's `peerMonitor.sent`, which stops the pending keepalive
+    // timer on every write. Without it we emit a redundant keepalive (and an
+    // extra flush) ahead of every traffic batch.
+    //
+    // Deliberately not a port of Go's `peerKeepAliveDelay`: Go waits a second
+    // before answering, which would spend a fifth of our peer_timeout budget
+    // and make spurious disconnects on lossy paths more likely, not less. We
+    // still answer immediately whenever we have nothing else to send.
+    let mut keepalive_owed = false;
 
     loop {
         // ── Priority: protocol channel > traffic queue > idle keepalive ───
@@ -772,9 +913,10 @@ pub(crate) async fn peer_writer(
             _ = traffic_notify.notified() => None,  // traffic queued
             _ = tokio::time::sleep(IDLE_KEEPALIVE_INTERVAL) => {
                 // Idle timeout — send a keepalive to keep the connection alive
-                if !write_and_flush(peer_id, &mut conn_write, &keepalive_frame).await {
+                if !write_and_flush(peer_id, &mut conn_write, &keepalive_frame, &last_write).await {
                     break;
                 }
+                keepalive_owed = false;
                 continue;
             },
         };
@@ -783,9 +925,18 @@ pub(crate) async fn peer_writer(
             match msg {
                 PeerMessage::SendFrame(data) => {
                     // Log outgoing frame type for diagnostics
-                    if let Some(ptype) = peek_frame_type(&data) {
+                    let ptype = peek_frame_type(&data);
+                    if let Some(ptype) = ptype {
                         tracing::debug!("peer_writer[{}]: sending {:?} frame, {} bytes", peer_id, ptype, data.len());
                     }
+
+                    // Non-keepalive frames expect a response, so they arm the read
+                    // deadline — but only after the flush below has handed the bytes
+                    // to the transport, never while they sit in our own buffer.
+                    let needs_deadline = matches!(
+                        ptype,
+                        Some(p) if !matches!(p, wire::PacketType::KeepAlive | wire::PacketType::Dummy)
+                    );
 
                     // Write with timeout to detect slow peers
                     let write_result = tokio::time::timeout(
@@ -794,20 +945,7 @@ pub(crate) async fn peer_writer(
                     ).await;
 
                     match write_result {
-                        Ok(Ok(_)) => {
-                            // Arm the read deadline for non-keepalive frames, but only
-                            // if not already armed. Matches Go's `if m.deadlined { return }`
-                            // check — once armed, the deadline stays until the reader clears
-                            // it on receiving any frame.
-                            if let Some(ptype) = peek_frame_type(&data) {
-                                if !matches!(ptype, wire::PacketType::KeepAlive | wire::PacketType::Dummy) {
-                                    let mut dl = read_deadline.lock().unwrap();
-                                    if dl.is_none() {
-                                        *dl = Some(std::time::Instant::now() + peer_timeout);
-                                    }
-                                }
-                            }
-                        }
+                        Ok(Ok(_)) => {}
                         Ok(Err(e)) => {
                             tracing::debug!("peer_writer[{}]: write error: {}", peer_id, e);
                             break;
@@ -834,31 +972,44 @@ pub(crate) async fn peer_writer(
                             break;
                         }
                     }
+                    mark_written(&last_write);
+
+                    if needs_deadline {
+                        arm_read_deadline(&read_deadline, peer_timeout);
+                    }
+                    // This frame is itself the answer the peer is waiting for.
+                    keepalive_owed = false;
                 }
                 PeerMessage::ScheduleKeepalive => {
                     // Coalesce: drain any additional ScheduleKeepalive messages
-                    // that queued up during a data burst, then send ONE keepalive.
+                    // that queued up during a data burst, then owe ONE keepalive.
                     // Without this, a burst of N received frames triggers N keepalives,
                     // starving the traffic queue and causing ACK drops (age > 25ms).
+                    keepalive_owed = true;
                     while let Ok(msg) = rx.try_recv() {
-                        if let PeerMessage::SendFrame(data) = msg {
-                            // Don't discard protocol frames — send them
-                            if !write_and_flush(peer_id, &mut conn_write, &data).await {
-                                break;
+                        match msg {
+                            PeerMessage::SendFrame(data) => {
+                                // Don't discard protocol frames — send them
+                                if !write_and_flush(peer_id, &mut conn_write, &data, &last_write).await {
+                                    break;
+                                }
+                                keepalive_owed = false;
                             }
+                            PeerMessage::ScheduleKeepalive => keepalive_owed = true,
                         }
-                        // ScheduleKeepalive messages are absorbed (coalesced)
                     }
-                    if !write_and_flush(peer_id, &mut conn_write, &keepalive_frame).await {
-                        break;
-                    }
+                    // The keepalive itself is deferred to the end of this
+                    // iteration: a traffic batch may follow and answer for us.
                 }
             }
         }
 
         // Drain queued application traffic (only when no protocol messages pending).
         if rx.is_empty() {
-            if !drain_traffic_queue(peer_id, &traffic_queue, &mut conn_write, peer_timeout, &read_deadline).await {
+            let drained = drain_traffic_queue(
+                peer_id, &traffic_queue, &mut conn_write, &traffic_notify,
+            ).await;
+            if !drained.ok {
                 tracing::debug!("peer_writer[{}]: failed to drain traffic queue, disconnecting", peer_id);
                 break;
             }
@@ -878,6 +1029,27 @@ pub(crate) async fn peer_writer(
                     break;
                 }
             }
+            if drained.wrote {
+                mark_written(&last_write);
+            }
+
+            // Traffic has now reached the transport, so start the peer's
+            // response budget from here rather than from when we buffered it.
+            if drained.wrote {
+                arm_read_deadline(&read_deadline, peer_timeout);
+                // Those frames answer the peer; no keepalive needed on top.
+                keepalive_owed = false;
+            }
+        }
+
+        // Nothing went out this iteration, so answer the peer explicitly.
+        // Skipped while the channel still holds frames: those are written on
+        // the very next iteration and serve as the answer themselves.
+        if keepalive_owed && rx.is_empty() {
+            if !write_and_flush(peer_id, &mut conn_write, &keepalive_frame, &last_write).await {
+                break;
+            }
+            keepalive_owed = false;
         }
     }
 

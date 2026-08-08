@@ -394,3 +394,65 @@ async fn cross_hub_forward_discovery_retry() {
         assert!(ok, "trial {}: D did not receive the packet within 8s", trial);
     }
 }
+
+/// A peer that stops answering must be probed rather than dropped on the first
+/// missed interval — a lossy path can stall for seconds while TCP backs off its
+/// retransmits, and tearing the link down loses more than waiting does. The
+/// link still has to die once the probe budget is spent.
+#[tokio::test]
+async fn silent_peer_is_probed_before_disconnect() {
+    const INTERVAL: Duration = Duration::from_millis(150);
+
+    /// How long the node takes to give up on a peer that reads everything we
+    /// send it and never answers.
+    async fn time_to_disconnect(probes: u32) -> Duration {
+        let config = Config::default()
+            .with_peer_timeout(INTERVAL)
+            .with_peer_probe_count(probes);
+        let node = new_packet_conn(SigningKey::generate(&mut OsRng), config);
+        let peer_addr = ironwood::Addr::from(
+            SigningKey::generate(&mut OsRng).verifying_key().to_bytes(),
+        );
+
+        let (ours, theirs) = tokio::io::duplex(65536);
+        // Drain the silent end so the node's writes never block: the only thing
+        // allowed to end this connection is the liveness deadline.
+        tokio::spawn(async move {
+            let mut theirs = theirs;
+            let mut buf = [0u8; 4096];
+            while tokio::io::AsyncReadExt::read(&mut theirs, &mut buf)
+                .await
+                .unwrap_or(0)
+                > 0
+            {}
+        });
+
+        let start = tokio::time::Instant::now();
+        timeout(
+            Duration::from_secs(5),
+            node.handle_conn(peer_addr, Box::new(ours), 0),
+        )
+        .await
+        .expect("peer outlived its probe budget entirely")
+        .ok();
+        start.elapsed()
+    }
+
+    let with_retry = time_to_disconnect(3).await;
+    let no_retry = time_to_disconnect(1).await;
+
+    assert!(
+        with_retry >= INTERVAL * 2,
+        "gave up after {with_retry:?}; three probes should outlast {:?}",
+        INTERVAL * 2
+    );
+    assert!(
+        with_retry < INTERVAL * 8,
+        "took {with_retry:?}, far beyond the {:?} budget",
+        INTERVAL * 3
+    );
+    assert!(
+        no_retry < INTERVAL * 2,
+        "single-probe peer survived {no_retry:?}, expected a prompt drop"
+    );
+}
