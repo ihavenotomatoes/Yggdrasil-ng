@@ -40,6 +40,9 @@ pub struct Core {
     pub(crate) tls_cert_expiry: Arc<RwLock<time::OffsetDateTime>>,
     proto_tx: mpsc::Sender<(Addr, Vec<u8>)>,
     pub(crate) multicast: Mutex<Option<Arc<Multicast>>>,
+    /// Name and MTU of the TUN interface, as assigned by the OS. Filled in
+    /// after the adapter is created; `None` means there is no TUN.
+    tun_info: std::sync::Mutex<Option<(String, u64)>>,
     external_ifaces_tx: watch::Sender<Vec<NetworkInterface>>,
     external_ifaces_rx: watch::Receiver<Vec<NetworkInterface>>,
 }
@@ -142,6 +145,7 @@ impl Core {
             tls_cert_expiry,
             proto_tx,
             multicast: Mutex::new(None),
+            tun_info: std::sync::Mutex::new(None),
             external_ifaces_tx,
             external_ifaces_rx,
         });
@@ -430,11 +434,21 @@ impl Core {
         self.inner.force_lookup(dest).await
     }
 
-    /// Get TUN adapter status.
+    /// Record the name and MTU of the TUN interface. Called once the adapter
+    /// exists, since the OS may hand out different values than were requested.
+    pub fn set_tun_info(&self, name: &str, mtu: u64) {
+        let mut slot = self.tun_info.lock().unwrap();
+        *slot = Some((name.to_string(), mtu));
+    }
+
+    /// Get TUN adapter status: (enabled, name, mtu). Without a TUN — disabled
+    /// via `if_name = "none"`, or built without the `tun` feature — the name
+    /// is empty, the MTU is 0 and `enabled` is false.
     pub fn get_tun_status(&self) -> (bool, String, u64) {
-        // TUN is always enabled in current implementation
-        // Return (enabled, name, mtu)
-        (true, "utun".to_string(), self.mtu())
+        match self.tun_info.lock().unwrap().clone() {
+            Some((name, mtu)) => (true, name, mtu),
+            None => (false, String::new(), 0),
+        }
     }
 
     /// Set the multicast module reference (called after construction).

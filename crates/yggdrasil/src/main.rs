@@ -233,10 +233,25 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Console mode: Ctrl+C triggers shutdown
+    // Shutdown on Ctrl+C, or on SIGTERM from a service manager.
     let (watch_tx, watch_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm =
+                signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+            let mut sigint =
+                signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
+            tokio::select! {
+                _ = sigterm.recv() => tracing::info!("Received SIGTERM"),
+                _ = sigint.recv()  => tracing::info!("Received SIGINT"),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
         let _ = watch_tx.send(true);
     });
 
@@ -402,6 +417,7 @@ async fn run_node(
         ).await {
             Ok(tun) => {
                 tracing::info!("TUN adapter started");
+                core.set_tun_info(tun.name(), tun.mtu() as u64);
                 Some(tun)
             }
             Err(e) => {
@@ -534,12 +550,6 @@ async fn run_node(
         yggdrasil::ckr::remove_routes(&config.tunnel_routing, tun_name, core.public_key());
     }
 
-    core.close_multicast().await;
-    if let Some(admin) = &admin {
-        admin.close();
-    }
-    core.close().await.ok();
-
     // Tear down TUN explicitly so the OS interface is removed before this
     // function returns. Dropping TunAdapter alone is not enough: its tokio
     // tasks each hold an Arc<AsyncDevice>, and dropping a JoinHandle does
@@ -551,6 +561,12 @@ async fn run_node(
     if let Some(t) = tun.take() {
         t.close().await;
     }
+
+    core.close_multicast().await;
+    if let Some(admin) = &admin {
+        admin.close();
+    }
+    core.close().await.ok();
 
     tracing::info!("Goodbye!");
     Ok(())

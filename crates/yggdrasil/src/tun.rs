@@ -38,6 +38,8 @@ pub struct TunAdapter {
     /// On macOS with "auto" this will be the kernel-assigned utunN
     /// (e.g. "utun3"), which may differ from the requested name.
     name: String,
+    /// MTU the interface ended up with, which the OS may have clamped.
+    mtu: u16,
     read_handle: tokio::task::JoinHandle<()>,
     write_handle: tokio::task::JoinHandle<()>,
 }
@@ -129,7 +131,8 @@ impl TunAdapter {
                 .map_err(|e| format!("failed to get assigned TUN interface name: {}", e))?;
         }
 
-        tracing::info!("TUN device '{}' created with address {} and MTU {}", tun_name, addr, mtu);
+        let actual_mtu = device.mtu().unwrap_or(mtu);
+        tracing::info!("TUN device '{}' created with address {} and MTU {}", tun_name, addr, actual_mtu);
 
         // CKR system route installation moved to main.rs (after multicast)
         // to ensure routes are added only after Yggdrasil network is fully up.
@@ -168,6 +171,7 @@ impl TunAdapter {
         Ok(Self {
             device,
             name: tun_name,
+            mtu: actual_mtu,
             read_handle,
             write_handle,
         })
@@ -177,6 +181,11 @@ impl TunAdapter {
     /// On macOS this is the kernel-assigned utunN when "auto" was requested.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// MTU the interface ended up with.
+    pub fn mtu(&self) -> u16 {
+        self.mtu
     }
 
     /// Tear down the TUN adapter explicitly: abort the I/O tasks, wait for
@@ -249,7 +258,7 @@ impl TunAdapter {
     }
 
     pub async fn close(self) {
-        let TunAdapter { device, name: _, read_handle, write_handle } = self;
+        let TunAdapter { device, name: _, mtu: _, read_handle, write_handle } = self;
         read_handle.abort();
         write_handle.abort();
         let _ = read_handle.await;
