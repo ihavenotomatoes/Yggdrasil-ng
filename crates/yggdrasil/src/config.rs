@@ -134,7 +134,74 @@ pub struct Config {
     /// empty encrypted traffic. Clamped to [0, 1000]. 0 disables. Default: 0.
     #[serde(default)]
     pub keepalive_remote_count: u64,
+
+    /// Peer liveness / ironwood read-deadline policy.
+    /// Total silence budget ≈ current interval × `probe_count`.
+    #[serde(default)]
+    pub peer_liveness: PeerLivenessConfig,
 }
+
+/// Nested `[peer_liveness]` table — one subsystem, one object (matches ironwood
+/// [`ironwood::AdaptiveTimeoutConfig`] + probe count).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PeerLivenessConfig {
+    /// When true (default): adaptive sticky floor. When false: exact `fixed_secs`.
+    #[serde(default = "default_true")]
+    pub adaptive: bool,
+
+    /// Exact interval when `adaptive = false` (seconds). Default: 15.
+    #[serde(default = "default_peer_liveness_fixed_secs")]
+    pub fixed_secs: u64,
+
+    /// Adaptive healthy floor for the interval (seconds). Default: 5.
+    /// With default `probe_count=3`, cold total silence ≈ 15s.
+    #[serde(default = "default_peer_liveness_min_secs")]
+    pub min_secs: u64,
+
+    /// Sticky floor after a real liveness timeout (seconds). Default: 15.
+    /// Independent of `fixed_secs` so fixed-mode value and sticky floor can differ.
+    #[serde(default = "default_peer_liveness_problem_min_secs")]
+    pub problem_min_secs: u64,
+
+    /// Adaptive interval ceiling (seconds). Default: 30.
+    #[serde(default = "default_peer_liveness_max_secs")]
+    pub max_secs: u64,
+
+    /// Base seconds added to RTT estimate. Default: 2.
+    #[serde(default = "default_peer_liveness_base_secs")]
+    pub base_secs: u64,
+
+    /// Multiplier for EWMA(arm→reply). Default: 8.
+    #[serde(default = "default_peer_liveness_rtt_mult")]
+    pub rtt_mult: u32,
+
+    /// Consecutive silent intervals before disconnect. Default: 3.
+    #[serde(default = "default_peer_liveness_probe_count")]
+    pub probe_count: u32,
+}
+
+impl Default for PeerLivenessConfig {
+    fn default() -> Self {
+        Self {
+            adaptive: true,
+            fixed_secs: default_peer_liveness_fixed_secs(),
+            min_secs: default_peer_liveness_min_secs(),
+            problem_min_secs: default_peer_liveness_problem_min_secs(),
+            max_secs: default_peer_liveness_max_secs(),
+            base_secs: default_peer_liveness_base_secs(),
+            rtt_mult: default_peer_liveness_rtt_mult(),
+            probe_count: default_peer_liveness_probe_count(),
+        }
+    }
+}
+
+fn default_peer_liveness_fixed_secs() -> u64 { 15 }
+fn default_peer_liveness_min_secs() -> u64 { 5 }
+fn default_peer_liveness_problem_min_secs() -> u64 { 15 }
+fn default_peer_liveness_max_secs() -> u64 { 30 }
+fn default_peer_liveness_base_secs() -> u64 { 2 }
+fn default_peer_liveness_rtt_mult() -> u32 { 8 }
+fn default_peer_liveness_probe_count() -> u32 { 3 }
 
 /// Built-in stateful firewall configuration. Default-off; when enabled,
 /// inbound mesh traffic is dropped unless it matches an outbound flow
@@ -290,6 +357,7 @@ impl Default for Config {
             keepalive_direct: false,
             keepalive_interval: default_keepalive_interval(),
             keepalive_remote_count: 0,
+            peer_liveness: PeerLivenessConfig::default(),
         }
     }
 }
