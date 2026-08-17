@@ -96,25 +96,28 @@ if_mtu = 65535
 # If the remote stays silent across `probe_count` intervals, the link is torn
 # down (`ironwood: operation timed out`). Any frame resets the probe count.
 #
-# Adaptive (default) — sticky floor (does not snap back to min):
+# Fixed mode (default) — constant interval:
+#   interval = fixed_secs (default 15)
+#   total silence budget ≈ fixed_secs × probe_count  (e.g. 15×3 = 45s)
+#
+# [peer_liveness]
+# adaptive = false
+# fixed_secs = 15
+# probe_count = 3
+#
+# Adaptive mode — sticky floor (does not snap back to min):
 #   healthy floor = min_secs (5); after timeout floor → problem_min_secs (15)
 #   interval T = clamp(base + rtt_mult * ewma + penalty, floor, max)
 #   total silence budget ≈ T × probe_count  (e.g. cold 5×3=15s, sticky 15×3=45s)
 #
 # [peer_liveness]
 # adaptive = true
-# fixed_secs = 15          # exact interval when adaptive = false
+# fixed_secs = 15          # used only when adaptive = false
 # min_secs = 5             # healthy adaptive floor
 # problem_min_secs = 15    # sticky floor after real timeout (independent of fixed)
 # max_secs = 30
 # base_secs = 2
 # rtt_mult = 8
-# probe_count = 3
-#
-# Fixed mode:
-# [peer_liveness]
-# adaptive = false
-# fixed_secs = 15
 # probe_count = 3
 
 # Custom node info that is advertised to other nodes.

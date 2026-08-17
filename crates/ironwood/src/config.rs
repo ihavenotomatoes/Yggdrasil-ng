@@ -101,7 +101,7 @@ impl Config {
         self
     }
 
-    /// Enable or disable adaptive peer liveness (default: enabled).
+    /// Enable or disable adaptive peer liveness (default: disabled / fixed mode).
     pub fn with_peer_timeout_adaptive(mut self, adaptive: bool) -> Self {
         self.peer_timeout_cfg.adaptive = adaptive;
         self

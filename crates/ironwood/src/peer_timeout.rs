@@ -4,7 +4,7 @@
 //! tolerated for up to `peer_probe_count` intervals (see [`crate::Config`]); only
 //! the final miss tears the link down and updates durable state.
 //!
-//! ## Adaptive (default)
+//! ## Adaptive (optional; default is fixed mode)
 //!
 //! ```text
 //! total_silence  is NOT owned here alone — peers.rs multiplies interval × probes.
@@ -34,7 +34,7 @@ const REGISTRY_SOFT_CAP: usize = 4096;
 pub struct AdaptiveTimeoutConfig {
     /// Fixed interval when `adaptive` is false.
     pub fixed_or_initial: Duration,
-    /// Enable adaptive sizing + sticky floor. Default: true.
+    /// Enable adaptive sizing + sticky floor. Default: false (fixed mode).
     pub adaptive: bool,
     /// Initial / healthy floor for the interval. Default: 5s.
     /// With `peer_probe_count=3` cold total silence ≈ 15s.
@@ -57,7 +57,7 @@ impl Default for AdaptiveTimeoutConfig {
     fn default() -> Self {
         Self {
             fixed_or_initial: Duration::from_secs(15),
-            adaptive: true,
+            adaptive: false,
             min: Duration::from_secs(5),
             problem_min: Duration::from_secs(15),
             max: Duration::from_secs(30),
@@ -430,21 +430,25 @@ mod tests {
 
     #[test]
     fn normal_stays_at_five_with_low_rtt() {
-        let cfg = AdaptiveTimeoutConfig::default();
+        let mut cfg = AdaptiveTimeoutConfig::default();
+        cfg.adaptive = true;
         assert_eq!(cfg.compute(0, 0, 5_000), Duration::from_secs(5));
         assert_eq!(cfg.compute(10, 0, 5_000), Duration::from_secs(5));
     }
 
     #[test]
     fn sticky_floor_fifteen_after_timeout() {
-        let cfg = AdaptiveTimeoutConfig::default();
+        let mut cfg = AdaptiveTimeoutConfig::default();
+        cfg.adaptive = true;
         assert_eq!(cfg.compute(10, 0, 15_000), Duration::from_secs(15));
         assert_eq!(cfg.compute(2000, 0, 15_000), Duration::from_secs(18));
     }
 
     #[test]
     fn timeout_raises_sticky_floor_and_penalizes() {
-        let reg = PeerLivenessRegistry::new(AdaptiveTimeoutConfig::default());
+        let mut cfg = AdaptiveTimeoutConfig::default();
+        cfg.adaptive = true;
+        let reg = PeerLivenessRegistry::new(cfg);
         let ctrl = reg.ctrl_for(key(1));
         assert!(!ctrl.is_degraded());
         assert_eq!(ctrl.current(), Duration::from_secs(5));
@@ -457,7 +461,9 @@ mod tests {
 
     #[test]
     fn sticky_floor_does_not_snap_back() {
-        let reg = PeerLivenessRegistry::new(AdaptiveTimeoutConfig::default());
+        let mut cfg = AdaptiveTimeoutConfig::default();
+        cfg.adaptive = true;
+        let reg = PeerLivenessRegistry::new(cfg);
         let ctrl = reg.ctrl_for(key(2));
         ctrl.on_timeout();
         assert!(ctrl.is_degraded());
@@ -473,7 +479,9 @@ mod tests {
 
     #[test]
     fn slow_sample_does_not_raise_floor() {
-        let reg = PeerLivenessRegistry::new(AdaptiveTimeoutConfig::default());
+        let mut cfg = AdaptiveTimeoutConfig::default();
+        cfg.adaptive = true;
+        let reg = PeerLivenessRegistry::new(cfg);
         let ctrl = reg.ctrl_for(key(3));
         ctrl.inject_sample(Duration::from_secs(6));
         assert!(!ctrl.is_degraded());
@@ -485,7 +493,9 @@ mod tests {
 
     #[test]
     fn durable_state_survives_new_ctrl() {
-        let reg = PeerLivenessRegistry::new(AdaptiveTimeoutConfig::default());
+        let mut cfg = AdaptiveTimeoutConfig::default();
+        cfg.adaptive = true;
+        let reg = PeerLivenessRegistry::new(cfg);
         let k = key(7);
         {
             let c1 = reg.ctrl_for(k);
@@ -514,7 +524,9 @@ mod tests {
 
     #[test]
     fn arm_reentry_keeps_epoch() {
-        let reg = PeerLivenessRegistry::new(AdaptiveTimeoutConfig::default());
+        let mut cfg = AdaptiveTimeoutConfig::default();
+        cfg.adaptive = true;
+        let reg = PeerLivenessRegistry::new(cfg);
         let ctrl = reg.ctrl_for(key(4));
         let mut slot = None;
         let e1 = ctrl.arm(&mut slot);
@@ -524,7 +536,9 @@ mod tests {
 
     #[test]
     fn snapshot_from_registry() {
-        let reg = PeerLivenessRegistry::new(AdaptiveTimeoutConfig::default());
+        let mut cfg = AdaptiveTimeoutConfig::default();
+        cfg.adaptive = true;
+        let reg = PeerLivenessRegistry::new(cfg);
         let k = key(9);
         let ctrl = reg.ctrl_for(k);
         ctrl.on_timeout();
@@ -536,7 +550,8 @@ mod tests {
 
     #[test]
     fn total_silence_budget_multiplies_interval() {
-        let cfg = AdaptiveTimeoutConfig::default();
+        let mut cfg = AdaptiveTimeoutConfig::default();
+        cfg.adaptive = true;
         // Cold floor 5s × 3 probes = 15s total.
         assert_eq!(
             cfg.total_silence_budget(0, 0, 5_000, 3),

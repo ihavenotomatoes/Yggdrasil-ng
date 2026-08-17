@@ -235,7 +235,7 @@ Yggdrasil-ng uses **TOML** format for configuration (unlike the Go version which
 | `node_info_privacy` | bool | Hide node info from other nodes (default: false) |
 | `allowed_public_keys` | array | Whitelist of allowed peer keys (empty = allow all) |
 | `[tunnel_routing]` | table | CKR tunnel routing config (`ckr` feature, enabled by default) — see [docs/CKR.md](docs/CKR.md) |
-
+| `[peer_liveness]` | table | Peer liveness / read-deadline policy (fixed or adaptive interval + probe count). Default: fixed mode (`adaptive = false`). See [docs/PEER_LIVENESS.md](docs/PEER_LIVENESS.md) |
 **Example minimal configuration:**
 
 ```toml

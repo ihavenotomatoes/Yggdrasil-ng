@@ -37,6 +37,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_false() -> bool {
+    false
+}
+
 fn default_multicast_interfaces() -> Vec<MulticastInterfaceConfig> {
     vec![MulticastInterfaceConfig {
         filter: "*".to_string(),
@@ -145,8 +149,8 @@ pub struct Config {
 /// [`ironwood::AdaptiveTimeoutConfig`] + probe count).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PeerLivenessConfig {
-    /// When true (default): adaptive sticky floor. When false: exact `fixed_secs`.
-    #[serde(default = "default_true")]
+    /// When true: adaptive sticky floor. When false (default): exact `fixed_secs`.
+    #[serde(default = "default_false")]
     pub adaptive: bool,
 
     /// Exact interval when `adaptive = false` (seconds). Default: 15.
@@ -183,7 +187,7 @@ pub struct PeerLivenessConfig {
 impl Default for PeerLivenessConfig {
     fn default() -> Self {
         Self {
-            adaptive: true,
+            adaptive: false,
             fixed_secs: default_peer_liveness_fixed_secs(),
             min_secs: default_peer_liveness_min_secs(),
             problem_min_secs: default_peer_liveness_problem_min_secs(),
