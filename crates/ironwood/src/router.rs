@@ -1113,6 +1113,39 @@ impl Router {
 
     /// Handle outbound traffic (from local application).
     pub fn send_traffic(&mut self, mut tr: crate::traffic::TrafficPacket) -> Vec<RouterAction> {
+        // Direct-peer shortcut: when the destination is a node we already have a
+        // link to, hand the packet straight to that link instead of discovering a
+        // path for it first. Saves a full lookup round trip on the first packet.
+        //
+        // `watermark = 0` is what makes this safe: the receiver's `lookup()` bails
+        // out at `self_dist >= watermark` (nothing can be strictly closer than 0),
+        // returns no next hop, and falls through to the local-delivery branch — so
+        // the packet is delivered regardless of what `path` says, and can never be
+        // forwarded onwards from there. Go's `_lookup` has the same rule, so this
+        // stays wire-compatible with Go peers.
+        //
+        // Empty payloads are excluded on purpose: `send_lookup` is implemented as
+        // an empty traffic packet whose only job is to fall into the lookup branch
+        // below. Delivering it to the peer instead would be a no-op (too short to
+        // parse as a session message) and the lookup would never go out.
+        if !tr.payload.is_empty() {
+            if let Some(peer_id) = self.best_peer_for_key(&tr.dest) {
+                let self_key = self.crypto.public_key;
+                tr.path = self.cached_coords(&tr.dest);
+                tr.from = self.cached_coords(&self_key);
+                tr.watermark = 0;
+                tracing::debug!(
+                    "Direct peer shortcut for {}, sending to peer {}",
+                    hex::encode(&tr.dest[..8]),
+                    peer_id
+                );
+                return vec![RouterAction::SendTraffic {
+                    peer_id,
+                    traffic: tr,
+                }];
+            }
+        }
+
         // Use pathfinder to find path
         if let Some(path) = self.pathfinder.get_path(&tr.dest) {
             tr.path = path.to_vec();
@@ -1545,6 +1578,84 @@ mod tests {
         assert!(ann.check());
         assert!(router.update(&ann));
         assert!(router.infos.contains_key(&crypto2.public_key));
+    }
+
+    /// Add a peer with the given key and return its PeerId.
+    fn add_test_peer(router: &mut Router, key: PublicKey, id: PeerId) -> PeerId {
+        router.add_peer(PeerEntry {
+            id,
+            key,
+            port: id as PeerPort,
+            prio: 0,
+            order: id,
+        });
+        id
+    }
+
+    #[test]
+    fn direct_peer_shortcut_bypasses_lookup() {
+        let mut router = make_router();
+        router.become_root();
+        let self_key = router.crypto.public_key;
+        let peer_key = Crypto::new(SigningKey::generate(&mut OsRng)).public_key;
+        let peer_id = add_test_peer(&mut router, peer_key, 7);
+
+        let tr = crate::traffic::TrafficPacket::new(self_key, peer_key, vec![1, 2, 3]);
+        let actions = router.send_traffic(tr);
+
+        // Straight to the link, no lookup at all.
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            RouterAction::SendTraffic { peer_id: id, traffic } => {
+                assert_eq!(*id, peer_id);
+                // watermark 0 makes the receiver deliver locally instead of
+                // forwarding, whatever the path says.
+                assert_eq!(traffic.watermark, 0);
+                assert_eq!(traffic.payload, vec![1, 2, 3]);
+            }
+            other => panic!("expected SendTraffic, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn direct_peer_shortcut_skips_empty_payload() {
+        let mut router = make_router();
+        router.become_root();
+        let self_key = router.crypto.public_key;
+        let peer_key = Crypto::new(SigningKey::generate(&mut OsRng)).public_key;
+        add_test_peer(&mut router, peer_key, 7);
+
+        // An empty payload is send_lookup's trigger packet: it must fall through
+        // to the lookup branch, never get delivered to the peer as traffic.
+        let tr = crate::traffic::TrafficPacket::new(self_key, peer_key, Vec::new());
+        let actions = router.send_traffic(tr);
+
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, RouterAction::SendTraffic { .. })),
+            "empty-payload packet must not take the direct-peer shortcut"
+        );
+    }
+
+    #[test]
+    fn non_peer_destination_still_looks_up() {
+        let mut router = make_router();
+        router.become_root();
+        let self_key = router.crypto.public_key;
+        let peer_key = Crypto::new(SigningKey::generate(&mut OsRng)).public_key;
+        let stranger = Crypto::new(SigningKey::generate(&mut OsRng)).public_key;
+        add_test_peer(&mut router, peer_key, 7);
+
+        let tr = crate::traffic::TrafficPacket::new(self_key, stranger, vec![1, 2, 3]);
+        let actions = router.send_traffic(tr);
+
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, RouterAction::SendTraffic { .. })),
+            "traffic to a non-peer must go through path discovery"
+        );
     }
 
     #[test]

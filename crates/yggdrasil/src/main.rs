@@ -395,6 +395,29 @@ async fn run_node(
     // Wire up path_notify: when ironwood discovers a new path, update the key store
     core.set_path_notify(rwc.clone());
 
+    // Seed the key store with the keys of directly-connected peers. We authenticated
+    // those keys during the link handshake, so their address/subnet mapping is already
+    // derivable locally -- no reason to buffer the first packet and wait for a lookup
+    // to tell us what we know. Combined with the router's direct-peer shortcut this
+    // takes the first packet to a direct peer from three round trips down to two
+    // (the remaining one being the session Init/Ack).
+    //
+    // Re-run on a timer rather than hooking link setup: it picks up peers that connect
+    // later, survives reconnects, and refreshes `last_seen` so entries can't age out
+    // while the peer is up. `update_key` returns early for entries that are still
+    // fresh, so a tick over an unchanged peer set is a couple of hashmap lookups.
+    let seed_core = core.clone();
+    let seed_rwc = rwc.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
+        loop {
+            ticker.tick().await;
+            for key in seed_core.get_peer_keys().await {
+                seed_rwc.update_key(key).await;
+            }
+        }
+    });
+
     // Create TUN adapter
     #[cfg(feature = "tun")]
     let mut tun = if config.if_name != "none" {

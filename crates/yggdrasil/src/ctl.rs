@@ -140,7 +140,8 @@ pub async fn run_ctl(
                         vec![uri, state, dir, address, latency, cost, uptime,
                              rx_bytes, tx_bytes, rx_rate, tx_rate, priority, last_error]
                     }).collect();
-                    print_table(&header, &rows);
+                    // URI is the flexible column: it gets truncated to fit the terminal
+                    print_table_flex(&header, &rows, 0);
                 }
             }
         }
@@ -280,49 +281,94 @@ fn session_rows(sessions: &[serde_json::Value]) -> Vec<Vec<String>> {
     }).collect()
 }
 
+/// Smallest width the flexible column may be shrunk to.
+const MIN_FLEX_WIDTH: usize = 20;
+
 /// Print rows as space-aligned columns with no borders or padding.
 fn print_table(header: &[&str], rows: &[Vec<String>]) {
+    print_table_inner(header, rows, None);
+}
+
+/// Like [`print_table`], but if the table is wider than the terminal, column
+/// `flex_col` is narrowed (its cells truncated with an ellipsis) until the
+/// table fits, down to [`MIN_FLEX_WIDTH`].
+fn print_table_flex(header: &[&str], rows: &[Vec<String>], flex_col: usize) {
+    print_table_inner(header, rows, Some(flex_col));
+}
+
+fn print_table_inner(header: &[&str], rows: &[Vec<String>], flex_col: Option<usize>) {
+    for line in format_table(header, rows, flex_col, terminal_width()) {
+        println!("{}", line);
+    }
+}
+
+fn format_table(
+    header: &[&str],
+    rows: &[Vec<String>],
+    flex_col: Option<usize>,
+    term_width: Option<usize>,
+) -> Vec<String> {
     let cols = header.len();
     // Compute max width per column
     let mut widths = vec![0usize; cols];
     for (i, h) in header.iter().enumerate() {
-        widths[i] = h.len();
+        widths[i] = h.chars().count();
     }
     for row in rows {
         for (i, cell) in row.iter().enumerate() {
             if i < cols {
-                widths[i] = widths[i].max(cell.len());
+                widths[i] = widths[i].max(cell.chars().count());
             }
         }
     }
-    // Print header
-    let mut line = String::new();
-    for (i, h) in header.iter().enumerate() {
-        if i > 0 {
-            line.push_str("  ");
-        }
-        if i < cols - 1 {
-            line.push_str(&format!("{:<width$}", h, width = widths[i]));
-        } else {
-            line.push_str(h); // last column: no trailing spaces
+    // Narrow the flexible column if the table overflows the terminal
+    let flex_col = flex_col.filter(|&i| i < cols);
+    if let (Some(flex), Some(term)) = (flex_col, term_width) {
+        let total: usize = widths.iter().sum::<usize>() + 2 * cols.saturating_sub(1);
+        if total > term {
+            let shrunk = widths[flex].saturating_sub(total - term).max(MIN_FLEX_WIDTH);
+            widths[flex] = shrunk.min(widths[flex]);
         }
     }
-    println!("{}", line);
-    // Print rows
-    for row in rows {
+
+    let render = |cells: &mut dyn Iterator<Item = &str>| -> String {
         let mut line = String::new();
-        for (i, cell) in row.iter().enumerate() {
+        for (i, cell) in cells.enumerate() {
             if i > 0 {
                 line.push_str("  ");
             }
+            let cell = fit_cell(cell, widths[i], flex_col == Some(i));
             if i < cols - 1 {
                 line.push_str(&format!("{:<width$}", cell, width = widths[i]));
             } else {
-                line.push_str(cell);
+                line.push_str(&cell); // last column: no trailing spaces
             }
         }
-        println!("{}", line);
+        line
+    };
+
+    let mut out = vec![render(&mut header.iter().copied())];
+    for row in rows {
+        out.push(render(&mut row.iter().map(|s| s.as_str())));
     }
+    out
+}
+
+/// Cut `s` down to `width` characters, marking the cut with an ellipsis.
+/// Returns it unchanged when `truncate` is false or it already fits.
+fn fit_cell(s: &str, width: usize, truncate: bool) -> String {
+    if !truncate || width == 0 || s.chars().count() <= width {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(width - 1).collect();
+    out.push('…');
+    out
+}
+
+/// Terminal width in columns, or `None` when stdout isn't a terminal
+/// (redirected to a file or a pipe — leave the output untruncated there).
+fn terminal_width() -> Option<usize> {
+    terminal_size::terminal_size().map(|(terminal_size::Width(w), _)| w as usize)
 }
 
 fn json_str(obj: &serde_json::Value, key: &str) -> String {
@@ -369,6 +415,81 @@ fn format_bytes(bytes: u64) -> String {
         format!("{} {}", bytes, UNITS[0])
     } else {
         format!("{:.2} {}", size, UNITS[unit_idx])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> (Vec<&'static str>, Vec<Vec<String>>) {
+        let header = vec!["URI", "State", "Latency"];
+        let rows = vec![
+            vec!["tls://[201:23b0:9e11:2a7c:4d5f::1]:7743".into(), "Up".into(), "21.0ms".into()],
+            vec!["tcp://192.168.44.125:7743".into(), "Up".into(), "1.1ms".into()],
+        ];
+        (header, rows)
+    }
+
+    /// Every line of a fitted table has the same width, and it's within the terminal.
+    fn assert_fits(lines: &[String], term: usize) {
+        for line in lines {
+            assert!(line.chars().count() <= term, "line over {} cols: {:?}", term, line);
+        }
+    }
+
+    #[test]
+    fn table_untruncated_when_it_fits() {
+        let (header, rows) = sample();
+        let lines = format_table(&header, &rows, Some(0), Some(200));
+        assert!(lines[1].starts_with("tls://[201:23b0:9e11:2a7c:4d5f::1]:7743"));
+        assert!(!lines.iter().any(|l| l.contains('…')));
+    }
+
+    #[test]
+    fn table_untruncated_when_not_a_terminal() {
+        let (header, rows) = sample();
+        let lines = format_table(&header, &rows, Some(0), None);
+        assert!(lines[1].starts_with("tls://[201:23b0:9e11:2a7c:4d5f::1]:7743"));
+    }
+
+    #[test]
+    fn flex_column_shrinks_to_terminal_width() {
+        let (header, rows) = sample();
+        let term = 45;
+        let lines = format_table(&header, &rows, Some(0), Some(term));
+        assert_fits(&lines, term);
+        // Widest line uses the full terminal width, i.e. we shrank by exactly the overflow
+        assert_eq!(lines.iter().map(|l| l.chars().count()).max().unwrap(), term);
+        assert!(lines[1].starts_with("tls://[201:23b0"));
+        assert!(lines[1].contains('…'));
+        // The short URI still fits, so it keeps its tail
+        assert!(lines[2].starts_with("tcp://192.168.44.125:7743"));
+    }
+
+    #[test]
+    fn flex_column_never_shrinks_below_minimum() {
+        let (header, rows) = sample();
+        let lines = format_table(&header, &rows, Some(0), Some(10));
+        let uri: String = lines[1].chars().take(MIN_FLEX_WIDTH).collect();
+        assert_eq!(uri.chars().count(), MIN_FLEX_WIDTH);
+        assert!(uri.ends_with('…'));
+    }
+
+    #[test]
+    fn other_columns_are_never_truncated() {
+        let (header, rows) = sample();
+        let lines = format_table(&header, &rows, Some(0), Some(30));
+        for line in &lines[1..] {
+            assert!(line.ends_with("ms"), "latency column was cut: {:?}", line);
+        }
+    }
+
+    #[test]
+    fn plain_table_ignores_terminal_width() {
+        let (header, rows) = sample();
+        let lines = format_table(&header, &rows, None, Some(20));
+        assert!(lines[1].starts_with("tls://[201:23b0:9e11:2a7c:4d5f::1]:7743"));
     }
 }
 
