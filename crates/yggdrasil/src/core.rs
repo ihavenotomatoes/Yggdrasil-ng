@@ -64,7 +64,30 @@ impl Core {
 
         // Create ironwood config with bloom transform and path notify
         let session_path_timeout = config.effective_session_path_timeout();
+
+        // Peer liveness: sticky floor after real timeout; total ≈ interval × probes.
+        use ironwood::AdaptiveTimeoutConfig;
+        use std::time::Duration;
+        let pl = &config.peer_liveness;
+        let peer_timeout_cfg = AdaptiveTimeoutConfig {
+            fixed_or_initial: Duration::from_secs(pl.fixed_secs),
+            adaptive: pl.adaptive,
+            min: Duration::from_secs(pl.min_secs),
+            problem_min: Duration::from_secs(pl.problem_min_secs),
+            max: Duration::from_secs(pl.max_secs),
+            base: Duration::from_secs(pl.base_secs),
+            rtt_mult: pl.rtt_mult,
+            penalty_step: Duration::from_secs(5),
+            penalty_decay: Duration::from_millis(500),
+            ..AdaptiveTimeoutConfig::default()
+        };
+        if let Err(e) = peer_timeout_cfg.validate() {
+            panic!("invalid peer_liveness config: {e}");
+        }
+
         let iw_config = IwConfig::default()
+            .with_peer_timeout_cfg(peer_timeout_cfg)
+            .with_peer_probe_count(pl.probe_count)
             .with_bloom_transform(|key: [u8; 32]| -> [u8; 32] {
                 let subnet = subnet_for_key(&key);
                 subnet.get_key()

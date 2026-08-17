@@ -777,14 +777,28 @@ fn extract_prefix_url(entry: &str) -> (Option<char>, &str) {
     }
 }
 
-/// Blocking download with exactly 3 attempts and 10s timeout each.
+/// Blocking download with exactly 3 attempts and the given timeout each.
 /// Returns body only on final 200 + successful read. Warn is done by caller.
+/// Checks `shutdown` between sleeps and attempts so Ctrl+C aborts promptly.
 #[cfg(feature = "ckr-advanced")]
-fn download_with_retries(url: &str, max_attempts: u32, timeout: Duration) -> Result<Vec<u8>, String> {
-    // Delay before the very first download attempt
-    std::thread::sleep(Duration::from_millis(2000));
+fn download_with_retries(
+    url: &str,
+    max_attempts: u32,
+    timeout: Duration,
+    shutdown: &tokio::sync::watch::Receiver<bool>,
+) -> Result<Vec<u8>, String> {
+    // Interruptible delay before the very first download attempt (~2 s).
+    for _ in 0..20 {
+        if *shutdown.borrow() {
+            return Err("shutdown requested".into());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 
     for attempt in 1..=max_attempts {
+        if *shutdown.borrow() {
+            return Err("shutdown requested".into());
+        }
         match ureq::get(url).timeout(timeout).call() {
             Ok(resp) => {
                 if resp.status() == 200 {
@@ -809,10 +823,14 @@ fn download_with_retries(url: &str, max_attempts: u32, timeout: Duration) -> Res
             }
         }
 
-        // Small delay between attempts (only if not the last one).
-        // This makes the "two attempts with 10s timeout" behaviour more predictable.
+        // Interruptible delay between attempts (only if not the last one).
         if attempt < max_attempts {
-            std::thread::sleep(Duration::from_millis(2000));
+            for _ in 0..20 {
+                if *shutdown.borrow() {
+                    return Err("shutdown requested".into());
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
         }
     }
     Err("unreachable".into())
@@ -842,8 +860,15 @@ fn remove_empty_dirs(base: &PathBuf) {
 /// - 3 attempts, 10s timeout. Warn only on final failure per URL.
 /// - Blocking call — we wait until finished before next startup stage.
 #[cfg(feature = "ckr-advanced")]
-pub fn download_route_lists(config: &TunnelRoutingConfig, core: &Core) {
-if !config.enable {
+pub fn download_route_lists(
+    config: &TunnelRoutingConfig,
+    core: &Core,
+    shutdown: &tokio::sync::watch::Receiver<bool>,
+) {
+    if !config.enable {
+        return;
+    }
+    if *shutdown.borrow() {
         return;
     }
 
@@ -897,8 +922,13 @@ if !config.enable {
     }
 
     {
-        // Delay before checking for connected peers
-        std::thread::sleep(Duration::from_millis(2000));
+        // Interruptible delay before checking for connected peers (~2 s).
+        for _ in 0..20 {
+            if *shutdown.borrow() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
 
         // First check: maybe static peers from config.peers already connected
         // during core.start() (before we subscribed to events).
@@ -917,6 +947,9 @@ if !config.enable {
             let mut first_peer_connected = false;
 
             while std::time::Instant::now() < deadline {
+                if *shutdown.borrow() {
+                    return;
+                }
                 match peer_rx.try_recv() {
                     Ok(PeerEvent::Connected { key, .. }) => {
                         tracing::info!(
@@ -938,10 +971,14 @@ if !config.enable {
             }
 
             if !first_peer_connected && !already_has_peers {
+                if *shutdown.borrow() {
+                    return;
+                }
                 tracing::info!("No peers connected within 15 seconds. Proceeding download route list(s) anyway.");
             }
         }
     }
+
     // === End of wait logic ===
     if !config.enable || config.remote_subnets.is_empty() {
         return;
@@ -1019,9 +1056,15 @@ if !config.enable {
         for (i, entry) in http_entries.iter().enumerate() {
             let (prefix_opt, bare_url) = extract_prefix_url(entry);
 
-            let body = match download_with_retries(bare_url, 3, Duration::from_secs(3)) {
+            if *shutdown.borrow() {
+                return;
+            }
+            let body = match download_with_retries(bare_url, 3, Duration::from_secs(3), shutdown) {
                 Ok(b) => b,
                 Err(e) => {
+                    if e == "shutdown requested" {
+                        return;
+                    }
                     // Warn ONLY on final (third) failure, exactly as required.
                     tracing::warn!(
                         "Failed to download route list #{} for {} from {} after 3 attempts: {}",
@@ -1188,7 +1231,15 @@ fn extract_peer_host(peer: &str) -> Option<String> {
 /// These exclusions then apply to *all* public keys in tunnel_routing.remote_subnets.
 /// Non-Android only. Safe to call even if peers list is empty or contains only IPs.
 #[cfg(not(target_os = "android"))]
-pub fn prepare_peer_exclusions(tunnel_routing: &TunnelRoutingConfig, core: &Core, peers: &[String]) {
+pub fn prepare_peer_exclusions(
+    tunnel_routing: &TunnelRoutingConfig,
+    core: &Core,
+    peers: &[String],
+    shutdown: &tokio::sync::watch::Receiver<bool>,
+) {
+    if *shutdown.borrow() {
+        return;
+    }
     if tunnel_routing.remote_subnets.is_empty() {
         // If there are no entries in `tunnel_routing.remote_subnets` (or the section is missing) —
         // there is no need to prepare peer exceptions or write anything to the log.
@@ -1226,6 +1277,9 @@ pub fn prepare_peer_exclusions(tunnel_routing: &TunnelRoutingConfig, core: &Core
             let mut first_peer_connected = false;
 
             while std::time::Instant::now() < deadline {
+                if *shutdown.borrow() {
+                    return;
+                }
                 match peer_rx.try_recv() {
                     Ok(PeerEvent::Connected { key, .. }) => {
                         tracing::info!(
@@ -1247,13 +1301,21 @@ pub fn prepare_peer_exclusions(tunnel_routing: &TunnelRoutingConfig, core: &Core
             }
 
             if !first_peer_connected && !already_has_peers {
+                if *shutdown.borrow() {
+                    return;
+                }
                 tracing::info!("No peers connected within 15 seconds. Proceeding with domain resolution anyway.");
             }
         }
 
-        // Additional 3000ms delay after peer connection (or timeout)
+        // Interruptible additional delay (~3 s) after peer connection (or timeout)
         // to ensure the Yggdrasil network is ready for DNS resolution.
-        std::thread::sleep(std::time::Duration::from_millis(3000));
+        for _ in 0..30 {
+            if *shutdown.borrow() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
     }
 
     let mut exclusions: Vec<String> = Vec::new();

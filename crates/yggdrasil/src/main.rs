@@ -452,8 +452,9 @@ async fn run_node(
     // Download any HTTP/HTTPS route lists declared in tunnel_routing.remote_subnets.
     // Must happen immediately after multicast peer discovery started and must
     // complete before we proceed to CKR initialization / route installation.
+    // Passes shutdown receiver so Ctrl+C aborts the blocking downloads/waits promptly.
     #[cfg(feature = "ckr-advanced")]
-    yggdrasil::ckr::download_route_lists(&config.tunnel_routing, &core);
+    yggdrasil::ckr::download_route_lists(&config.tunnel_routing, &core, &shutdown_rx);
 
     // Prepare peer IP exclusions from config.peers *after* Yggdrasil network is
     // running (core.start() but *before* init_crypto_key() and install_routes(). 
@@ -461,59 +462,63 @@ async fn run_node(
     // (DNS often lives in Yggdrasil) and that the resulting "!IP" exclusions 
     // are present in effective_entries for all remote_subnets entries.
     #[cfg(all(feature = "ckr", not(target_os = "android")))]
-    yggdrasil::ckr::prepare_peer_exclusions(&config.tunnel_routing, &core, &config.peers);
-    
-    // Initialize CKR routing table (CryptoKey) after multicast has started.
-    // This moves the "CKR: ignoring ..." and "Active CKR routes" logs
-    // to the position before TUN IP assignment.
-    #[cfg(feature = "ckr")]
-    rwc.init_crypto_key(&config.tunnel_routing, core.public_key());
-    
-    // Assign additional CKR IP addresses (from ip_addresses / legacy ipv4_address)
-    // to the already running TUN interface. This is done after multicast peer
-    // discovery so the "CKR: assigning ..." logs appear in the required order
-    // (between "Multicast peer discovery started" and system route installation).
-    // We call the new method on the TunAdapter that was created earlier.
-    #[cfg(feature = "ckr")]
-    if config.if_name != "none" {
-        if let Some(ref tun_adapter) = tun {
-            if config.tunnel_routing.enable {
-                if let Err(e) = tun_adapter.assign_ckr_ip_addresses(&config.tunnel_routing) {
-                    tracing::error!("Failed to assign CKR IP addresses to TUN: {}", e);
+    yggdrasil::ckr::prepare_peer_exclusions(&config.tunnel_routing, &core, &config.peers, &shutdown_rx);
+
+    // If Ctrl+C arrived during download / peer-exclusion prep, skip the remaining
+    // CKR init / IP assignment / route install so shutdown can proceed immediately.
+    if !*shutdown_rx.borrow() {
+        // Initialize CKR routing table (CryptoKey) after multicast has started.
+        // This moves the "CKR: ignoring ..." and "Active CKR routes" logs
+        // to the position before TUN IP assignment.
+        #[cfg(feature = "ckr")]
+        rwc.init_crypto_key(&config.tunnel_routing, core.public_key());
+
+        // Assign additional CKR IP addresses (from ip_addresses / legacy ipv4_address)
+        // to the already running TUN interface. This is done after multicast peer
+        // discovery so the "CKR: assigning ..." logs appear in the required order
+        // (between "Multicast peer discovery started" and system route installation).
+        // We call the new method on the TunAdapter that was created earlier.
+        #[cfg(feature = "ckr")]
+        if config.if_name != "none" {
+            if let Some(ref tun_adapter) = tun {
+                if config.tunnel_routing.enable {
+                    if let Err(e) = tun_adapter.assign_ckr_ip_addresses(&config.tunnel_routing) {
+                        tracing::error!("Failed to assign CKR IP addresses to TUN: {}", e);
+                    }
                 }
             }
         }
-    }
 
-    // Install CKR system routes late — after multicast peer discovery has started.
-    // This moves "Installed route" logs to the very end of startup (between
-    // "Multicast peer discovery started" and "Yggdrasil NG started").
-    // Routes are now added only when the Yggdrasil network is fully operational.
-    // The early installation block was removed from TunAdapter::new.
-    // We reuse the exact same tun_name computation and error handling pattern
-    // that already exists in the shutdown/remove_routes block below.
-    #[cfg(feature = "ckr")]
-    if config.tunnel_routing.enable && config.tunnel_routing.install_system_routes && config.if_name != "none" {
-        // Prefer the real interface name reported by TunAdapter
-        // (on macOS this is the kernel-assigned utunN).
-        let tun_name = match &tun {
-            Some(t) => t.name(),
-            None => {
-                // Fallback (should not happen when if_name != "none")
-                if config.if_name == "auto" {
-                    if cfg!(windows) { "Yggdrasil" } else { "ygg0" }
-                } else {
-                    config.if_name.as_str()
+        // Install CKR system routes late — after multicast peer discovery has started.
+        // This moves "Installed route" logs to the very end of startup (between
+        // "Multicast peer discovery started" and "Yggdrasil NG started").
+        // Routes are now added only when the Yggdrasil network is fully operational.
+        // The early installation block was removed from TunAdapter::new.
+        // We reuse the exact same tun_name computation and error handling pattern
+        // that already exists in the shutdown/remove_routes block below.
+        #[cfg(feature = "ckr")]
+        if config.tunnel_routing.enable && config.tunnel_routing.install_system_routes && config.if_name != "none" {
+            // Prefer the real interface name reported by TunAdapter
+            // (on macOS this is the kernel-assigned utunN).
+            let tun_name = match &tun {
+                Some(t) => t.name(),
+                None => {
+                    // Fallback (should not happen when if_name != "none")
+                    if config.if_name == "auto" {
+                        if cfg!(windows) { "Yggdrasil" } else { "ygg0" }
+                    } else {
+                        config.if_name.as_str()
+                    }
                 }
+            };
+            if let Err(e) = yggdrasil::ckr::install_routes(&config.tunnel_routing, tun_name, core.public_key()) {
+                tracing::error!("Failed to install CKR routes: {}", e);
             }
-        };
-        if let Err(e) = yggdrasil::ckr::install_routes(&config.tunnel_routing, tun_name, core.public_key()) {
-            tracing::error!("Failed to install CKR routes: {}", e);
         }
-    }
 
-    // Wait for shutdown signal
-    tracing::info!("Yggdrasil NG started");
+        // Wait for shutdown signal
+        tracing::info!("Yggdrasil NG started");
+    }
 
     // Tell systemd we're ready (Type=notify). By this point the TUN interface
     // (if any) has been created and the admin socket/multicast started, so
