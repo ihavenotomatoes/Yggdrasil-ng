@@ -49,7 +49,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let mut opts = Options::new();
     opts.optflagopt("g", "genconf", "Generate a new configuration (optionally save to FILE)", "FILE");
     opts.optflagopt("", "normalize", "Normalize a config: read from FILE (or stdin if absent), add any missing fields with defaults while preserving user values and comments, and print to stdout", "FILE");
-    opts.optopt("c", "config", "Config file path (default: yggdrasil.toml)", "FILE");
+    opts.optopt("c", "config", "Config file path (default: yggdrasil.toml, then system path)", "FILE");
     opts.optflag("", "autoconf", "Run without a configuration file (use ephemeral keys)");
     opts.optflag("a", "address", "Print the IPv6 address for the given config and exit");
     opts.optflag("s", "subnet", "Print the IPv6 subnet for the given config and exit");
@@ -120,7 +120,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         return service::run_as_service();
     }
 
-    let config_path = matches.opt_str("config").unwrap_or_else(|| "yggdrasil.toml".to_string());
+    let config_path = resolve_config_path(&matches);
     let autoconf = matches.opt_present("autoconf");
     let address = matches.opt_present("address");
     let subnet = matches.opt_present("subnet");
@@ -279,7 +279,7 @@ async fn run_node(
         opts.parse(Vec::<String>::new()).unwrap()
     });
 
-    let config_path = matches.opt_str("config").unwrap_or_else(|| "yggdrasil.toml".to_string());
+    let config_path = resolve_config_path(&matches);
     let autoconf = matches.opt_present("autoconf");
     let loglevel = matches.opt_str("loglevel").unwrap_or_else(|| "info".to_string());
     let logto = matches.opt_str("logto");
@@ -785,6 +785,47 @@ fn prefix_port_from_name(name: &str) -> Option<(u8, u16)> {
     let idx = name.rfind('_')?;
     let suffix = &name[idx + 1..];
     parse_prefix_port(suffix)
+}
+
+/// Resolve the configuration file path.
+///
+/// When `--config` / `-c` is not given:
+/// 1. Try `yggdrasil.toml` in the current working directory.
+/// 2. If absent, try the OS-specific system path:
+///    - Unix-like (Linux except Android, BSD, macOS, …): `/etc/yggdrasil/yggdrasil.toml`
+///    - Windows: `C:\ProgramData\Yggdrasil-ng\yggdrasil.toml`
+/// 3. If still not found, return the original default `"yggdrasil.toml"`
+///    so that the subsequent `File::open` produces the same error message
+///    as before this change.
+fn resolve_config_path(matches: &getopts::Matches) -> String {
+    if let Some(path) = matches.opt_str("config") {
+        return path;
+    }
+
+    const LOCAL: &str = "yggdrasil.toml";
+    if Path::new(LOCAL).exists() {
+        return LOCAL.to_string();
+    }
+
+    #[cfg(all(unix, not(target_os = "android")))]
+    {
+        const SYSTEM: &str = "/etc/yggdrasil/yggdrasil.toml";
+        if Path::new(SYSTEM).exists() {
+            return SYSTEM.to_string();
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        const SYSTEM: &str = r"C:\ProgramData\Yggdrasil-ng\yggdrasil.toml";
+        if Path::new(SYSTEM).exists() {
+            return SYSTEM.to_string();
+        }
+    }
+
+    // File not found anywhere — keep the historic default so open() fails
+    // with the same message as before.
+    LOCAL.to_string()
 }
 
 /// Resolve (prefix, port) from the binary/symlink/hardlink name.
