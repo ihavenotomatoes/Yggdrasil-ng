@@ -790,42 +790,57 @@ fn prefix_port_from_name(name: &str) -> Option<(u8, u16)> {
 /// Resolve the configuration file path.
 ///
 /// When `--config` / `-c` is not given:
-/// 1. Try `yggdrasil.toml` in the current working directory.
-/// 2. If absent, try the OS-specific system path:
-///    - Unix-like (Linux except Android, BSD, macOS, …): `/etc/yggdrasil/yggdrasil.toml`
-///    - Windows: `C:\ProgramData\Yggdrasil-ng\yggdrasil.toml`
-/// 3. If still not found, return the original default `"yggdrasil.toml"`
-///    so that the subsequent `File::open` produces the same error message
-///    as before this change.
+/// 1. Determine the config filename:
+///    - If the binary/symlink/hardlink name contains a recognised prefix+port
+///      suffix (via `prefix_port_from_name`), use `<stem>.toml`
+///      (stem = filename without extension, e.g. `ygg_029001.exe` → `ygg_029001.toml`).
+///    - Otherwise fall back to the historic default `yggdrasil.toml`.
+/// 2. Try that filename in the current working directory.
+/// 3. If absent, try the OS-specific system directory with the same filename:
+///    - Unix-like (Linux except Android, BSD, macOS, …): `/etc/yggdrasil/<filename>`
+///    - Windows: `C:\ProgramData\Yggdrasil-ng\<filename>`
+/// 4. If still not found, return the filename so that the subsequent
+///    `File::open` produces the same error message as before.
 fn resolve_config_path(matches: &getopts::Matches) -> String {
     if let Some(path) = matches.opt_str("config") {
         return path;
     }
 
-    const LOCAL: &str = "yggdrasil.toml";
-    if Path::new(LOCAL).exists() {
-        return LOCAL.to_string();
+    // Compute the config filename based on the binary name (if prefix/port recognised)
+    let name = program_basename();
+    let local = if prefix_port_from_name(&name).is_some() {
+        let stem = Path::new(&name)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&name);
+        format!("{}.toml", stem)
+    } else {
+        "yggdrasil.toml".to_string()
+    };
+
+    if Path::new(&local).exists() {
+        return local;
     }
 
     #[cfg(all(unix, not(target_os = "android")))]
     {
-        const SYSTEM: &str = "/etc/yggdrasil/yggdrasil.toml";
-        if Path::new(SYSTEM).exists() {
-            return SYSTEM.to_string();
+        let system = format!("/etc/yggdrasil/{}", local);
+        if Path::new(&system).exists() {
+            return system;
         }
     }
 
     #[cfg(windows)]
     {
-        const SYSTEM: &str = r"C:\ProgramData\Yggdrasil-ng\yggdrasil.toml";
-        if Path::new(SYSTEM).exists() {
-            return SYSTEM.to_string();
+        let system = format!(r"C:\ProgramData\Yggdrasil-ng\{}", local);
+        if Path::new(&system).exists() {
+            return system;
         }
     }
 
-    // File not found anywhere — keep the historic default so open() fails
-    // with the same message as before.
-    LOCAL.to_string()
+    // File not found anywhere — return the computed filename so open() fails
+    // with the same style of error message as before.
+    local
 }
 
 /// Resolve (prefix, port) from the binary/symlink/hardlink name.
