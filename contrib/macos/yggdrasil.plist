@@ -8,7 +8,7 @@
     <array>
       <string>sh</string>
       <string>-c</string>
-      <string>/usr/local/bin/yggdrasil -c /etc/yggdrasil.conf</string>
+      <string>/usr/local/bin/yggdrasil -c /etc/yggdrasil/yggdrasil.toml</string>
     </array>
     <key>KeepAlive</key>
     <true/>
