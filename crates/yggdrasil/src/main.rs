@@ -63,7 +63,6 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(windows)]
     opts.optflag("", "service", "Run as a Windows service (launched by the Service Control Manager)");
     opts.optopt("", "peers", "Comma-separated list of additional peer URIs to connect to (appended to config peers)", "PEERS");
-    opts.optopt("", "prefix-port", "Network prefix *00::/7 (00-fc) and port (1024-65535) for admin_listen/multicast, e.g. 02:9001", "PREFIXPORT");
     opts.optflag("h", "help", "Print this help");
     opts.optflag("v", "version", "Print version");
 
@@ -88,10 +87,10 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Resolve prefix/port early (CLI --prefix-port has priority over binary name suffix)
+    // Resolve prefix/port early from binary/symlink/hardlink name suffix
     // so --address / --subnet and control-mode endpoint see the correct values.
-    // Config mutation and the info/warn messages happen later (after logging is ready).
-    if let Some((prefix, port)) = resolve_prefix_port(&matches) {
+    // Config mutation and the info message happen later (after logging is ready).
+    if let Some((prefix, port)) = resolve_prefix_port() {
         yggdrasil::address::set_address_prefix(prefix);
         yggdrasil::multicast::set_multicast_port(port);
     }
@@ -174,17 +173,6 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize logging
     init_logging(&loglevel, logto.as_deref());
-
-    // Warn about an invalid --prefix-port as soon as logging is ready.
-    // The actual apply (and the info message) is performed later in run_node.
-    if let Some(val) = matches.opt_str("prefix-port") {
-        if parse_prefix_port(&val).is_none() {
-            tracing::warn!(
-                "Invalid --prefix-port value '{}', ignoring (expected format like 02:9001)",
-                val
-            );
-        }
-    }
 
     // Load config
     let config = if autoconf {
@@ -277,7 +265,6 @@ async fn run_node(
     opts.optflag("s", "subnet", "");
     opts.optflag("n", "no-replace", "");
     opts.optopt("", "peers", "", "PEERS");
-    opts.optopt("", "prefix-port", "", "PREFIXPORT");
     opts.optflag("h", "help", "");
     opts.optflag("v", "version", "");
     #[cfg(feature = "ctl")]
@@ -311,7 +298,7 @@ async fn run_node(
         return Err("No configuration: specify --config or --autoconf".into());
     };
 
-    if let Some((prefix, port)) = resolve_prefix_port(&matches) {
+    if let Some((prefix, port)) = resolve_prefix_port() {
         apply_prefix_port(prefix, port, &mut config);
     }
 
@@ -700,7 +687,8 @@ fn parse_peers_list(s: &str) -> Vec<String> {
         .collect()
 }
 
-/// Parse --prefix-port value according to the required format.
+/// Parse a prefix-port value according to the required format.
+/// Used for the suffix after the last '_' in the binary/symlink/hardlink name.
 /// Returns (prefix_u8, port_u16) on success, None on failure.
 fn parse_prefix_port(s: &str) -> Option<(u8, u16)> {
     // Manual implementation of the given regex (no extra dependency).
@@ -792,24 +780,16 @@ fn program_basename() -> String {
 
 /// Extract prefix and port from the binary/symlink/hardlink name.
 /// The last '_' in the name is the marker; everything after it is parsed
-/// with the same rules as --prefix-port (e.g. "029001", "02-9001", "02.9001.exe").
+/// with parse_prefix_port (e.g. "029001", "02-9001", "02.9001.exe").
 fn prefix_port_from_name(name: &str) -> Option<(u8, u16)> {
     let idx = name.rfind('_')?;
     let suffix = &name[idx + 1..];
     parse_prefix_port(suffix)
 }
 
-/// Resolve (prefix, port) with priority:
-/// 1. Valid --prefix-port CLI value
-/// 2. Valid suffix after the last '_' in the binary name
-/// 3. None (keep defaults)
-fn resolve_prefix_port(matches: &getopts::Matches) -> Option<(u8, u16)> {
-    if let Some(val) = matches.opt_str("prefix-port") {
-        if let Some(pp) = parse_prefix_port(&val) {
-            return Some(pp);
-        }
-        // Invalid CLI value: fall through and try the binary name
-    }
+/// Resolve (prefix, port) from the binary/symlink/hardlink name.
+/// Valid suffix after the last '_' is used; otherwise None (keep defaults).
+fn resolve_prefix_port() -> Option<(u8, u16)> {
     prefix_port_from_name(&program_basename())
 }
 

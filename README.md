@@ -112,7 +112,6 @@ yggdrasil [options]
 | `--logto FILE` | Log to a file instead of stderr (appends) |
 | `--service` | Run as a Windows service (Windows only) |
 | `--peers PEERS` | Peer URIs. Comma-separated and may be quoted. |
-| `--prefix-port PREFIXPORT` | Custom `*00::/7` prefix (`00`–`fc`) and port (`1024`–`65535`) |
 | `-h, --help` | Print help message |
 | `-v, --version` | Print version |
 
@@ -148,15 +147,9 @@ Print your address without starting the daemon:
 yggdrasil --config yggdrasil.toml --address
 ```
 
-Run with a custom `*00::/7` prefix (`00`–`fc`) and port (`1024`–`65535`):
-
-```bash
-sudo yggdrasil -c yggdrasil.toml --prefix-port 02:9001
-```
-The same prefix and port can also be taken from the name of the binary, symlink or hardlink.
-The last `_` in the filename is the marker; everything after it is parsed exactly like the `--prefix-port` value (e.g. `yggdrasil_029001`, `yggdrasil_02-9001`, `yggdrasil_02.9001.exe`).
-If a valid `--prefix-port` is given on the command line it takes precedence and the filename is ignored.
-If neither source provides a valid value the defaults (`0x02` / `9001`) are kept.
+A custom `*00::/7` prefix (`00`–`fc`) and port (`1024`–`65535`) can be taken from the name of the binary, symlink or hardlink.
+The last `_` in the filename is the marker; everything after it is parsed by the same rules (e.g. `yggdrasil_029001`, `yggdrasil_02-9001`, `yggdrasil_02.9001.exe`).
+If the name does not provide a valid value the defaults (`0x02` / `9001`) are kept.
 This also affects control-mode commands (`getPeers`, `getTree`, …) and the TUN interface name, so a renamed binary automatically talks to the matching admin socket and uses a matching interface name.
 
 Run with adding extra peers from the command line (they are appended to any peers already listed in the config):
