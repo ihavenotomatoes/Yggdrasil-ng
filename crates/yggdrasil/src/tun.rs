@@ -6,6 +6,7 @@
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 #[cfg(windows)]
 use std::sync::OnceLock;
@@ -288,14 +289,57 @@ async fn tun_read_loop(device: Arc<AsyncDevice>, rwc: Arc<ReadWriteCloser>) {
     }
 }
 
+/// Returns true for transient TUN write failures caused by kernel buffer exhaustion
+/// (ENOBUFS / WouldBlock, and EQFULL on Apple). In these cases the packet should
+/// be dropped instead of tearing down the write path.
+#[cfg(unix)]
+fn is_tun_write_overflow(err: &std::io::Error) -> bool {
+    if err.kind() == std::io::ErrorKind::WouldBlock {
+        return true;
+    }
+    match err.raw_os_error() {
+        Some(code) if code == libc::ENOBUFS => true,
+        // macOS-only: the interface output queue is full.
+        #[cfg(target_vendor = "apple")]
+        Some(code) if code == libc::EQFULL => true,
+        _ => false,
+    }
+}
+
+/// Windows counterpart: wintun reports a full ring buffer as ERROR_BUFFER_OVERFLOW,
+/// which tun-rs already translates into `ErrorKind::WouldBlock`.
+#[cfg(not(unix))]
+fn is_tun_write_overflow(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::WouldBlock
+}
+
 /// Read packets from the network (RWC) and write them straight into the TUN device.
 async fn tun_write_loop(device: Arc<AsyncDevice>, rwc: Arc<ReadWriteCloser>) {
     let mut buf = vec![0u8; 65535];
+    // Rate-limit overflow warnings so a sustained overload does not flood the log.
+    let mut last_overflow_log = Instant::now()
+        .checked_sub(Duration::from_secs(60))
+        .unwrap_or_else(Instant::now);
+    const OVERFLOW_LOG_INTERVAL: Duration = Duration::from_secs(5);
+
     loop {
         match rwc.read(&mut buf).await {
             Ok(n) => {
                 tracing::debug!("TUN write {} bytes, version={:#x}", n, buf[0] >> 4);
                 if let Err(e) = device.send(&buf[..n]).await {
+                    if is_tun_write_overflow(&e) {
+                        // Drop on overflow: better to lose some packets under load
+                        // than to stop delivering traffic entirely.
+                        let now = Instant::now();
+                        if now.duration_since(last_overflow_log) >= OVERFLOW_LOG_INTERVAL {
+                            tracing::warn!(
+                                "TUN write overflow, dropping packet: {}",
+                                e
+                            );
+                            last_overflow_log = now;
+                        }
+                        continue;
+                    }
                     tracing::error!("TUN write error: {}", e);
                     return;
                 }
