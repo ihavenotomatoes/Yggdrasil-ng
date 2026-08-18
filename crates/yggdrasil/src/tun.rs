@@ -307,19 +307,27 @@ fn is_tun_write_overflow(err: &std::io::Error) -> bool {
 }
 
 /// Windows counterpart: wintun reports a full ring buffer as ERROR_BUFFER_OVERFLOW,
-/// which tun-rs already translates into `ErrorKind::WouldBlock`.
+/// which tun-rs translates into `ErrorKind::WouldBlock`. Its blocking send swallows
+/// that internally and retries with backoff for 5 seconds before giving up with
+/// `ErrorKind::TimedOut`, so in practice a full ring reaches us as the latter. A
+/// disabled adapter surfaces as a different error, so it still tears down the loop.
 #[cfg(not(unix))]
 fn is_tun_write_overflow(err: &std::io::Error) -> bool {
-    err.kind() == std::io::ErrorKind::WouldBlock
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
 }
 
 /// Read packets from the network (RWC) and write them straight into the TUN device.
 async fn tun_write_loop(device: Arc<AsyncDevice>, rwc: Arc<ReadWriteCloser>) {
     let mut buf = vec![0u8; 65535];
-    // Rate-limit overflow warnings so a sustained overload does not flood the log.
+    // Rate-limit overflow warnings so a sustained overload does not flood the log,
+    // but count the drops in between so the warning says how bad it actually is.
     let mut last_overflow_log = Instant::now()
         .checked_sub(Duration::from_secs(60))
         .unwrap_or_else(Instant::now);
+    let mut dropped_since_log: u64 = 0;
     const OVERFLOW_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
     loop {
@@ -330,13 +338,16 @@ async fn tun_write_loop(device: Arc<AsyncDevice>, rwc: Arc<ReadWriteCloser>) {
                     if is_tun_write_overflow(&e) {
                         // Drop on overflow: better to lose some packets under load
                         // than to stop delivering traffic entirely.
+                        dropped_since_log += 1;
                         let now = Instant::now();
                         if now.duration_since(last_overflow_log) >= OVERFLOW_LOG_INTERVAL {
                             tracing::warn!(
-                                "TUN write overflow, dropping packet: {}",
+                                "TUN write overflow, dropped {} packet(s) since last report: {}",
+                                dropped_since_log,
                                 e
                             );
                             last_overflow_log = now;
+                            dropped_since_log = 0;
                         }
                         continue;
                     }
