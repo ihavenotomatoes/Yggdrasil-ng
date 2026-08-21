@@ -20,7 +20,6 @@
 //! - Slow samples only update EWMA / decay penalty; they never raise the floor.
 
 use rustc_hash::FxHashMap as HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -155,18 +154,18 @@ struct ArmEpoch {
 
 /// Durable state shared across reconnects for one peer public key.
 struct DurableLiveness {
-    ewma_ms: AtomicU64,
-    penalty_ms: AtomicU64,
+    ewma_ms: Mutex<u64>,
+    penalty_ms: Mutex<u64>,
     /// Sticky interval floor in ms (starts at cfg.min).
-    floor_ms: AtomicU64,
+    floor_ms: Mutex<u64>,
 }
 
 impl DurableLiveness {
     fn new(initial_floor_ms: u64) -> Self {
         Self {
-            ewma_ms: AtomicU64::new(0),
-            penalty_ms: AtomicU64::new(0),
-            floor_ms: AtomicU64::new(initial_floor_ms),
+            ewma_ms: Mutex::new(0),
+            penalty_ms: Mutex::new(0),
+            floor_ms: Mutex::new(initial_floor_ms),
         }
     }
 }
@@ -220,9 +219,9 @@ impl PeerLivenessRegistry {
 }
 
 fn snapshot_of(cfg: &AdaptiveTimeoutConfig, d: &DurableLiveness) -> LivenessSnapshot {
-    let ewma = d.ewma_ms.load(Ordering::Relaxed);
-    let pen = d.penalty_ms.load(Ordering::Relaxed);
-    let floor = d.floor_ms.load(Ordering::Relaxed);
+    let ewma = *d.ewma_ms.lock().unwrap();
+    let pen = *d.penalty_ms.lock().unwrap();
+    let floor = *d.floor_ms.lock().unwrap();
     let timeout = cfg.compute(ewma, pen, floor);
     let problem = cfg.problem_min.as_millis() as u64;
     LivenessSnapshot {
@@ -245,7 +244,7 @@ pub(crate) struct PeerTimeoutCtrl {
 impl PeerTimeoutCtrl {
     /// True if sticky floor has ratcheted to problem_min or above.
     pub fn is_degraded(&self) -> bool {
-        let floor = self.durable.floor_ms.load(Ordering::Relaxed);
+        let floor = *self.durable.floor_ms.lock().unwrap();
         self.cfg.adaptive && floor >= self.cfg.problem_min.as_millis() as u64
     }
 
@@ -260,9 +259,9 @@ impl PeerTimeoutCtrl {
     }
 
     pub fn current(&self) -> Duration {
-        let ewma = self.durable.ewma_ms.load(Ordering::Relaxed);
-        let pen = self.durable.penalty_ms.load(Ordering::Relaxed);
-        let floor = self.durable.floor_ms.load(Ordering::Relaxed);
+        let ewma = *self.durable.ewma_ms.lock().unwrap();
+        let pen = *self.durable.penalty_ms.lock().unwrap();
+        let floor = *self.durable.floor_ms.lock().unwrap();
         self.cfg.compute(ewma, pen, floor)
     }
 
@@ -282,9 +281,9 @@ impl PeerTimeoutCtrl {
         tracing::trace!(
             peer = %hex_prefix(&self.key),
             timeout_ms = t.as_millis() as u64,
-            ewma_ms = self.durable.ewma_ms.load(Ordering::Relaxed),
-            penalty_ms = self.durable.penalty_ms.load(Ordering::Relaxed),
-            floor_ms = self.durable.floor_ms.load(Ordering::Relaxed),
+            ewma_ms = *self.durable.ewma_ms.lock().unwrap(),
+            penalty_ms = *self.durable.penalty_ms.lock().unwrap(),
+            floor_ms = *self.durable.floor_ms.lock().unwrap(),
             "peer liveness deadline armed"
         );
         expires
@@ -305,17 +304,19 @@ impl PeerTimeoutCtrl {
 
         if self.cfg.adaptive {
             let problem = self.cfg.problem_min.as_millis() as u64;
-            let prev_floor = self.durable.floor_ms.load(Ordering::Relaxed);
-            let new_floor = prev_floor.max(problem);
-            self.durable.floor_ms.store(new_floor, Ordering::Relaxed);
+            let prev_floor = {
+                let mut floor = self.durable.floor_ms.lock().unwrap();
+                let prev = *floor;
+                *floor = prev.max(problem);
+                prev
+            };
 
             let step = self.cfg.penalty_step.as_millis() as u64;
             let max_ms = self.cfg.max.as_millis() as u64;
-            let _ = self.durable.penalty_ms.fetch_update(
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-                |p| Some(p.saturating_add(step).min(max_ms)),
-            );
+            {
+                let mut pen = self.durable.penalty_ms.lock().unwrap();
+                *pen = (*pen).saturating_add(step).min(max_ms);
+            }
 
             if prev_floor < problem {
                 tracing::info!(
@@ -330,8 +331,8 @@ impl PeerTimeoutCtrl {
         tracing::debug!(
             peer = %hex_prefix(&self.key),
             armed_timeout_ms = armed_t.map(|d| d.as_millis() as u64).unwrap_or(0),
-            penalty_ms = self.durable.penalty_ms.load(Ordering::Relaxed),
-            floor_ms = self.durable.floor_ms.load(Ordering::Relaxed),
+            penalty_ms = *self.durable.penalty_ms.lock().unwrap(),
+            floor_ms = *self.durable.floor_ms.lock().unwrap(),
             next_timeout_ms = self.current().as_millis() as u64,
             "peer liveness timeout — sticky floor/penalty updated"
         );
@@ -346,35 +347,37 @@ impl PeerTimeoutCtrl {
             return;
         }
 
-        let prev = self.durable.ewma_ms.load(Ordering::Relaxed);
-        let new = if prev == 0 {
-            sample_ms
-        } else {
-            (prev * 7 + sample_ms) / 8
-        };
-        self.durable.ewma_ms.store(new, Ordering::Relaxed);
+        {
+            let mut ewma = self.durable.ewma_ms.lock().unwrap();
+            let prev = *ewma;
+            let new = if prev == 0 {
+                sample_ms
+            } else {
+                (prev * 7 + sample_ms) / 8
+            };
+            *ewma = new;
+        }
 
         let decay = self.cfg.penalty_decay.as_millis() as u64;
-        let _ = self.durable.penalty_ms.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |p| Some(p.saturating_sub(decay)),
-        );
+        {
+            let mut pen = self.durable.penalty_ms.lock().unwrap();
+            *pen = (*pen).saturating_sub(decay);
+        }
     }
 
     #[allow(dead_code)]
     pub fn ewma_ms(&self) -> u64 {
-        self.durable.ewma_ms.load(Ordering::Relaxed)
+        *self.durable.ewma_ms.lock().unwrap()
     }
 
     #[allow(dead_code)]
     pub fn penalty_ms(&self) -> u64 {
-        self.durable.penalty_ms.load(Ordering::Relaxed)
+        *self.durable.penalty_ms.lock().unwrap()
     }
 
     #[allow(dead_code)]
     pub fn floor_ms(&self) -> u64 {
-        self.durable.floor_ms.load(Ordering::Relaxed)
+        *self.durable.floor_ms.lock().unwrap()
     }
 
     #[allow(dead_code)]
