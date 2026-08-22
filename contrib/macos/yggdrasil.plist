@@ -8,7 +8,11 @@
     <array>
       <string>sh</string>
       <string>-c</string>
-      <string>/usr/local/bin/yggdrasil -c /etc/yggdrasil/yggdrasil.toml</string>
+      <string>
+        mkdir -p /etc/yggdrasil &amp;&amp;
+        /usr/local/bin/yggdrasil --genconf=/etc/yggdrasil/yggdrasil.toml --no-replace &amp;&amp;
+        exec /usr/local/bin/yggdrasil --config=/etc/yggdrasil/yggdrasil.toml
+      </string>
     </array>
     <key>KeepAlive</key>
     <true/>
