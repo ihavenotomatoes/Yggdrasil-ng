@@ -787,29 +787,6 @@ fn prefix_port_from_name(name: &str) -> Option<(u8, u16)> {
     parse_prefix_port(suffix)
 }
 
-/// Return the real ProgramData directory via SHGetKnownFolderPath(FOLDERID_ProgramData).
-#[cfg(windows)]
-fn windows_program_data_dir() -> Option<std::path::PathBuf> {
-    use std::ffi::OsString;
-    use std::os::windows::ffi::OsStringExt;
-    use windows::Win32::System::Com::CoTaskMemFree;
-    use windows::Win32::UI::Shell::{FOLDERID_ProgramData, KNOWN_FOLDER_FLAG, SHGetKnownFolderPath};
-
-    unsafe {
-        let pwstr = SHGetKnownFolderPath(
-            &FOLDERID_ProgramData,
-            KNOWN_FOLDER_FLAG(0),
-            None,
-        )
-        .ok()?;
-        // PWSTR is a null-terminated wide string allocated by CoTaskMemAlloc.
-        let wide = pwstr.as_wide();
-        let path = std::path::PathBuf::from(OsString::from_wide(wide));
-        CoTaskMemFree(Some(pwstr.0 as _));
-        Some(path)
-    }
-}
-
 /// Resolve the configuration file path.
 ///
 /// When `--config` / `-c` is not given:
@@ -867,6 +844,29 @@ fn resolve_config_path(matches: &getopts::Matches) -> String {
     // File not found anywhere — return the computed filename so open() fails
     // with the same style of error message as before.
     local
+}
+
+/// Return the real ProgramData directory via SHGetKnownFolderPath(FOLDERID_ProgramData).
+#[cfg(windows)]
+fn windows_program_data_dir() -> Option<std::path::PathBuf> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{FOLDERID_ProgramData, KNOWN_FOLDER_FLAG, SHGetKnownFolderPath};
+
+    unsafe {
+        let pwstr = SHGetKnownFolderPath(
+            &FOLDERID_ProgramData,
+            KNOWN_FOLDER_FLAG(0),
+            None,
+        )
+        .ok()?;
+        // PWSTR is a null-terminated wide string allocated by CoTaskMemAlloc.
+        let wide = pwstr.as_wide();
+        let path = std::path::PathBuf::from(OsString::from_wide(wide));
+        CoTaskMemFree(Some(pwstr.0 as _));
+        Some(path)
+    }
 }
 
 /// Resolve (prefix, port) from the binary/symlink/hardlink name.
