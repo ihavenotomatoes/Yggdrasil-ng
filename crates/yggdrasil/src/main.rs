@@ -525,7 +525,11 @@ async fn run_node(
                             target_os = "dragonfly",
                         )) {
                             // Last-resort label only; the live adapter name is preferred.
-                            "tun0"
+                            if cfg!(any(target_os = "freebsd", target_os = "dragonfly")) {
+                                "ygg0"
+                            } else {
+                                "tun0"
+                            }
                         } else {
                             "ygg0"
                         }
@@ -777,7 +781,8 @@ fn apply_prefix_port(prefix: u8, port: u16, config: &mut Config) {
 
     // Override if_name only when it is the default "auto"
     // (absent/commented in config). macOS and BSD stay "auto" so the
-    // TUN backend can allocate utunN / tunN.
+    // TUN backend can allocate utunN / tunN. FreeBSD/DragonFly then
+    // rename that tunN to the Linux-like alias inside tun.rs.
     if config.if_name == "auto" {
         let suffix = format!("{:02x}{}", prefix, port);
         if cfg!(windows) {
@@ -790,6 +795,7 @@ fn apply_prefix_port(prefix: u8, port: u16, config: &mut Config) {
             target_os = "dragonfly",
         )) {
             // Keep "auto" — backend assigns utunN (macOS) or tunN (BSD).
+            // FreeBSD/DragonFly rename tunN after creation (see tun.rs).
         } else {
             // Linux: strip the trailing "0" from "ygg0"
             config.if_name = format!("ygg{}", suffix);

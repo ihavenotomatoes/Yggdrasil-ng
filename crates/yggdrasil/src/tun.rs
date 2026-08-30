@@ -38,6 +38,8 @@ static SET_INTERFACE_DNS_PTR: OnceLock<
 /// - macOS/Darwin: the kernel allocates the next free `utunN`;
 /// - FreeBSD/GhostBSD, NetBSD, OpenBSD, DragonFlyBSD: tun-rs scans
 ///   `/dev/tun0`..`/dev/tun255` and takes the first free node.
+///   On FreeBSD/GhostBSD and DragonFlyBSD the allocated `tunN` is then
+///   renamed to a Linux-like alias (`ygg0` / `ygg{prefix}{port}`).
 /// Windows and Linux keep their historic fixed defaults.
 fn auto_requested_name() -> String {
     if cfg!(windows) {
@@ -55,13 +57,44 @@ fn auto_requested_name() -> String {
     }
 }
 
+/// Linux-like TUN name used as the FreeBSD/DragonFly alias when
+/// `if_name` is `"auto"`.
+///
+/// Matches `apply_prefix_port` on Linux:
+/// - custom prefix/port from the binary/symlink/hardlink suffix
+///   (`ygg_0615001` → `ygg0615001`);
+/// - otherwise the historic default `ygg0`.
+#[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
+fn linux_like_auto_tun_name() -> String {
+    if crate::address::prefix_port_set() {
+        linux_like_auto_tun_name_from(Some((
+            crate::address::address_prefix(),
+            crate::multicast::multicast_port(),
+        )))
+    } else {
+        linux_like_auto_tun_name_from(None)
+    }
+}
+
+/// Same naming rule with explicit inputs so unit tests do not touch
+/// the process-wide prefix/port atomics.
+#[cfg(any(test, target_os = "freebsd", target_os = "dragonfly"))]
+fn linux_like_auto_tun_name_from(prefix_port: Option<(u8, u16)>) -> String {
+    match prefix_port {
+        Some((prefix, port)) => format!("ygg{:02x}{}", prefix, port),
+        None => "ygg0".to_string(),
+    }
+}
+
 /// TUN adapter: bridges a TUN network device with the IPv6 RWC.
 pub struct TunAdapter {
     device: Arc<AsyncDevice>,
     /// Actual OS-level name of the interface.
     /// On macOS with "auto" this is the kernel-assigned utunN
-    /// (e.g. "utun3"). On BSD with "auto" this is the allocated tunN
-    /// (e.g. "tun0"). Both may differ from the configured "auto".
+    /// (e.g. "utun3"). On NetBSD/OpenBSD with "auto" this is the
+    /// allocated tunN (e.g. "tun0"). On FreeBSD/DragonFly with "auto"
+    /// this is the Linux-like alias after rename (`ygg0` /
+    /// `ygg{prefix}{port}`), or the original tunN if rename failed.
     name: String,
     /// MTU the interface ended up with, which the OS may have clamped.
     mtu: u16,
@@ -146,6 +179,34 @@ impl TunAdapter {
                 .map_err(|e| format!("failed to get assigned TUN interface name: {}", e))?;
         }
 
+        // FreeBSD/DragonFly cannot create /dev/ygg*. After tun-rs has
+        // allocated tunN, rename the iface to the Linux-like alias.
+        // `self.name` must become the alias so close() destroys it.
+        #[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
+        if name == "auto" && tun_name.starts_with("tun") {
+            let alias = linux_like_auto_tun_name();
+            if alias != tun_name {
+                match rename_tun_interface(&tun_name, &alias) {
+                    Ok(()) => {
+                        tracing::info!(
+                            "Renamed TUN interface '{}' to '{}'",
+                            tun_name,
+                            alias
+                        );
+                        tun_name = alias;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "Failed to rename TUN interface '{}' to '{}': {}",
+                            tun_name,
+                            alias,
+                            err
+                        );
+                    }
+                }
+            }
+        }
+
         let actual_mtu = device.mtu().unwrap_or(mtu);
         tracing::info!("TUN device '{}' created with address {} and MTU {}", tun_name, addr, actual_mtu);
 
@@ -194,7 +255,9 @@ impl TunAdapter {
 
     /// Returns the actual name of the TUN network interface as seen by the OS.
     /// On macOS this is the kernel-assigned utunN when "auto" was requested.
-    /// On BSD this is the allocated tunN when "auto" was requested.
+    /// On NetBSD/OpenBSD this is the allocated tunN when "auto" was requested.
+    /// On FreeBSD/DragonFly this is the Linux-like alias after a successful
+    /// rename, otherwise the allocated tunN.
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -357,6 +420,17 @@ fn siocifdestroy_request() -> libc::c_ulong {
     IOC_IN | ((len & IOCPARM_MASK) << 16) | ((b'i' as libc::c_ulong) << 8) | 121
 }
 
+/// `SIOCSIFNAME` is `_IOW('i', 40, struct ifreq)` on FreeBSD and DragonFly.
+/// Encoded the same way as `siocifdestroy_request` so we do not depend
+/// on `libc::SIOCSIFNAME` being present.
+#[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
+fn siocsifname_request() -> libc::c_ulong {
+    const IOC_IN: libc::c_ulong = 0x8000_0000;
+    const IOCPARM_MASK: libc::c_ulong = 0x1fff;
+    let len = std::mem::size_of::<libc::ifreq>() as libc::c_ulong;
+    IOC_IN | ((len & IOCPARM_MASK) << 16) | ((b'i' as libc::c_ulong) << 8) | 40
+}
+
 /// Copy `name` into `ifr_name` with a trailing NUL. Returns false if
 /// the name is empty or does not fit in `IFNAMSIZ-1` bytes.
 #[cfg(any(
@@ -402,6 +476,54 @@ fn destroy_tun_interface_inner(name: &str) -> std::io::Result<()> {
     }
 
     let rc = unsafe { libc::ioctl(sock, siocifdestroy_request(), &mut ifr) };
+    let ioctl_err = std::io::Error::last_os_error();
+    unsafe { libc::close(sock) };
+
+    if rc != 0 {
+        Err(ioctl_err)
+    } else {
+        Ok(())
+    }
+}
+
+/// Rename a cloned TUN iface (`tunN` → `ygg0` / `ygg{prefix}{port}`).
+///
+/// `ifr_name` is the current name; `ifr_ifru.ifru_data` points at a
+/// NUL-terminated buffer with the new name (FreeBSD/DragonFly
+/// `SIOCSIFNAME` convention).
+#[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
+fn rename_tun_interface(current: &str, new_name: &str) -> std::io::Result<()> {
+    let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
+    if !fill_ifr_name(&mut ifr, current) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "current TUN interface name empty or longer than IFNAMSIZ-1",
+        ));
+    }
+
+    let new_bytes = new_name.as_bytes();
+    let max = (libc::IFNAMSIZ as usize).saturating_sub(1);
+    if new_bytes.is_empty() || new_bytes.len() > max {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "new TUN interface name empty or longer than IFNAMSIZ-1",
+        ));
+    }
+
+    let mut new_buf = [0 as libc::c_char; libc::IFNAMSIZ as usize];
+    new_buf[..new_bytes.len()].copy_from_slice(unsafe {
+        // c_char is i8 on these targets; the bytes are ASCII.
+        &*(new_bytes as *const [u8] as *const [libc::c_char])
+    });
+
+    ifr.ifr_ifru.ifru_data = new_buf.as_mut_ptr();
+
+    let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if sock < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let rc = unsafe { libc::ioctl(sock, siocsifname_request(), &mut ifr) };
     let ioctl_err = std::io::Error::last_os_error();
     unsafe { libc::close(sock) };
 
@@ -767,5 +889,47 @@ mod bsd_destroy_tests {
         let expected =
             IOC_IN | ((len & IOCPARM_MASK) << 16) | ((b'i' as libc::c_ulong) << 8) | 121;
         assert_eq!(siocifdestroy_request(), expected);
+    }
+}
+
+#[cfg(all(test, any(target_os = "freebsd", target_os = "dragonfly")))]
+mod freebsd_dragonfly_alias_tests {
+    use super::{
+        linux_like_auto_tun_name_from, siocsifname_request,
+    };
+
+    #[test]
+    fn default_alias_is_ygg0_without_prefix_port() {
+        assert_eq!(linux_like_auto_tun_name_from(None), "ygg0");
+    }
+
+    #[test]
+    fn alias_follows_linux_suffix_rule() {
+        // Binary/symlink `ygg_0615001` → prefix 0x06, port 15001.
+        assert_eq!(
+            linux_like_auto_tun_name_from(Some((0x06, 15001))),
+            "ygg0615001"
+        );
+        assert_eq!(
+            linux_like_auto_tun_name_from(Some((0x02, 9001))),
+            "ygg029001"
+        );
+    }
+
+    #[test]
+    fn alias_fits_ifnamsiz() {
+        let name = linux_like_auto_tun_name_from(Some((0xfc, 65535)));
+        assert_eq!(name, "yggfc65535");
+        assert!(name.len() < libc::IFNAMSIZ as usize);
+    }
+
+    #[test]
+    fn siocsifname_request_is_iow_i_40() {
+        const IOC_IN: libc::c_ulong = 0x8000_0000;
+        const IOCPARM_MASK: libc::c_ulong = 0x1fff;
+        let len = std::mem::size_of::<libc::ifreq>() as libc::c_ulong;
+        let expected =
+            IOC_IN | ((len & IOCPARM_MASK) << 16) | ((b'i' as libc::c_ulong) << 8) | 40;
+        assert_eq!(siocsifname_request(), expected);
     }
 }
