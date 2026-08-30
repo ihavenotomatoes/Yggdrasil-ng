@@ -72,6 +72,8 @@ pub struct Config {
     pub admin_listen: String,
 
     /// TUN interface name. "auto" for auto-name, "none" to disable.
+    /// "auto" becomes utunN on macOS and tunN on BSD; Windows uses
+    /// "Yggdrasil", other Unix platforms use "ygg0".
     #[serde(default = "default_if_name")]
     pub if_name: String,
 

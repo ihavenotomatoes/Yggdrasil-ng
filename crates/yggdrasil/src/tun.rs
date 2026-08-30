@@ -32,12 +32,36 @@ static SET_INTERFACE_DNS_PTR: OnceLock<
     >,
 > = OnceLock::new();
 
+/// Requested TUN name when `if_name` is `"auto"`.
+///
+/// An empty string means "do not call `DeviceBuilder::name()`":
+/// - macOS/Darwin: the kernel allocates the next free `utunN`;
+/// - FreeBSD/GhostBSD, NetBSD, OpenBSD, DragonFlyBSD: tun-rs scans
+///   `/dev/tun0`..`/dev/tun255` and takes the first free node.
+/// Windows and Linux keep their historic fixed defaults.
+fn auto_requested_name() -> String {
+    if cfg!(windows) {
+        "Yggdrasil".to_string()
+    } else if cfg!(any(
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+    )) {
+        String::new()
+    } else {
+        "ygg0".to_string()
+    }
+}
+
 /// TUN adapter: bridges a TUN network device with the IPv6 RWC.
 pub struct TunAdapter {
     device: Arc<AsyncDevice>,
     /// Actual OS-level name of the interface.
-    /// On macOS with "auto" this will be the kernel-assigned utunN
-    /// (e.g. "utun3"), which may differ from the requested name.
+    /// On macOS with "auto" this is the kernel-assigned utunN
+    /// (e.g. "utun3"). On BSD with "auto" this is the allocated tunN
+    /// (e.g. "tun0"). Both may differ from the configured "auto".
     name: String,
     /// MTU the interface ended up with, which the OS may have clamped.
     mtu: u16,
@@ -69,24 +93,14 @@ impl TunAdapter {
         }
 
         // Determine the requested interface name.
-        // On macOS "auto" must leave the name empty so that tun-rs lets the
-        // kernel allocate the next free utunN. On other platforms we keep
-        // the historic defaults.
-        // `mut` is required only on macOS (we overwrite the empty name with
-        // the real utunN after device creation). On other OSes the compiler
-        // would warn about unused_mut, hence the allow.
+        // On macOS and BSD "auto" must leave the name empty so that tun-rs
+        // does not call DeviceBuilder::name() and the backend can allocate
+        // utunN / tunN. Windows and Linux keep the historic defaults.
+        // `mut` is needed because we overwrite an empty name with the real
+        // interface name after device creation.
         #[allow(unused_mut)]
         let mut tun_name: String = if name == "auto" {
-            if cfg!(windows) {
-                "Yggdrasil".to_string()
-            } else if cfg!(target_os = "macos") {
-                // Empty string → do not call DeviceBuilder::name().
-                // Kernel will pick the lowest free utun* and we will read
-                // the real name afterwards via device.name().
-                String::new()
-            } else {
-                "ygg0".to_string()
-            }
+            auto_requested_name()
         } else {
             name.to_string()
         };
@@ -123,9 +137,9 @@ impl TunAdapter {
 
         let device = Arc::new(device);
 
-        // On macOS with auto-selection the kernel has assigned a free utunN.
-        // Retrieve the real name so that logs and route installation use it.
-        #[cfg(target_os = "macos")]
+        // When the name was left empty ("auto" on macOS/BSD) the backend has
+        // allocated utunN or tunN. Read the real name for logs, getTUN, and
+        // CKR route installation.
         if tun_name.is_empty() {
             tun_name = device
                 .name()
@@ -180,6 +194,7 @@ impl TunAdapter {
 
     /// Returns the actual name of the TUN network interface as seen by the OS.
     /// On macOS this is the kernel-assigned utunN when "auto" was requested.
+    /// On BSD this is the allocated tunN when "auto" was requested.
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -537,4 +552,46 @@ fn apply_interface_dns(guid: windows::core::GUID, addrs: &[&str], ipv6: bool) ->
 
     call_set_interface_dns_settings(guid, &settings as *const _)
         .map_err(|e| format!("SetInterfaceDnsSettings (ipv6={}): {}", ipv6, e))
+}
+
+#[cfg(test)]
+mod auto_name_tests {
+    use super::auto_requested_name;
+
+    #[test]
+    fn auto_requested_name_windows() {
+        if cfg!(windows) {
+            assert_eq!(auto_requested_name(), "Yggdrasil");
+        }
+    }
+
+    #[test]
+    fn auto_requested_name_macos_or_bsd_is_empty() {
+        if cfg!(any(
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly",
+        )) {
+            assert!(
+                auto_requested_name().is_empty(),
+                "auto must not pass an explicit name on macOS/BSD"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_requested_name_linux_keeps_ygg0() {
+        if cfg!(all(
+            unix,
+            not(target_os = "macos"),
+            not(target_os = "freebsd"),
+            not(target_os = "netbsd"),
+            not(target_os = "openbsd"),
+            not(target_os = "dragonfly"),
+        )) {
+            assert_eq!(auto_requested_name(), "ygg0");
+        }
+    }
 }
