@@ -769,6 +769,12 @@ fn apply_prefix_port(prefix: u8, port: u16, config: &mut Config) {
         prefix, port
     );
 
+    // Override admin_listen only when it still has the default value
+    // (i.e. was absent/commented in the config file).
+    if config.admin_listen == "tcp://localhost:9001" {
+        config.admin_listen = format!("tcp://localhost:{}", port);
+    }
+
     // Override if_name only when it is the default "auto"
     // (absent/commented in config). macOS and BSD stay "auto" so the
     // TUN backend can allocate utunN / tunN.
