@@ -274,14 +274,141 @@ impl TunAdapter {
     }
 
     pub async fn close(self) {
-        let TunAdapter { device, name: _, mtu: _, read_handle, write_handle } = self;
+        let TunAdapter { device, name, mtu: _, read_handle, write_handle } = self;
         read_handle.abort();
         write_handle.abort();
         let _ = read_handle.await;
         let _ = write_handle.await;
         // Tasks have released their Arc clones; drop the last one so
         // AsyncDevice::Drop runs WintunCloseAdapter (or platform equivalent).
+        //
+        // On FreeBSD/GhostBSD, NetBSD and DragonFlyBSD the last close of
+        // /dev/tunN only marks the clone interface down. The kernel keeps
+        // the iface until SIOCIFDESTROY. tun-rs Drop may try destroy while
+        // the fd is still open; that ioctl is then ignored or can stall.
+        // Close the fd first, then destroy by name.
         drop(device);
+        destroy_tun_interface(&name);
+    }
+}
+
+/// BSD systems where a cloned TUN iface survives `close(/dev/tunN)`
+/// and must be removed with `SIOCIFDESTROY` (`ifconfig tunN destroy`).
+///
+/// GhostBSD is `target_os = "freebsd"`. OpenBSD auto-destroys ifaces
+/// created by opening `/dev/tunN`; a second destroy is then ENXIO/EINVAL
+/// and is treated as success.
+#[cfg(any(
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+))]
+fn destroy_tun_interface(name: &str) {
+    if name.is_empty() {
+        return;
+    }
+
+    match destroy_tun_interface_inner(name) {
+        Ok(()) => {
+            tracing::info!("Destroyed TUN interface '{}'", name);
+        }
+        Err(err) => {
+            // Already gone: OpenBSD last-close destroy, or tun-rs Drop
+            // managed to destroy before we got here.
+            match err.raw_os_error() {
+                Some(code) if code == libc::ENXIO || code == libc::ENODEV || code == libc::EINVAL => {
+                    tracing::debug!("TUN interface '{}' already destroyed: {}", name, err);
+                }
+                _ => {
+                    tracing::warn!("Failed to destroy TUN interface '{}': {}", name, err);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(any(
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+)))]
+fn destroy_tun_interface(_name: &str) {}
+
+/// `SIOCIFDESTROY` is `_IOW('i', 121, struct ifreq)` on FreeBSD,
+/// NetBSD, OpenBSD and DragonFly. `libc` only exports the named
+/// constant reliably on FreeBSD, so other targets build the request
+/// from the same encoding and `size_of::<libc::ifreq>()`.
+#[cfg(any(
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+))]
+fn siocifdestroy_request() -> libc::c_ulong {
+    // SIOCIFDESTROY = _IOW('i', 121, struct ifreq) on FreeBSD/GhostBSD,
+    // NetBSD, OpenBSD and DragonFly. Do not use libc::SIOCIFDESTROY:
+    // the named constant is missing from some libc versions even on
+    // FreeBSD.
+    const IOC_IN: libc::c_ulong = 0x8000_0000;
+    const IOCPARM_MASK: libc::c_ulong = 0x1fff;
+    let len = std::mem::size_of::<libc::ifreq>() as libc::c_ulong;
+    IOC_IN | ((len & IOCPARM_MASK) << 16) | ((b'i' as libc::c_ulong) << 8) | 121
+}
+
+/// Copy `name` into `ifr_name` with a trailing NUL. Returns false if
+/// the name is empty or does not fit in `IFNAMSIZ-1` bytes.
+#[cfg(any(
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+))]
+fn fill_ifr_name(ifr: &mut libc::ifreq, name: &str) -> bool {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() {
+        return false;
+    }
+    let max = (libc::IFNAMSIZ as usize).saturating_sub(1);
+    if bytes.len() > max {
+        return false;
+    }
+    ifr.ifr_name[..bytes.len()].copy_from_slice(unsafe {
+        // c_char is i8 on these targets; the bytes are ASCII ("tun0").
+        &*(bytes as *const [u8] as *const [libc::c_char])
+    });
+    true
+}
+
+#[cfg(any(
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+))]
+fn destroy_tun_interface_inner(name: &str) -> std::io::Result<()> {
+    let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
+    if !fill_ifr_name(&mut ifr, name) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "TUN interface name empty or longer than IFNAMSIZ-1",
+        ));
+    }
+
+    let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if sock < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let rc = unsafe { libc::ioctl(sock, siocifdestroy_request(), &mut ifr) };
+    let ioctl_err = std::io::Error::last_os_error();
+    unsafe { libc::close(sock) };
+
+    if rc != 0 {
+        Err(ioctl_err)
+    } else {
+        Ok(())
     }
 }
 
@@ -593,5 +720,52 @@ mod auto_name_tests {
         )) {
             assert_eq!(auto_requested_name(), "ygg0");
         }
+    }
+}
+
+#[cfg(all(
+    test,
+    any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+    )
+))]
+mod bsd_destroy_tests {
+    use super::{fill_ifr_name, siocifdestroy_request};
+
+    #[test]
+    fn fill_ifr_name_copies_ascii_and_keeps_nul() {
+        let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
+        assert!(fill_ifr_name(&mut ifr, "tun0"));
+        assert_eq!(ifr.ifr_name[0] as u8, b't');
+        assert_eq!(ifr.ifr_name[1] as u8, b'u');
+        assert_eq!(ifr.ifr_name[2] as u8, b'n');
+        assert_eq!(ifr.ifr_name[3] as u8, b'0');
+        assert_eq!(ifr.ifr_name[4], 0);
+    }
+
+    #[test]
+    fn fill_ifr_name_rejects_empty() {
+        let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
+        assert!(!fill_ifr_name(&mut ifr, ""));
+    }
+
+    #[test]
+    fn fill_ifr_name_rejects_too_long() {
+        let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
+        let too_long = "x".repeat(libc::IFNAMSIZ as usize);
+        assert!(!fill_ifr_name(&mut ifr, &too_long));
+    }
+
+    #[test]
+    fn siocifdestroy_request_is_iow_i_121() {
+        const IOC_IN: libc::c_ulong = 0x8000_0000;
+        const IOCPARM_MASK: libc::c_ulong = 0x1fff;
+        let len = std::mem::size_of::<libc::ifreq>() as libc::c_ulong;
+        let expected =
+            IOC_IN | ((len & IOCPARM_MASK) << 16) | ((b'i' as libc::c_ulong) << 8) | 121;
+        assert_eq!(siocifdestroy_request(), expected);
     }
 }
