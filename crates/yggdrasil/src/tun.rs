@@ -39,7 +39,8 @@ static SET_INTERFACE_DNS_PTR: OnceLock<
 /// - FreeBSD/GhostBSD, NetBSD, OpenBSD, DragonFlyBSD: tun-rs scans
 ///   `/dev/tun0`..`/dev/tun255` and takes the first free node.
 ///   On FreeBSD/GhostBSD and DragonFlyBSD the allocated `tunN` is then
-///   renamed to a Linux-like alias (`ygg0` / `ygg{prefix}{port}`).
+///   renamed: `if_name = "auto"` → Linux-like alias (`ygg0` /
+///   `ygg{prefix}{port}`); any other `if_name` is used as the alias as-is.
 /// Windows and Linux keep their historic fixed defaults.
 fn auto_requested_name() -> String {
     if cfg!(windows) {
@@ -92,9 +93,10 @@ pub struct TunAdapter {
     /// Actual OS-level name of the interface.
     /// On macOS with "auto" this is the kernel-assigned utunN
     /// (e.g. "utun3"). On NetBSD/OpenBSD with "auto" this is the
-    /// allocated tunN (e.g. "tun0"). On FreeBSD/DragonFly with "auto"
-    /// this is the Linux-like alias after rename (`ygg0` /
-    /// `ygg{prefix}{port}`), or the original tunN if rename failed.
+    /// allocated tunN (e.g. "tun0"). On FreeBSD/DragonFly this is the
+    /// alias after rename (`ygg0` / `ygg{prefix}{port}` when `if_name`
+    /// is `"auto"`, otherwise the configured `if_name`), or the
+    /// original tunN if rename failed.
     name: String,
     /// MTU the interface ended up with, which the OS may have clamped.
     mtu: u16,
@@ -128,12 +130,17 @@ impl TunAdapter {
         // Determine the requested interface name.
         // On macOS and BSD "auto" must leave the name empty so that tun-rs
         // does not call DeviceBuilder::name() and the backend can allocate
-        // utunN / tunN. Windows and Linux keep the historic defaults.
+        // utunN / tunN. On FreeBSD/DragonFly a non-"auto" if_name is also
+        // left empty here: tun-rs still allocates tunN, and if_name is
+        // applied afterwards as an alias. Windows and Linux keep the
+        // historic defaults.
         // `mut` is needed because we overwrite an empty name with the real
         // interface name after device creation.
         #[allow(unused_mut)]
         let mut tun_name: String = if name == "auto" {
             auto_requested_name()
+        } else if cfg!(any(target_os = "freebsd", target_os = "dragonfly")) {
+            String::new()
         } else {
             name.to_string()
         };
@@ -179,12 +186,19 @@ impl TunAdapter {
                 .map_err(|e| format!("failed to get assigned TUN interface name: {}", e))?;
         }
 
-        // FreeBSD/DragonFly cannot create /dev/ygg*. After tun-rs has
-        // allocated tunN, rename the iface to the Linux-like alias.
-        // `self.name` must become the alias so close() destroys it.
+        // FreeBSD/DragonFly cannot create /dev/<arbitrary>. After tun-rs
+        // has allocated tunN, rename it to the requested alias.
+        // `"auto"` uses the Linux-like name; any other if_name is used
+        // as-is. `self.name` must become the alias so close() destroys it.
+        // Rename failure is non-fatal: keep the allocated tunN. Do not
+        // warn when a caller-supplied if_name cannot be applied.
         #[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
-        if name == "auto" && tun_name.starts_with("tun") {
-            let alias = linux_like_auto_tun_name();
+        if tun_name.starts_with("tun") {
+            let alias = if name == "auto" {
+                linux_like_auto_tun_name()
+            } else {
+                name.to_string()
+            };
             if alias != tun_name {
                 match rename_tun_interface(&tun_name, &alias) {
                     Ok(()) => {
@@ -196,12 +210,14 @@ impl TunAdapter {
                         tun_name = alias;
                     }
                     Err(err) => {
-                        tracing::warn!(
-                            "Failed to rename TUN interface '{}' to '{}': {}",
-                            tun_name,
-                            alias,
-                            err
-                        );
+                        if name == "auto" {
+                            tracing::warn!(
+                                "Failed to rename TUN interface '{}' to '{}': {}",
+                                tun_name,
+                                alias,
+                                err
+                            );
+                        }
                     }
                 }
             }
@@ -256,8 +272,9 @@ impl TunAdapter {
     /// Returns the actual name of the TUN network interface as seen by the OS.
     /// On macOS this is the kernel-assigned utunN when "auto" was requested.
     /// On NetBSD/OpenBSD this is the allocated tunN when "auto" was requested.
-    /// On FreeBSD/DragonFly this is the Linux-like alias after a successful
-    /// rename, otherwise the allocated tunN.
+    /// On FreeBSD/DragonFly this is the alias after a successful rename
+    /// (`ygg0` / `ygg{prefix}{port}` for `"auto"`, otherwise the configured
+    /// if_name), or the allocated tunN if rename failed.
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -931,5 +948,15 @@ mod freebsd_dragonfly_alias_tests {
         let expected =
             IOC_IN | ((len & IOCPARM_MASK) << 16) | ((b'i' as libc::c_ulong) << 8) | 40;
         assert_eq!(siocsifname_request(), expected);
+    }
+
+    #[test]
+    fn explicit_if_name_is_used_as_alias_as_is() {
+        // Non-"auto" if_name is the alias verbatim; it is not forced
+        // through the ygg{prefix}{port} rule and need not start with "tun".
+        assert_ne!(linux_like_auto_tun_name_from(None), "vpn0");
+        assert_ne!(linux_like_auto_tun_name_from(Some((0x06, 15001))), "mesh");
+        assert!(libc::IFNAMSIZ as usize > "vpn0".len());
+        assert!(libc::IFNAMSIZ as usize > "ygg-mesh".len());
     }
 }

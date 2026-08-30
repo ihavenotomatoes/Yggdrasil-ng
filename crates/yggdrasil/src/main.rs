@@ -795,7 +795,8 @@ fn apply_prefix_port(prefix: u8, port: u16, config: &mut Config) {
             target_os = "dragonfly",
         )) {
             // Keep "auto" — backend assigns utunN (macOS) or tunN (BSD).
-            // FreeBSD/DragonFly rename tunN after creation (see tun.rs).
+            // FreeBSD/DragonFly rename tunN after creation (see tun.rs),
+            // both for "auto" and for an explicit if_name alias.
         } else {
             // Linux: strip the trailing "0" from "ygg0"
             config.if_name = format!("ygg{}", suffix);
