@@ -72,6 +72,11 @@ pub struct Config {
     pub admin_listen: String,
 
     /// TUN interface name. "auto" for auto-name, "none" to disable.
+    /// "auto" becomes utunN on macOS and tunN on NetBSD/OpenBSD; on
+    /// FreeBSD "auto" is renamed to ygg0 / ygg{prefix}{port} after 
+    /// allocation. Any other value is the interface name as on Linux;
+    /// FreeBSD apply it as an alias of the allocated tunN.
+    /// Windows uses "Yggdrasil", other Unix platforms use "ygg0".
     #[serde(default = "default_if_name")]
     pub if_name: String,
 

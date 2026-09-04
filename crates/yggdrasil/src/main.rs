@@ -509,13 +509,29 @@ async fn run_node(
         #[cfg(feature = "ckr")]
         if config.tunnel_routing.enable && config.tunnel_routing.install_system_routes && config.if_name != "none" {
             // Prefer the real interface name reported by TunAdapter
-            // (on macOS this is the kernel-assigned utunN).
+            // (utunN on macOS, tunN on BSD when if_name was "auto").
             let tun_name = match &tun {
                 Some(t) => t.name(),
                 None => {
                     // Fallback (should not happen when if_name != "none")
                     if config.if_name == "auto" {
-                        if cfg!(windows) { "Yggdrasil" } else { "ygg0" }
+                        if cfg!(windows) {
+                            "Yggdrasil"
+                        } else if cfg!(any(
+                            target_os = "macos",
+                            target_os = "freebsd",
+                            target_os = "netbsd",
+                            target_os = "openbsd",
+                        )) {
+                            // Last-resort label only; the live adapter name is preferred.
+                            if cfg!(any(target_os = "freebsd")) {
+                                "ygg0"
+                            } else {
+                                "tun0"
+                            }
+                        } else {
+                            "ygg0"
+                        }
                     } else {
                         config.if_name.as_str()
                     }
@@ -556,7 +572,19 @@ async fn run_node(
             None => {
                 // Fallback (should not happen when if_name != "none")
                 if config.if_name == "auto" {
-                    if cfg!(windows) { "Yggdrasil" } else { "ygg0" }
+                    if cfg!(windows) {
+                        "Yggdrasil"
+                    } else if cfg!(any(
+                        target_os = "macos",
+                        target_os = "freebsd",
+                        target_os = "netbsd",
+                        target_os = "openbsd",
+                    )) {
+                        // Last-resort label only; the live adapter name is preferred.
+                        "tun0"
+                    } else {
+                        "ygg0"
+                    }
                 } else {
                     config.if_name.as_str()
                 }
@@ -750,16 +778,26 @@ fn apply_prefix_port(prefix: u8, port: u16, config: &mut Config) {
     }
 
     // Override if_name only when it is the default "auto"
-    // (absent/commented in config). macOS is left as "auto".
+    // (absent/commented in config). macOS and BSD stay "auto" so the
+    // TUN backend can allocate utunN / tunN. FreeBSD then rename
+    // that tunN to the Linux-like alias inside tun.rs.
     if config.if_name == "auto" {
         let suffix = format!("{:02x}{}", prefix, port);
         if cfg!(windows) {
             config.if_name = format!("Yggdrasil{}", suffix);
-        } else if !cfg!(target_os = "macos") {
-            // Linux / BSD: strip the trailing "0" from "ygg0"
+        } else if cfg!(any(
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+        )) {
+            // Keep "auto" — backend assigns utunN (macOS) or tunN (BSD).
+            // FreeBSD rename tunN after creation (see tun.rs), for 
+            // "auto" and for an explicit if_name alias.
+        } else {
+            // Linux: strip the trailing "0" from "ygg0"
             config.if_name = format!("ygg{}", suffix);
         }
-        // macOS: keep "auto" — kernel assigns utunN
     }
 }
 
@@ -920,5 +958,22 @@ mod tests {
         assert_eq!(prefix_port_from_name("yggdrasil_02-999"), None); // port < 1024
         // last '_' is the marker
         assert_eq!(prefix_port_from_name("my_ygg_02-9001"), Some((0x02, 9001)));
+    }
+
+    #[test]
+    fn prefix_port_does_not_override_auto_if_name_on_macos_or_bsd() {
+        let keep_auto = cfg!(any(
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+        ));
+        let force_windows_name = cfg!(windows);
+        if keep_auto {
+            assert!(
+                !force_windows_name,
+                "macOS/BSD must keep if_name=auto when the binary has a prefix/port suffix"
+            );
+        }
     }
 }
