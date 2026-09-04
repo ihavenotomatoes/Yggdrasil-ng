@@ -57,6 +57,58 @@ fn auto_requested_name() -> String {
     }
 }
 
+/// Stock TUN MTU used at DeviceBuilder time on NetBSD / OpenBSD.
+///
+/// tun-rs applies `SIOCSIFMTU` during `build_async()`. Passing the
+/// configured `if_mtu` (default 65535) fails with EINVAL on a stock
+/// kernel: NetBSD `tun(4)` caps at `TUNMTU` (1500), OpenBSD at
+/// `TUNMRU` (16384). Custom kernels may raise those compile-time
+/// limits, so after a successful create we probe upward separately.
+#[cfg(target_os = "netbsd")]
+const BSD_TUN_CREATE_MTU: u16 = 1500;
+#[cfg(target_os = "openbsd")]
+const BSD_TUN_CREATE_MTU: u16 = 16384;
+
+/// MTU passed to `DeviceBuilder::mtu()` so create cannot fail with
+/// EINVAL on a stock NetBSD/OpenBSD tun(4). Other platforms keep the
+/// caller-supplied value unchanged.
+fn tun_create_mtu(requested: u16) -> u16 {
+    #[cfg(any(target_os = "netbsd", target_os = "openbsd"))]
+    {
+        requested.min(BSD_TUN_CREATE_MTU)
+    }
+    #[cfg(not(any(target_os = "netbsd", target_os = "openbsd")))]
+    {
+        requested
+    }
+}
+
+/// Highest MTU in `(floor, requested]` that `try_set` accepts.
+///
+/// `try_set(v)` must return true only when the kernel accepted `v`
+/// as the interface MTU. The last successful value is left applied
+/// by the caller of `try_set`; this helper does not emit logs.
+#[cfg(any(test, target_os = "netbsd", target_os = "openbsd"))]
+fn probe_highest_mtu(floor: u16, requested: u16, mut try_set: impl FnMut(u16) -> bool) -> u16 {
+    if requested <= floor {
+        return floor;
+    }
+    if try_set(requested) {
+        return requested;
+    }
+    let mut lo = floor;
+    let mut hi = requested - 1;
+    while lo < hi {
+        let mid = lo + (hi - lo + 1) / 2;
+        if try_set(mid) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    lo
+}
+
 /// Linux-like TUN name used as the FreeBSD alias when
 /// `if_name` is `"auto"`.
 ///
@@ -78,7 +130,7 @@ fn linux_like_auto_tun_name() -> String {
 
 /// Same naming rule with explicit inputs so unit tests do not touch
 /// the process-wide prefix/port atomics.
-#[cfg(any(test, target_os = "freebsd"))]
+#[cfg(target_os = "freebsd")]
 fn linux_like_auto_tun_name_from(prefix_port: Option<(u8, u16)>) -> String {
     match prefix_port {
         Some((prefix, port)) => format!("ygg{:02x}{}", prefix, port),
@@ -149,11 +201,14 @@ impl TunAdapter {
             .parse()
             .map_err(|e| format!("invalid address '{}': {}", ip_str, e))?;
 
-        // Create TUN device using tun-rs DeviceBuilder (only primary Yggdrasil IPv6)
+        // Create TUN device using tun-rs DeviceBuilder (only primary Yggdrasil IPv6).
+        // On NetBSD/OpenBSD pass the stock tun(4) MTU first; a later probe
+        // raises it to whatever this kernel actually accepts.
+        let create_mtu = tun_create_mtu(mtu);
         #[allow(unused_mut)]
         let mut builder = tun_rs::DeviceBuilder::new()
             .ipv6(ip, 7u8)
-            .mtu(mtu);
+            .mtu(create_mtu);
 
         // Only set an explicit name when we have one.
         // On macOS + "auto" the name stays empty → kernel auto-selects utunN.
@@ -221,7 +276,16 @@ impl TunAdapter {
             }
         }
 
-        let actual_mtu = device.mtu().unwrap_or(mtu);
+        // On NetBSD/OpenBSD the builder used the stock tun(4) MTU so
+        // create could not fail with EINVAL. Ask this kernel for the
+        // highest MTU it will accept, capped by the requested value.
+        // Failures stay on `create_mtu`; do not log the probe itself.
+        #[cfg(any(target_os = "netbsd", target_os = "openbsd"))]
+        let _ = probe_highest_mtu(create_mtu, mtu, |candidate| {
+            device.set_mtu(candidate).is_ok()
+        });
+
+        let actual_mtu = device.mtu().unwrap_or(create_mtu);
         tracing::info!("TUN device '{}' created with address {} and MTU {}", tun_name, addr, actual_mtu);
 
         // CKR system route installation moved to main.rs (after multicast)
@@ -849,6 +913,87 @@ mod auto_name_tests {
         )) {
             assert_eq!(auto_requested_name(), "ygg0");
         }
+    }
+}
+
+#[cfg(test)]
+mod tun_mtu_probe_tests {
+    use super::probe_highest_mtu;
+
+    #[test]
+    fn keeps_floor_when_requested_is_not_higher() {
+        let mut calls = Vec::new();
+        let got = probe_highest_mtu(1500, 1500, |v| {
+            calls.push(v);
+            true
+        });
+        assert_eq!(got, 1500);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn accepts_requested_when_kernel_allows_it() {
+        let got = probe_highest_mtu(1500, 65535, |_| true);
+        assert_eq!(got, 65535);
+    }
+
+    #[test]
+    fn finds_stock_netbsd_tunmtu() {
+        let got = probe_highest_mtu(1500, 65535, |v| v <= 1500);
+        assert_eq!(got, 1500);
+    }
+
+    #[test]
+    fn finds_stock_openbsd_tunmru() {
+        let got = probe_highest_mtu(16384, 65535, |v| v <= 16384);
+        assert_eq!(got, 16384);
+    }
+
+    #[test]
+    fn finds_custom_kernel_cap_between_floor_and_requested() {
+        // Custom NetBSD with TUNMTU raised to 9000, or OpenBSD with
+        // TUNMRU raised to 32767 / 65535.
+        assert_eq!(probe_highest_mtu(1500, 65535, |v| v <= 9000), 9000);
+        assert_eq!(probe_highest_mtu(16384, 65535, |v| v <= 32767), 32767);
+        assert_eq!(probe_highest_mtu(16384, 40000, |_| true), 40000);
+    }
+
+    #[test]
+    fn never_asks_below_floor_or_above_requested() {
+        let mut seen = Vec::new();
+        let cap = 9000u16;
+        let floor = 1500u16;
+        let requested = 65535u16;
+        let got = probe_highest_mtu(floor, requested, |v| {
+            seen.push(v);
+            v <= cap
+        });
+        assert_eq!(got, cap);
+        assert!(seen.iter().all(|&v| v >= floor && v <= requested));
+        assert_eq!(seen.first().copied(), Some(requested));
+    }
+
+    #[cfg(target_os = "netbsd")]
+    #[test]
+    fn netbsd_create_mtu_is_stock_1500() {
+        assert_eq!(super::tun_create_mtu(65535), 1500);
+        assert_eq!(super::tun_create_mtu(1280), 1280);
+        assert_eq!(super::tun_create_mtu(1500), 1500);
+    }
+
+    #[cfg(target_os = "openbsd")]
+    #[test]
+    fn openbsd_create_mtu_is_stock_16384() {
+        assert_eq!(super::tun_create_mtu(65535), 16384);
+        assert_eq!(super::tun_create_mtu(1280), 1280);
+        assert_eq!(super::tun_create_mtu(16384), 16384);
+    }
+
+    #[cfg(not(any(target_os = "netbsd", target_os = "openbsd")))]
+    #[test]
+    fn other_os_create_mtu_is_unchanged() {
+        assert_eq!(super::tun_create_mtu(65535), 65535);
+        assert_eq!(super::tun_create_mtu(1280), 1280);
     }
 }
 
