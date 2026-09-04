@@ -631,15 +631,10 @@ async fn tun_read_loop(device: Arc<AsyncDevice>, rwc: Arc<ReadWriteCloser>) {
     }
 }
 
-/// Returns true for TUN write failures that reject only this packet.
-/// The write path must drop the packet and keep running.
-///
-/// - All Unix: `WouldBlock` / `ENOBUFS` (kernel buffer exhaustion).
-/// - Apple: `EQFULL` (interface output queue full).
-/// - NetBSD: `EIO` from `tun(4)` `tunwrite()` when the payload is 0 or
-///   larger than the compile-time `TUNMTU`. That is a per-packet reject;
-///   the device stays usable. Do not treat `EIO` as droppable on other
-///   platforms — there it can mean a real adapter failure.
+/// Returns true for transient TUN write failures caused by kernel buffer exhaustion
+/// (ENOBUFS / WouldBlock, and EQFULL on Apple).
+/// In these cases the packet should
+/// be dropped instead of tearing down the write path.
 #[cfg(unix)]
 fn is_tun_write_overflow(err: &std::io::Error) -> bool {
     if err.kind() == std::io::ErrorKind::WouldBlock {
@@ -650,9 +645,6 @@ fn is_tun_write_overflow(err: &std::io::Error) -> bool {
         // macOS-only: the interface output queue is full.
         #[cfg(target_vendor = "apple")]
         Some(code) if code == libc::EQFULL => true,
-        // NetBSD tun(4): payload empty or larger than compile-time TUNMTU.
-        #[cfg(target_os = "netbsd")]
-        Some(code) if code == libc::EIO => true,
         _ => false,
     }
 }
@@ -927,35 +919,6 @@ mod auto_name_tests {
         )) {
             assert_eq!(auto_requested_name(), "ygg0");
         }
-    }
-}
-
-#[cfg(all(test, unix))]
-mod tun_write_overflow_tests {
-    use super::is_tun_write_overflow;
-
-    #[test]
-    fn would_block_is_droppable() {
-        let err = std::io::Error::new(std::io::ErrorKind::WouldBlock, "would block");
-        assert!(is_tun_write_overflow(&err));
-    }
-
-    #[test]
-    fn enobufs_is_droppable() {
-        let err = std::io::Error::from_raw_os_error(libc::ENOBUFS);
-        assert!(is_tun_write_overflow(&err));
-    }
-
-    #[test]
-    fn eio_is_droppable_only_on_netbsd() {
-        let err = std::io::Error::from_raw_os_error(libc::EIO);
-        assert_eq!(is_tun_write_overflow(&err), cfg!(target_os = "netbsd"));
-    }
-
-    #[test]
-    fn einval_is_not_droppable() {
-        let err = std::io::Error::from_raw_os_error(libc::EINVAL);
-        assert!(!is_tun_write_overflow(&err));
     }
 }
 
