@@ -287,6 +287,11 @@ impl TunAdapter {
 
         let actual_mtu = device.mtu().unwrap_or(create_mtu);
         tracing::info!("TUN device '{}' created with address {} and MTU {}", tun_name, addr, actual_mtu);
+        // Overlay MTU must follow the kernel-clamped interface MTU.
+        // Otherwise inbound packets larger than tun(4) TUNMTU pass the
+        // RWC check, fail tunwrite (EIO on NetBSD) and never produce
+        // an ICMPv6 Packet Too Big for the sender.
+        rwc.set_mtu(actual_mtu as u64);
 
         // CKR system route installation moved to main.rs (after multicast)
         // to ensure routes are added only after Yggdrasil network is fully up.
