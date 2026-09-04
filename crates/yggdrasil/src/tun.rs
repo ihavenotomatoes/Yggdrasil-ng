@@ -36,11 +36,11 @@ static SET_INTERFACE_DNS_PTR: OnceLock<
 ///
 /// An empty string means "do not call `DeviceBuilder::name()`":
 /// - macOS/Darwin: the kernel allocates the next free `utunN`;
-/// - FreeBSD/GhostBSD, NetBSD, OpenBSD, DragonFlyBSD: tun-rs scans
+/// - FreeBSD/GhostBSD, NetBSD, OpenBSD: tun-rs scans
 ///   `/dev/tun0`..`/dev/tun255` and takes the first free node.
-///   On FreeBSD/GhostBSD and DragonFlyBSD the allocated `tunN` is then
-///   renamed: `if_name = "auto"` → Linux-like alias (`ygg0` /
-///   `ygg{prefix}{port}`); any other `if_name` is used as the alias as-is.
+///   On FreeBSD/GhostBSD the allocated `tunN` is then renamed:
+///   `if_name = "auto"` → Linux-like alias (`ygg0` / `ygg{prefix}{port}`);
+///   any other `if_name` is used as the alias as-is.
 /// Windows and Linux keep their historic fixed defaults.
 fn auto_requested_name() -> String {
     if cfg!(windows) {
@@ -50,7 +50,6 @@ fn auto_requested_name() -> String {
         target_os = "freebsd",
         target_os = "netbsd",
         target_os = "openbsd",
-        target_os = "dragonfly",
     )) {
         String::new()
     } else {
@@ -58,14 +57,14 @@ fn auto_requested_name() -> String {
     }
 }
 
-/// Linux-like TUN name used as the FreeBSD/DragonFly alias when
+/// Linux-like TUN name used as the FreeBSD alias when
 /// `if_name` is `"auto"`.
 ///
 /// Matches `apply_prefix_port` on Linux:
 /// - custom prefix/port from the binary/symlink/hardlink suffix
 ///   (`ygg_0615001` → `ygg0615001`);
 /// - otherwise the historic default `ygg0`.
-#[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
+#[cfg(any(target_os = "freebsd"))]
 fn linux_like_auto_tun_name() -> String {
     if crate::address::prefix_port_set() {
         linux_like_auto_tun_name_from(Some((
@@ -79,7 +78,7 @@ fn linux_like_auto_tun_name() -> String {
 
 /// Same naming rule with explicit inputs so unit tests do not touch
 /// the process-wide prefix/port atomics.
-#[cfg(any(test, target_os = "freebsd", target_os = "dragonfly"))]
+#[cfg(any(test, target_os = "freebsd"))]
 fn linux_like_auto_tun_name_from(prefix_port: Option<(u8, u16)>) -> String {
     match prefix_port {
         Some((prefix, port)) => format!("ygg{:02x}{}", prefix, port),
@@ -93,8 +92,8 @@ pub struct TunAdapter {
     /// Actual OS-level name of the interface.
     /// On macOS with "auto" this is the kernel-assigned utunN
     /// (e.g. "utun3"). On NetBSD/OpenBSD with "auto" this is the
-    /// allocated tunN (e.g. "tun0"). On FreeBSD/DragonFly this is the
-    /// alias after rename (`ygg0` / `ygg{prefix}{port}` when `if_name`
+    /// allocated tunN (e.g. "tun0"). On FreeBSD this is the alias
+    /// after rename (`ygg0` / `ygg{prefix}{port}` when `if_name`
     /// is `"auto"`, otherwise the configured `if_name`), or the
     /// original tunN if rename failed.
     name: String,
@@ -130,16 +129,15 @@ impl TunAdapter {
         // Determine the requested interface name.
         // On macOS and BSD "auto" must leave the name empty so that tun-rs
         // does not call DeviceBuilder::name() and the backend can allocate
-        // utunN / tunN. On FreeBSD/DragonFly a non-"auto" if_name is also
-        // left empty here: tun-rs still allocates tunN, and if_name is
-        // applied afterwards as an alias. Windows and Linux keep the
-        // historic defaults.
+        // utunN / tunN. On FreeBSD a non-"auto" if_name is also left empty here:
+        // tun-rs still allocates tunN, and if_name is applied afterwards as
+        // an alias. Windows and Linux keep the historic defaults.
         // `mut` is needed because we overwrite an empty name with the real
         // interface name after device creation.
         #[allow(unused_mut)]
         let mut tun_name: String = if name == "auto" {
             auto_requested_name()
-        } else if cfg!(any(target_os = "freebsd", target_os = "dragonfly")) {
+        } else if cfg!(any(target_os = "freebsd")) {
             String::new()
         } else {
             name.to_string()
@@ -186,13 +184,13 @@ impl TunAdapter {
                 .map_err(|e| format!("failed to get assigned TUN interface name: {}", e))?;
         }
 
-        // FreeBSD/DragonFly cannot create /dev/<arbitrary>. After tun-rs
-        // has allocated tunN, rename it to the requested alias.
+        // FreeBSD cannot create /dev/<arbitrary>. After tun-rs has
+        // allocated tunN, rename it to the requested alias.
         // `"auto"` uses the Linux-like name; any other if_name is used
         // as-is. `self.name` must become the alias so close() destroys it.
         // Rename failure is non-fatal: keep the allocated tunN. Do not
         // warn when a caller-supplied if_name cannot be applied.
-        #[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
+        #[cfg(any(target_os = "freebsd"))]
         if tun_name.starts_with("tun") {
             let alias = if name == "auto" {
                 linux_like_auto_tun_name()
@@ -272,9 +270,9 @@ impl TunAdapter {
     /// Returns the actual name of the TUN network interface as seen by the OS.
     /// On macOS this is the kernel-assigned utunN when "auto" was requested.
     /// On NetBSD/OpenBSD this is the allocated tunN when "auto" was requested.
-    /// On FreeBSD/DragonFly this is the alias after a successful rename
-    /// (`ygg0` / `ygg{prefix}{port}` for `"auto"`, otherwise the configured
-    /// if_name), or the allocated tunN if rename failed.
+    /// On FreeBSD this is the alias after a successful rename (`ygg0` /
+    /// `ygg{prefix}{port}` for `"auto"`, otherwise the configured if_name),
+    /// or the allocated tunN if rename failed.
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -362,9 +360,9 @@ impl TunAdapter {
         // Tasks have released their Arc clones; drop the last one so
         // AsyncDevice::Drop runs WintunCloseAdapter (or platform equivalent).
         //
-        // On FreeBSD/GhostBSD, NetBSD and DragonFlyBSD the last close of
-        // /dev/tunN only marks the clone interface down. The kernel keeps
-        // the iface until SIOCIFDESTROY. tun-rs Drop may try destroy while
+        // On FreeBSD/GhostBSD and NetBSD the last close of /dev/tunN
+        // only marks the clone interface down. The kernel keeps the iface
+        // until SIOCIFDESTROY. tun-rs Drop may try destroy while
         // the fd is still open; that ioctl is then ignored or can stall.
         // Close the fd first, then destroy by name.
         drop(device);
@@ -382,7 +380,6 @@ impl TunAdapter {
     target_os = "freebsd",
     target_os = "netbsd",
     target_os = "openbsd",
-    target_os = "dragonfly",
 ))]
 fn destroy_tun_interface(name: &str) {
     if name.is_empty() {
@@ -412,35 +409,32 @@ fn destroy_tun_interface(name: &str) {
     target_os = "freebsd",
     target_os = "netbsd",
     target_os = "openbsd",
-    target_os = "dragonfly",
 )))]
 fn destroy_tun_interface(_name: &str) {}
 
 /// `SIOCIFDESTROY` is `_IOW('i', 121, struct ifreq)` on FreeBSD,
-/// NetBSD, OpenBSD and DragonFly. `libc` only exports the named
-/// constant reliably on FreeBSD, so other targets build the request
+/// NetBSD and OpenBSD. `libc` only exports the named constant
+/// reliably on FreeBSD, so other targets build the request
 /// from the same encoding and `size_of::<libc::ifreq>()`.
 #[cfg(any(
     target_os = "freebsd",
     target_os = "netbsd",
     target_os = "openbsd",
-    target_os = "dragonfly",
 ))]
 fn siocifdestroy_request() -> libc::c_ulong {
     // SIOCIFDESTROY = _IOW('i', 121, struct ifreq) on FreeBSD/GhostBSD,
-    // NetBSD, OpenBSD and DragonFly. Do not use libc::SIOCIFDESTROY:
-    // the named constant is missing from some libc versions even on
-    // FreeBSD.
+    // NetBSD, OpenBSD. Do not use libc::SIOCIFDESTROY: the named
+    // constant is missing from some libc versions even on FreeBSD.
     const IOC_IN: libc::c_ulong = 0x8000_0000;
     const IOCPARM_MASK: libc::c_ulong = 0x1fff;
     let len = std::mem::size_of::<libc::ifreq>() as libc::c_ulong;
     IOC_IN | ((len & IOCPARM_MASK) << 16) | ((b'i' as libc::c_ulong) << 8) | 121
 }
 
-/// `SIOCSIFNAME` is `_IOW('i', 40, struct ifreq)` on FreeBSD and DragonFly.
+/// `SIOCSIFNAME` is `_IOW('i', 40, struct ifreq)` on FreeBSD.
 /// Encoded the same way as `siocifdestroy_request` so we do not depend
 /// on `libc::SIOCSIFNAME` being present.
-#[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
+#[cfg(any(target_os = "freebsd"))]
 fn siocsifname_request() -> libc::c_ulong {
     const IOC_IN: libc::c_ulong = 0x8000_0000;
     const IOCPARM_MASK: libc::c_ulong = 0x1fff;
@@ -454,7 +448,6 @@ fn siocsifname_request() -> libc::c_ulong {
     target_os = "freebsd",
     target_os = "netbsd",
     target_os = "openbsd",
-    target_os = "dragonfly",
 ))]
 fn fill_ifr_name(ifr: &mut libc::ifreq, name: &str) -> bool {
     let bytes = name.as_bytes();
@@ -476,7 +469,6 @@ fn fill_ifr_name(ifr: &mut libc::ifreq, name: &str) -> bool {
     target_os = "freebsd",
     target_os = "netbsd",
     target_os = "openbsd",
-    target_os = "dragonfly",
 ))]
 fn destroy_tun_interface_inner(name: &str) -> std::io::Result<()> {
     let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
@@ -506,9 +498,9 @@ fn destroy_tun_interface_inner(name: &str) -> std::io::Result<()> {
 /// Rename a cloned TUN iface (`tunN` → `ygg0` / `ygg{prefix}{port}`).
 ///
 /// `ifr_name` is the current name; `ifr_ifru.ifru_data` points at a
-/// NUL-terminated buffer with the new name (FreeBSD/DragonFly
-/// `SIOCSIFNAME` convention).
-#[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
+/// NUL-terminated buffer with the new name (FreeBSD `SIOCSIFNAME`
+/// convention).
+#[cfg(any(target_os = "freebsd"))]
 fn rename_tun_interface(current: &str, new_name: &str) -> std::io::Result<()> {
     let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
     if !fill_ifr_name(&mut ifr, current) {
@@ -838,7 +830,6 @@ mod auto_name_tests {
             target_os = "freebsd",
             target_os = "netbsd",
             target_os = "openbsd",
-            target_os = "dragonfly",
         )) {
             assert!(
                 auto_requested_name().is_empty(),
@@ -855,7 +846,6 @@ mod auto_name_tests {
             not(target_os = "freebsd"),
             not(target_os = "netbsd"),
             not(target_os = "openbsd"),
-            not(target_os = "dragonfly"),
         )) {
             assert_eq!(auto_requested_name(), "ygg0");
         }
@@ -868,7 +858,6 @@ mod auto_name_tests {
         target_os = "freebsd",
         target_os = "netbsd",
         target_os = "openbsd",
-        target_os = "dragonfly",
     )
 ))]
 mod bsd_destroy_tests {
@@ -909,8 +898,8 @@ mod bsd_destroy_tests {
     }
 }
 
-#[cfg(all(test, any(target_os = "freebsd", target_os = "dragonfly")))]
-mod freebsd_dragonfly_alias_tests {
+#[cfg(all(test, any(target_os = "freebsd")))]
+mod freebsd_alias_tests {
     use super::{
         linux_like_auto_tun_name_from, siocsifname_request,
     };

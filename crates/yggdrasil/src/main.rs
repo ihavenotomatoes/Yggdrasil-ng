@@ -522,10 +522,9 @@ async fn run_node(
                             target_os = "freebsd",
                             target_os = "netbsd",
                             target_os = "openbsd",
-                            target_os = "dragonfly",
                         )) {
                             // Last-resort label only; the live adapter name is preferred.
-                            if cfg!(any(target_os = "freebsd", target_os = "dragonfly")) {
+                            if cfg!(any(target_os = "freebsd")) {
                                 "ygg0"
                             } else {
                                 "tun0"
@@ -580,7 +579,6 @@ async fn run_node(
                         target_os = "freebsd",
                         target_os = "netbsd",
                         target_os = "openbsd",
-                        target_os = "dragonfly",
                     )) {
                         // Last-resort label only; the live adapter name is preferred.
                         "tun0"
@@ -781,8 +779,8 @@ fn apply_prefix_port(prefix: u8, port: u16, config: &mut Config) {
 
     // Override if_name only when it is the default "auto"
     // (absent/commented in config). macOS and BSD stay "auto" so the
-    // TUN backend can allocate utunN / tunN. FreeBSD/DragonFly then
-    // rename that tunN to the Linux-like alias inside tun.rs.
+    // TUN backend can allocate utunN / tunN. FreeBSD then rename
+    // that tunN to the Linux-like alias inside tun.rs.
     if config.if_name == "auto" {
         let suffix = format!("{:02x}{}", prefix, port);
         if cfg!(windows) {
@@ -792,11 +790,10 @@ fn apply_prefix_port(prefix: u8, port: u16, config: &mut Config) {
             target_os = "freebsd",
             target_os = "netbsd",
             target_os = "openbsd",
-            target_os = "dragonfly",
         )) {
             // Keep "auto" — backend assigns utunN (macOS) or tunN (BSD).
-            // FreeBSD/DragonFly rename tunN after creation (see tun.rs),
-            // both for "auto" and for an explicit if_name alias.
+            // FreeBSD rename tunN after creation (see tun.rs), for 
+            // "auto" and for an explicit if_name alias.
         } else {
             // Linux: strip the trailing "0" from "ygg0"
             config.if_name = format!("ygg{}", suffix);
@@ -970,7 +967,6 @@ mod tests {
             target_os = "freebsd",
             target_os = "netbsd",
             target_os = "openbsd",
-            target_os = "dragonfly",
         ));
         let force_windows_name = cfg!(windows);
         if keep_auto {
