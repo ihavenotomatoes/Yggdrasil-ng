@@ -402,6 +402,8 @@ async fn run_node(
             tun_mtu,
             #[cfg(windows)]
             &config.if_dns_servers,
+            #[cfg(target_os = "linux")]
+            config.if_gso,
             #[cfg(feature = "ckr")]
             Some(&config.tunnel_routing),
             #[cfg(feature = "ckr")]

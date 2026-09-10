@@ -89,6 +89,15 @@ pub struct Config {
     #[serde(default)]
     pub if_dns_servers: Vec<String>,
 
+    /// Enable GSO (generic segmentation offload) on the TUN interface.
+    /// Linux only; ignored elsewhere.
+    ///
+    /// Worth enabling when many small packets arrive back to back (1500-byte-MTU
+    /// peers, CKR forwarding); inert for bulk transfer at the default MTU. See
+    /// `docs/GSO.md`.
+    #[serde(default)]
+    pub if_gso: bool,
+
     /// Custom node info (arbitrary TOML value).
     #[serde(default = "default_node_info")]
     pub node_info: toml::Value,
@@ -354,6 +363,7 @@ impl Default for Config {
             if_name: default_if_name(),
             if_mtu: default_mtu(),
             if_dns_servers: Vec::new(),
+            if_gso: false,
             node_info: toml::Value::Table(toml::map::Map::new()),
             node_info_privacy: false,
             allowed_public_keys: Vec::new(),
