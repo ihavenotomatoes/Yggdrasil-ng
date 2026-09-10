@@ -110,6 +110,16 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let logto = matches.opt_str("logto");
 
     // --genconf [FILE]: generate config, save to file or print to stdout
+    if matches.opt_present("base") && !matches.opt_present("genconf") {
+        eprintln!("Error: --base can only be used together with --genconf");
+        std::process::exit(1);
+    }
+    if matches.opt_present("base")
+        && matches.opt_str("base").unwrap_or_default().is_empty()
+    {
+        eprintln!("Error: --base requires a FILE path");
+        std::process::exit(1);
+    }
     if matches.opt_present("genconf") {
         if let Some(path) = matches.opt_str("genconf") {
             let path = expand_genconf_path(&path);
@@ -124,7 +134,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("Created folder {}", display_abs_path(parent));
                 }
             }
-            let text = Config::generate_config_text();
+            let text = generate_config_text_maybe_from_base(matches.opt_str("base").as_deref())?;
             {
                 use std::io::Write;
                 let mut opts = OpenOptions::new();
@@ -138,7 +148,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
             }
             eprintln!("Configuration saved to {}", display_abs_path(path_ref));
         } else {
-            print!("{}", Config::generate_config_text());
+            print!("{}", generate_config_text_maybe_from_base(matches.opt_str("base").as_deref())?);
         }
         return Ok(());
     }
@@ -249,30 +259,11 @@ async fn run_node(
     // When called from service mode, logging + config aren't set up yet.
     // Re-read CLI args to get config path / autoconf / loglevel.
     let args: Vec<String> = std::env::args().collect();
-    let mut opts = Options::new();
-    opts.optopt("c", "config", "", "FILE");
-    opts.optflag("", "autoconf", "");
-    opts.optopt("l", "loglevel", "", "LEVEL");
-    opts.optopt("", "logto", "", "FILE");
-    // Accept (and ignore) the rest so parsing doesn't fail
-    opts.optflagopt("g", "genconf", "", "FILE");
-    opts.optflag("a", "address", "");
-    opts.optflag("s", "subnet", "");
-    opts.optflag("n", "no-replace", "");
-    opts.optopt("", "peers", "", "PEERS");
-    opts.optflag("h", "help", "");
-    opts.optflag("v", "version", "");
-    #[cfg(feature = "ctl")]
-    opts.optopt("e", "endpoint", "", "URI");
-    #[cfg(feature = "ctl")]
-    opts.optflag("j", "json", "");
-    #[cfg(windows)]
-    opts.optflag("", "service", "");
-
-    let matches = opts.parse(&args[1..]).unwrap_or_else(|_| {
-        // Fallback: empty matches
-        opts.parse(Vec::<String>::new()).unwrap()
-    });
+    let opts = make_cli_options();
+    let matches = match opts.parse(&args[1..]) {
+        Ok(m) => m,
+        Err(_) => opts.parse(Vec::<String>::new()).unwrap(),
+    };
 
     let config_path = resolve_config_path(&matches);
     let autoconf = matches.opt_present("autoconf");
@@ -689,6 +680,46 @@ fn expand_genconf_path(path: &str) -> String {
     }
 }
 
+/// Rewrite the historic default admin_listen URI inside generated
+/// config text so the commented template line uses the port taken
+/// from the binary/symlink/hardlink name.
+///
+/// The template ships with `tcp://localhost:9001` (commented).
+/// Only that exact default URI is replaced; a custom URI would
+/// not appear in freshly generated text.
+fn rewrite_admin_listen_in_genconf_text(text: &str, port: u16) -> String {
+    let from = format!("tcp://localhost:{}", DEFAULT_ADMIN_PORT);
+    let to = format!("tcp://localhost:{}", port);
+    text.replace(&from, &to)
+}
+
+/// Build genconf text. If `base_path` is set, reuse `private_key` from that
+/// TOML file; otherwise mint a new keypair (existing generate_config_text()).
+fn generate_config_text_maybe_from_base(
+    base_path: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let text = match base_path {
+        None => Config::generate_config_text(),
+        Some(path) => {
+            let path = expand_genconf_path(path);
+            let text = match std::fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(format!("base configuration file not found: {}", path).into());
+                }
+                Err(e) => return Err(e.into()),
+            };
+            let key = Config::private_key_from_toml(&text)
+                .map_err(|e| format!("invalid --base file {}: {}", path, e))?;
+            Config::generate_config_text_from_private_key(&key)
+        }
+    };
+    let port = resolve_prefix_port()
+        .map(|(_, port)| port)
+        .unwrap_or(DEFAULT_ADMIN_PORT);
+    Ok(rewrite_admin_listen_in_genconf_text(&text, port))
+}
+
 /// Parent directory of a config file path, if one should be considered
 /// for creation. `yggdrasil.toml` and `./yggdrasil.toml` have no folder.
 fn config_parent_dir(path: &Path) -> Option<&Path> {
@@ -723,6 +754,7 @@ fn make_cli_options() -> Options {
     opts.optflag("s", "subnet", "Print the IPv6 subnet for the given config and exit");
     opts.optopt("l", "loglevel", "Log level: error, warn, info, debug, trace (default: info)", "LEVEL");
     opts.optflag("n", "no-replace", "With --genconf FILE, skip if the file already exists");
+    opts.optopt("b", "base", "With --genconf, copy private_key from this existing config file instead of generating a new key", "FILE");
     opts.optopt("", "logto", "Log to a file instead of stderr", "FILE");
     #[cfg(feature = "ctl")]
     opts.optopt("e", "endpoint", "Admin socket address (default: tcp://localhost:9001)", "URI");
@@ -1003,11 +1035,13 @@ fn load_config_file(path: &str) -> Result<Config, Box<dyn std::error::Error>> {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             eprintln!(
-                "Error: Can't find the configuration file. Create a configuration file with:\n    yggdrasil --genconf={}\n\n{}",
+                "Error: Can't find the configuration file. Create a configuration file with:\n    {} --genconf={}\n\n{}",
+                program_basename(),
                 path,
                 make_cli_options().usage(&usage_string())
             );
-            std::process::exit(1);
+            // Short Err for SCM Stopped / main() Termination (Debug escapes newlines).
+            return Err(format!("configuration file not found: {}", path).into());
         }
         Err(e) => return Err(e.into()),
     };
@@ -1367,5 +1401,108 @@ mod tests {
         // Unknown names and a lone percent stay unchanged.
         assert_eq!(expand_genconf_path(r"%"), r"%");
         assert_eq!(expand_genconf_path(r"%%"), r"%%");
+    }
+
+    #[test]
+    fn generate_from_base_reuses_key_and_ignores_other_fields() {
+        let base_key = {
+            let generated = yggdrasil::config::Config::generate_config_text();
+            yggdrasil::config::Config::private_key_from_toml(&generated).unwrap()
+        };
+        // Base file has a custom listen/peers; those must NOT be copied.
+        let base_toml = format!(
+            "private_key = \"{base_key}\"\npeers = [\"tcp://198.51.100.7:23456\"]\nlisten = [\"tcp://198.51.100.8:23456\"]\n"
+        );
+        let dir = std::env::temp_dir();
+        let base_path = dir.join(format!(
+            "ygg-base-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&base_path, base_toml).unwrap();
+        let text = generate_config_text_maybe_from_base(Some(base_path.to_str().unwrap())).unwrap();
+        let _ = std::fs::remove_file(&base_path);
+        assert!(text.contains(&format!("private_key = \"{base_key}\"")));
+        assert!(
+            !text.contains("tcp://198.51.100.7:23456"),
+            "peers from the base file must not be copied:\n{text}"
+        );
+        assert!(
+            !text.contains("tcp://198.51.100.8:23456"),
+            "listen from the base file must not be copied:\n{text}"
+        );
+    }
+
+    #[test]
+    fn generate_from_missing_base_is_error() {
+        let err = generate_config_text_maybe_from_base(Some("/no/such/ygg-base-file.toml"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("base configuration file not found"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn generate_without_base_still_mints_a_key() {
+        let text = generate_config_text_maybe_from_base(None).unwrap();
+        let key = yggdrasil::config::Config::private_key_from_toml(&text).unwrap();
+        assert_eq!(key.len(), 128);
+    }
+
+    #[test]
+    fn rewrite_admin_listen_in_genconf_text_keeps_historic_port() {
+        let input = "# admin_listen = \"tcp://localhost:9001\"\n";
+        let out = rewrite_admin_listen_in_genconf_text(input, DEFAULT_ADMIN_PORT);
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn rewrite_admin_listen_in_genconf_text_uses_explicit_port() {
+        let input = "# admin_listen = \"tcp://localhost:9001\"\n";
+        let out = rewrite_admin_listen_in_genconf_text(input, 15001);
+        assert_eq!(out, "# admin_listen = \"tcp://localhost:15001\"\n");
+        assert!(!out.contains("tcp://localhost:9001"));
+    }
+
+    #[test]
+    fn rewrite_admin_listen_in_genconf_text_uses_derived_prefix_only_port() {
+        // Same formula as ygg_fc / ygg_06: suffix is only the prefix.
+        let input = "# admin_listen = \"tcp://localhost:9001\"\n";
+        let fc = rewrite_admin_listen_in_genconf_text(input, port_from_prefix(0xfc));
+        assert_eq!(port_from_prefix(0xfc), 9126);
+        assert_eq!(fc, "# admin_listen = \"tcp://localhost:9126\"\n");
+
+        let p06 = rewrite_admin_listen_in_genconf_text(input, port_from_prefix(0x06));
+        assert_eq!(port_from_prefix(0x06), 9003);
+        assert_eq!(p06, "# admin_listen = \"tcp://localhost:9003\"\n");
+
+        let p02 = rewrite_admin_listen_in_genconf_text(input, port_from_prefix(0x02));
+        assert_eq!(port_from_prefix(0x02), DEFAULT_ADMIN_PORT);
+        assert_eq!(p02, input);
+    }
+
+    #[test]
+    fn generate_config_text_maybe_from_base_contains_commented_admin_listen() {
+        let text = generate_config_text_maybe_from_base(None).unwrap();
+        // Cargo test binary has no prefix/port suffix, so the historic
+        // commented default must still be present.
+        assert!(
+            text.contains("# admin_listen = \"tcp://localhost:9001\""),
+            "expected commented default admin_listen in generated text:\n{text}"
+        );
+        let rewritten = rewrite_admin_listen_in_genconf_text(&text, 9126);
+        assert!(
+            rewritten.contains("# admin_listen = \"tcp://localhost:9126\""),
+            "expected rewritten commented admin_listen:\n{rewritten}"
+        );
+        assert!(
+            !rewritten.contains("tcp://localhost:9001"),
+            "historic default URI must not remain after rewrite:\n{rewritten}"
+        );
     }
 }

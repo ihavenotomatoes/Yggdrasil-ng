@@ -219,7 +219,7 @@ impl TunAdapter {
         #[cfg(windows)]
         {
             // Add the current address prefix to the base GUID so multiple
-            // instances with different --prefix-port can coexist.
+            // instances with different prefix/port can coexist.
             let guid = TUN_DEVICE_GUID_BASE.wrapping_add(crate::address::address_prefix() as u128);
             builder = builder.device_guid(guid);
         }
