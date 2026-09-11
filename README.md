@@ -1,5 +1,35 @@
 # Yggdrasil-ng
 
+> **⚠️ This is not the upstream `master` branch. 🔰**
+>
+> This tree is the `development` branch of a fork that is slightly ahead of [Revertron/Yggdrasil-ng](https://github.com/Revertron/Yggdrasil-ng) `master`. It is not a drop-in replacement for that `master`. If you want the stable upstream tree, please use https://github.com/Revertron/Yggdrasil-ng instead.
+>
+>
+> Extra features in this branch:
+>
+> - Custom `*00::/7` prefix and admin/multicast port taken from the binary / symlink / hardlink name — [docs/PREFIX.md](docs/PREFIX.md). As a complementary network to the public Yggdrasil Network, a private overlay network on a separate prefix is convenient to use together with `group_password` and with per-link `?password=` — [Group password (closed networks)](#group-password-closed-networks), [Protecting an isolated network](docs/PREFIX.md#protecting-an-isolated-network)
+>
+> - A matching default config filename and TUN name [Default configuration file paths](#default-configuration-file-paths), [`-c` / `--config`](#command-line-options)
+>
+> - Reuse an existing `private_key` when generating a new template (`-b` / `--base`) — [Command Line Options](#command-line-options), [Starting Yggdrasil](#starting-yggdrasil)
+>
+> - Extra peers from the command line (`--peers`) — [Command Line Options](#command-line-options)
+>
+> - Several simultaneous links to the same peer (different transports or
+  sockets), capped on inbound by `max_inbound_links_per_peer` — [Key configuration options](#config-file-format-toml)
+>
+> - Linux TUN GSO (`if_gso`) — [docs/GSO.md](docs/GSO.md), [TUN segmentation offload (GSO)](#tun-segmentation-offload-gso)
+>
+> - Peer liveness / read-deadline policy (`[peer_liveness]`) — [docs/PEER_LIVENESS.md](docs/PEER_LIVENESS.md)
+>
+> - Session and path keepalives (`session_path_timeout`, `keepalive_direct`, `keepalive_remote_count`, `keepalive_interval`) — [Key configuration options](#config-file-format-toml)
+>
+> - CKR route lists from `file://` and `http(s)://`, and `_` (system routes without a CKR tunnel) — [docs/CKR.md](docs/CKR.md#configuration)
+>
+> - FreeBSD: auto-created TUN is renamed to a Linux-like `ygg0` / `ygg{prefix}{port}`; shutdown destroys that alias
+>
+>- NetBSD / OpenBSD: the TUN is created at the stock kernel MTU, then the highest accepted MTU is probed and and increased whenever possible
+
 A Rust rewrite of the [Yggdrasil Network](https://yggdrasil-network.github.io/) — an early-stage implementation of a fully end-to-end encrypted IPv6 networking protocol.
 This project aims to provide a lightweight, self-arranging, and secure mesh network alternative to the original Go implementation.
 
@@ -17,8 +47,8 @@ This project aims to provide a lightweight, self-arranging, and secure mesh netw
 **✅ Fully Implemented:**
 - Core routing protocol (spanning tree, path discovery, bloom filters)
 - End-to-end encryption with forward secrecy (session key ratcheting)
-- TCP, TLS, QUIC, WS transports with automatic reconnection and exponential backoff
-- TUN/TAP interface for IPv6 traffic
+- TCP, TLS, WebSocket and QUIC transports with automatic reconnection and exponential backoff
+- TUN interface for IPv6 traffic
 - Admin socket API (getSelf, getPeers, getTree, getPaths, getSessions, addPeer, removePeer, etc.)
 - Session cleanup and timeout handling
 - Optimized Ed25519→Curve25519 key conversion
@@ -103,12 +133,14 @@ yggdrasil [options]
 | Option | Description |
 |--------|-------------|
 | `-g, --genconf [FILE]` | Generate a new configuration (save to FILE or print to stdout) |
-| `-c, --config FILE` | Config file path (default: `yggdrasil.toml`) |
+| `-c, --config FILE` | Config file path (default: `./<stem>.toml` when the binary name contains a recognised prefix/port suffix, e.g. `ygg_fc` → `./ygg_fc.toml`, otherwise `./yggdrasil.toml`; then the same filename in the OS system directory — see [Default configuration file paths](#default-configuration-file-paths)). |
+
 | `--autoconf` | Run without a configuration file (use ephemeral keys) |
 | `-a, --address` | Print the IPv6 address for the given config and exit |
 | `-s, --subnet` | Print the IPv6 subnet for the given config and exit |
 | `-l, --loglevel LEVEL` | Log level: error, warn, info, debug, trace (default: info) |
 | `-n, --no-replace` | With `--genconf FILE`, skip if the file already exists |
+| `-b, --base FILE` | With `--genconf`, copy `private_key` from this existing config |
 | `--logto FILE` | Log to a file instead of stderr (appends) |
 | `--service` | Run as a Windows service (Windows only) |
 | `--peers PEERS` | Peer URIs. Comma-separated and may be quoted. |
@@ -127,6 +159,8 @@ Generate a default configuration file:
 yggdrasil --genconf > yggdrasil.toml
 # Or save directly to a file:
 yggdrasil --genconf=yggdrasil.toml
+# Reuse private_key from an existing config (new file still uses the current template):
+yggdrasil --genconf=yggdrasil.toml --base=yggdrasil.toml.old
 ```
 
 Edit the configuration to add peers, then start the daemon:
@@ -146,11 +180,34 @@ Print your address without starting the daemon:
 ```bash
 yggdrasil --config yggdrasil.toml --address
 ```
+A non-standard `*00::/7` prefix and admin/multicast port can be selected by renaming the binary or by creating a symlink/hardlink (`ygg_fc`, `yggdrasil_02-9001`, …). That also picks the default config filename, the admin socket and the TUN name, so several overlays can run on one host. Why you would do this, how the name is parsed, and a `ygg_fc` / `fc00::/7` quick start are in **[docs/PREFIX.md](docs/PREFIX.md)**.
 
-A custom `*00::/7` prefix (`00`–`fc`) and port (`1024`–`65535`) can be taken from the name of the binary, symlink or hardlink.
-The last `_` in the filename is the marker; everything after it is parsed by the same rules (e.g. `yggdrasil_029001`, `yggdrasil_02-9001`, `ygg_029001`, `yggdrasil_02.9001.exe`).
-If the name does not provide a valid value the defaults (`0x02` / `9001`) are kept.
-This also affects control-mode commands (`getPeers`, `getTree`, …) and the TUN interface name, so a renamed binary automatically talks to the matching admin socket and uses a matching interface name.
+### Default configuration file paths
+
+When `-c` / `--config` is omitted, the config filename is:
+
+- `<stem>.toml` if the binary/symlink/hardlink name contains a recognised prefix/port suffix (`.exe` is stripped first), e.g. `ygg_fc` / `ygg_fc.exe` → `ygg_fc.toml`;
+- `yggdrasil.toml` otherwise.
+
+That filename is then searched in this order:
+
+1. the current working directory;
+2. the OS system directory, same filename:
+   - Unix-like (Linux except Android, BSD, macOS): `/etc/yggdrasil/<filename>`
+   - Windows: `%ALLUSERSPROFILE%\Yggdrasil-ng\<filename>` (resolved via `SHGetKnownFolderPath(FOLDERID_ProgramData)`, usually `C:\ProgramData\Yggdrasil-ng\`).
+
+If the file exists in either place, the daemon and control commands can be started **without** `-c`.
+```bash
+# Linux — system default for the public mesh
+sudo yggdrasil --genconf=/etc/yggdrasil/yggdrasil.toml
+sudo yggdrasil
+```
+
+```cmd
+:: Windows — system default for the public mesh
+yggdrasil.exe --genconf="%ALLUSERSPROFILE%\Yggdrasil-ng\yggdrasil.toml"
+yggdrasil.exe
+```
 
 Run with adding extra peers from the command line (they are appended to any peers already listed in the config):
 
@@ -219,7 +276,8 @@ Yggdrasil-ng uses **TOML** format for configuration (unlike the Go version which
 | `if_name` | string | TUN interface name: "auto" (default) or "none" to disable |
 | `if_mtu` | integer | TUN MTU (default: 65535) |
 | `if_dns` | array | DNS servers for the TUN interface (Windows only), e.g. `["308:84:68:55::", "308:62:45:62::"]` |
-| `group_password` | string |Closed-network group password for turning the mesh into a private closed network. |
+| `if_gso` | bool | TUN segmentation offload, Linux only (default: false) — see [docs/GSO.md](docs/GSO.md) |
+| `group_password` | string | Closed-network password; empty = open mesh. See [Group password (closed networks)](#group-password-closed-networks) |
 | `session_path_timeout` | integer | Timeout in seconds for both encrypted sessions and cached paths. (60-86400, default: 60) For geeks. |
 | `keepalive_direct` | bool | Send empty traffic to direct peers on a short interval so idle sessions do not expire. (default: false). |
 | `keepalive_remote_count` | integer | LRU size for recently used non-direct destinations to keep alive. (0–1000, default: 0 = off). |
@@ -227,8 +285,11 @@ Yggdrasil-ng uses **TOML** format for configuration (unlike the Go version which
 | `node_info` | table | Custom node metadata (TOML table) |
 | `node_info_privacy` | bool | Hide node info from other nodes (default: false) |
 | `allowed_public_keys` | array | Whitelist of allowed peer keys (empty = allow all) |
+| `max_inbound_links_per_peer` | integer | Max inbound links from one remote key (default: 4, `0` = unlimited). Outbound `peers` are uncapped. |
+| `[[multicast_interfaces]]` | array of tables | LAN multicast discovery (`filter`, `beacon`, `listen`, `port`, `priority`, `password`) |
 | `[tunnel_routing]` | table | CKR tunnel routing config (`ckr` feature, enabled by default) — see [docs/CKR.md](docs/CKR.md) |
 | `[peer_liveness]` | table | Peer liveness / read-deadline policy (fixed or adaptive interval + probe count). Default: fixed mode (`adaptive = false`). See [docs/PEER_LIVENESS.md](docs/PEER_LIVENESS.md) |
+
 **Example minimal configuration:**
 
 ```toml
@@ -308,6 +369,19 @@ peers = [
 ]
 ```
 
+### Group password (closed networks)
+
+`group_password` is a mesh-wide secret. When it is non-empty, this node only finishes encrypted sessions with peers that use the **exact same** string. Empty (the default) is an open network.
+
+It is independent of the per-URI `?password=` on `peers` / `listen` and of `password` on `[[multicast_interfaces]]`. Those only authenticate a **direct link**. `group_password` is folded into the session handshake, so a node that somehow obtained a link still cannot complete a session unless it shares the group secret.
+
+```toml
+# Same non-empty value on every member of a private overlay.
+# Leave commented or empty for the public mesh.
+group_password = "change-me"
+```
+Use group_password together with ?password= on every personal overlay. A different *00::/7 prefix alone does not keep strangers out — see [Protecting an isolated network](docs/PREFIX.md#protecting-an-isolated-network)
+
 ### Differences from Go Version
 
 **Command line:**
@@ -371,10 +445,37 @@ The service is registered under the name `yggdrasil-ng` (display name "Yggdrasil
 Open an elevated (Administrator) command prompt:
 
 ```cmd
-sc create yggdrasil-ng binPath= "C:\path\to\yggdrasil.exe --service -c C:\path\to\yggdrasil.toml" start= auto DisplayName= "Yggdrasil NG"
+sc create yggdrasil-ng binPath= "%ProgramFiles%\Yggdrasil-ng\yggdrasil.exe --service -c %ALLUSERSPROFILE%\Yggdrasil-ng\yggdrasil.toml" start= auto DisplayName= "Yggdrasil NG"
+sc description yggdrasil-ng "Yggdrasil Network router process"
+```
+
+Creating the service without `-c` is also valid when `yggdrasil.toml` already exists in the current directory or in `%ALLUSERSPROFILE%\Yggdrasil-ng\`:
+
+```cmd
+sc create yggdrasil-ng binPath= "%ProgramFiles%\Yggdrasil-ng\yggdrasil.exe --service" start= auto DisplayName= "Yggdrasil NG"
+sc description yggdrasil-ng "Yggdrasil Network router process"
 ```
 
 > **Note:** The spaces after `binPath=`, `start=`, and `DisplayName=` are required by `sc`.
+
+Example of creating a service for PowerShell users, both with and without specifying the configuration file path:
+
+```powershell
+New-Service -Name "yggdrasil-ng" `
+ -BinaryPathName "%ProgramFiles%\Yggdrasil-ng\yggdrasil.exe --service -c %ALLUSERSPROFILE%\Yggdrasil-ng\yggdrasil.toml" `
+  -StartupType Automatic `
+  -DisplayName "Yggdrasil NG" `
+  -Description "Yggdrasil Network router process"
+```
+
+```powershell
+New-Service -Name "yggdrasil-ng" `
+  -BinaryPathName "%ProgramFiles%\Yggdrasil-ng\yggdrasil.exe --service" `
+  -StartupType Automatic `
+  -DisplayName "Yggdrasil NG" `
+  -Description "Yggdrasil Network router process"
+```
+A second service on another prefix (for example `YggFC` + `ygg_fc.exe`) is described in [docs/PREFIX.md](docs/PREFIX.md#windows-service-yggfc).
 
 ### Start / Stop
 
@@ -437,6 +538,24 @@ Yggdrasil-ng is designed to be **wire-compatible** with the original Go implemen
 - Thorough tests are to be made, but some tests with iperf3 show significant improvements over the Go's version.
 - Also, the memory footprint is a lot smaller.
 - And binaries are smaller too :)
+
+### TUN segmentation offload (GSO)
+
+`if_gso = true` (Linux only, off by default) lets the kernel hand over segmented
+buffers in one read/write instead of one syscall per packet.
+
+**It pays off when many small packets arrive back to back — the predicate is
+packet density, not MTU.** Measured over 1 GbE at `if_mtu = 1500`, single stream,
+10 reps per arm on idle hosts: **+18% throughput, −32% sender CPU per gigabit,
+−23% receiver CPU per gigabit**, 20× coalescing, and 6× tighter run-to-run
+variance. It costs about 0.6 ms of loaded latency.
+
+It is inert for bulk transfer at the default MTU — TCP already emits ~64 KB
+segments there, so there is nothing to coalesce — and inert for sparse traffic.
+Enable it for interop with 1500-byte-MTU meshes and for CKR/VPN forwarding.
+
+See **[docs/GSO.md](docs/GSO.md)** for when to enable it, what it costs, and how
+to verify the kernel granted it.
 
 ---
 

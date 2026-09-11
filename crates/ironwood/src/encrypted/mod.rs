@@ -251,6 +251,19 @@ impl EncryptedPacketConn {
     pub fn force_refresh(&self) {
         self.inner.force_refresh();
     }
+
+    /// Like `handle_conn`, but reports the per-link peer id through `id_tx` once
+    /// it is allocated, so callers holding several links to one key can tell the
+    /// resulting `get_peers()` entries apart.
+    pub async fn handle_conn_with_id(
+        &self,
+        key: Addr,
+        conn: Box<dyn crate::types::AsyncConn>,
+        prio: u8,
+        id_tx: Option<tokio::sync::oneshot::Sender<u64>>,
+    ) -> Result<()> {
+        self.inner.handle_conn_with_id(key, conn, prio, id_tx).await
+    }
 }
 
 /// Background reader loop: reads from inner PacketConn, decrypts via sessions, delivers.
@@ -422,6 +435,27 @@ impl crate::types::PacketConn for EncryptedPacketConn {
         Ok((n, Addr(msg.source)))
     }
 
+    fn try_read_from(&self, buf: &mut [u8]) -> Result<Option<(usize, Addr)>> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Error::Closed);
+        }
+
+        let msg = match self.recv_rx.try_lock() {
+            Ok(mut rx) => match rx.try_recv() {
+                Ok(msg) => msg,
+                Err(mpsc::error::TryRecvError::Empty) => return Ok(None),
+                Err(mpsc::error::TryRecvError::Disconnected) => return Err(Error::Closed),
+            },
+            // Another reader holds the receiver; treat it as "nothing for us
+            // right now" rather than blocking on the lock.
+            Err(_) => return Ok(None),
+        };
+
+        let n = buf.len().min(msg.data.len());
+        buf[..n].copy_from_slice(&msg.data[..n]);
+        Ok(Some((n, Addr(msg.source))))
+    }
+    
     async fn write_to(&self, buf: &[u8], addr: &Addr) -> Result<usize> {
         if self.closed.load(Ordering::Relaxed) {
             return Err(Error::Closed);
@@ -463,7 +497,7 @@ impl crate::types::PacketConn for EncryptedPacketConn {
     }
 
     async fn handle_conn(&self, key: Addr, conn: Box<dyn crate::types::AsyncConn>, prio: u8) -> Result<()> {
-        self.inner.handle_conn(key, conn, prio).await
+        self.inner.handle_conn_with_id(key, conn, prio, None).await
     }
 
     fn is_closed(&self) -> bool {

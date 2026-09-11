@@ -117,7 +117,7 @@ impl Core {
 
         let inner = ironwood::new_encrypted_packet_conn(signing_key.clone(), iw_config);
 
-        let active_links = ActiveLinks::new();
+        let active_links = ActiveLinks::new(config.max_inbound_links_per_peer);
 
         // Generate self-signed TLS certificate
         let tls_material = tls::generate_self_signed_cert(&signing_key)
@@ -218,35 +218,57 @@ impl Core {
     ) -> Result<(Range<usize>, Addr), ironwood::Error> {
         loop {
             let (n, addr) = self.inner.read_from(buf).await?;
-            if n == 0 {
-                continue;
+            if let Some(range) = self.dispatch_frame(buf, n, &addr) {
+                return Ok((range, addr));
             }
-            tracing::debug!("Core read: {n} bytes with {} from {}", buf[0], &addr);
-            match buf[0] {
-                TYPE_SESSION_TRAFFIC => {
-                    return Ok((1..n, addr));
-                }
-                TYPE_SESSION_PROTO => {
-                    // Hand the message off to the proto task. This must never
-                    // block: proto handling talks to the router actor and can
-                    // wait on session setup, while this loop is the only source
-                    // of inbound traffic for the TUN. Dropping is safe, remote
-                    // queries time out on the requester side.
-                    if self
-                        .proto_in_tx
-                        .try_send((addr.0, buf[1..n].to_vec()))
-                        .is_err()
-                    {
-                        tracing::debug!("proto queue full, dropping message from {}", &addr);
-                    }
+        }
+    }
 
-                    // Continue reading, don't return proto messages to caller
-                    continue;
-                }
-                _ => {
-                    continue;
-                }
+    /// Non-blocking counterpart to [`read_from`](Self::read_from): returns the
+    /// next traffic packet only if one has already arrived, `Ok(None)`
+    /// otherwise. Protocol messages found along the way are dispatched exactly
+    /// as they are on the blocking path.
+    pub fn try_read_from(
+        &self,
+        buf: &mut [u8],
+    ) -> Result<Option<(Range<usize>, Addr)>, ironwood::Error> {
+        loop {
+            let Some((n, addr)) = self.inner.try_read_from(buf)? else {
+                return Ok(None);
+            };
+            if let Some(range) = self.dispatch_frame(buf, n, &addr) {
+                return Ok(Some((range, addr)));
             }
+        }
+    }
+
+    /// Classify one session frame of `n` bytes sitting in `buf`. Returns the
+    /// payload range for traffic; returns `None` for a frame consumed here (a
+    /// protocol message, handed to the proto task) or ignored, meaning the
+    /// caller should read again.
+    fn dispatch_frame(&self, buf: &[u8], n: usize, addr: &Addr) -> Option<Range<usize>> {
+        if n == 0 {
+            return None;
+        }
+        tracing::debug!("Core read: {n} bytes with {} from {}", buf[0], addr);
+        match buf[0] {
+            TYPE_SESSION_TRAFFIC => Some(1..n),
+            TYPE_SESSION_PROTO => {
+                // Hand the message off to the proto task. This must never
+                // block: proto handling talks to the router actor and can
+                // wait on session setup, while this loop is the only source
+                // of inbound traffic for the TUN. Dropping is safe, remote
+                // queries time out on the requester side.
+                if self
+                    .proto_in_tx
+                    .try_send((addr.0, buf[1..n].to_vec()))
+                    .is_err()
+                {
+                    tracing::debug!("proto queue full, dropping message from {}", addr);
+                }
+                None
+            }
+            _ => None,
         }
     }
 
@@ -355,8 +377,18 @@ impl Core {
     }
 
     /// Handle a new peer connection (delegate to ironwood).
-    pub async fn handle_conn(&self, key: [u8; 32], conn: Box<dyn ironwood::types::AsyncConn>, priority: u8) -> Result<(), ironwood::Error> {
-        self.inner.handle_conn(Addr(key), conn, priority).await
+    ///
+    /// `id_tx`, if given, receives ironwood's per-link peer id once allocated;
+    /// the link layer uses it to attribute RTT/cost per link when a peer holds
+    /// several links at once.
+    pub async fn handle_conn(
+        &self,
+        key: [u8; 32],
+        conn: Box<dyn ironwood::types::AsyncConn>,
+        priority: u8,
+        id_tx: Option<tokio::sync::oneshot::Sender<u64>>,
+    ) -> Result<(), ironwood::Error> {
+        self.inner.handle_conn_with_id(Addr(key), conn, priority, id_tx).await
     }
 
     /// Initialize the links with a reference to this core.
@@ -435,7 +467,13 @@ impl Core {
         // Merge latency/cost from ironwood router
         let iw_peers = self.inner.get_peers().await;
         for p in &mut peers {
-            if let Some(iw) = iw_peers.iter().find(|ip| ip.key == p.key) {
+            // Match on the per-link id so that several links to one key each get
+            // their own RTT/cost; fall back to the key while the id is unknown
+            // (a link registered but not yet allocated in ironwood).
+            let by_id = p
+                .peer_id
+                .and_then(|id| iw_peers.iter().find(|ip| ip.id == id));
+            if let Some(iw) = by_id.or_else(|| iw_peers.iter().find(|ip| ip.key == p.key)) {
                 p.latency_ms = iw.latency_ms;
                 p.cost = iw.cost;
             }
@@ -459,6 +497,7 @@ impl Core {
                     latency_ms: 0.0,
                     cost: 0,
                     last_error,
+                    peer_id: None,
                 });
             }
         }

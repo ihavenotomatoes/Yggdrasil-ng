@@ -72,6 +72,11 @@ pub struct Config {
     pub admin_listen: String,
 
     /// TUN interface name. "auto" for auto-name, "none" to disable.
+    /// "auto" becomes utunN on macOS and tunN on NetBSD/OpenBSD; on
+    /// FreeBSD "auto" is renamed to ygg0 / ygg{prefix}{port} after 
+    /// allocation. Any other value is the interface name as on Linux;
+    /// FreeBSD apply it as an alias of the allocated tunN.
+    /// Windows uses "Yggdrasil", other Unix platforms use "ygg0".
     #[serde(default = "default_if_name")]
     pub if_name: String,
 
@@ -83,6 +88,15 @@ pub struct Config {
     /// IP address strings, e.g. ["201:abcd::1", "201:abcd::2"]. Empty = leave unchanged.
     #[serde(default)]
     pub if_dns_servers: Vec<String>,
+
+    /// Enable GSO (generic segmentation offload) on the TUN interface.
+    /// Linux only; ignored elsewhere.
+    ///
+    /// Worth enabling when many small packets arrive back to back (1500-byte-MTU
+    /// peers, CKR forwarding); inert for bulk transfer at the default MTU. See
+    /// `docs/GSO.md`.
+    #[serde(default)]
+    pub if_gso: bool,
 
     /// Custom node info (arbitrary TOML value).
     #[serde(default = "default_node_info")]
@@ -99,6 +113,14 @@ pub struct Config {
     /// Multicast interface configurations for LAN peer discovery.
     #[serde(default = "default_multicast_interfaces")]
     pub multicast_interfaces: Vec<MulticastInterfaceConfig>,
+
+    /// Maximum number of *inbound* links a single remote public key may hold at
+    /// once. Multiple simultaneous links to one peer (tcp + tls + ws + quic) are
+    /// supported; this bounds how many sockets one remote key can pin on us,
+    /// since the remote side chooses how many to open. `0` = unlimited.
+    /// Outbound links are not capped here — they are governed by the `peers` list.
+    #[serde(default = "default_max_inbound_links_per_peer")]
+    pub max_inbound_links_per_peer: usize,
 
     /// Tunnel routing (CKR) configuration.
     #[cfg(feature = "ckr")]
@@ -327,6 +349,11 @@ fn default_mtu() -> u64 {
     65535
 }
 
+fn default_max_inbound_links_per_peer() -> usize {
+    // Enough for one remote peering to us over tcp/tls/ws/quic at once.
+    4
+}
+
 fn default_node_info() -> toml::Value {
     toml::Value::Table(toml::map::Map::new())
 }
@@ -349,10 +376,12 @@ impl Default for Config {
             if_name: default_if_name(),
             if_mtu: default_mtu(),
             if_dns_servers: Vec::new(),
+            if_gso: false,
             node_info: toml::Value::Table(toml::map::Map::new()),
             node_info_privacy: false,
             allowed_public_keys: Vec::new(),
             multicast_interfaces: default_multicast_interfaces(),
+            max_inbound_links_per_peer: default_max_inbound_links_per_peer(),
             #[cfg(feature = "ckr")]
             tunnel_routing: TunnelRoutingConfig::default(),
             firewall: FirewallConfig::default(),
@@ -383,6 +412,26 @@ impl Config {
         let signing_key = SigningKey::generate(&mut OsRng);
         let key_hex = hex::encode(signing_key.to_keypair_bytes());
         CONFIG_TEMPLATE.replace("{{PRIVATE_KEY}}", &key_hex)
+    }
+
+    /// Generate a commented config file using an already-known hex private key
+    /// instead of minting a new keypair.
+    pub fn generate_config_text_from_private_key(key_hex: &str) -> String {
+        CONFIG_TEMPLATE.replace("{{PRIVATE_KEY}}", key_hex)
+    }
+
+    /// Read `private_key` from an existing TOML config string.
+    ///
+    /// Other fields are ignored. The key must be present, non-empty and a
+    /// valid 64-byte Ed25519 keypair hex (same rules as `signing_key()`).
+    pub fn private_key_from_toml(user_toml: &str) -> Result<String, String> {
+        let cfg: Config = toml::from_str(user_toml)
+            .map_err(|e| format!("invalid base config TOML: {}", e))?;
+        if cfg.private_key.is_empty() {
+            return Err("base config has empty private_key".to_string());
+        }
+        let _ = cfg.signing_key()?;
+        Ok(cfg.private_key)
     }
 
     /// Read a TOML config string, add any fields missing from the user's input
@@ -679,5 +728,66 @@ mod normalize_tests {
         let cfg: Config = toml::from_str(text).unwrap();
         assert_eq!(cfg.keepalive_remote_count, 16);
         assert!(!cfg.keepalive_direct);
+    }
+}
+
+#[cfg(test)]
+mod private_key_from_toml_tests {
+    use super::*;
+
+    #[test]
+    fn generate_from_private_key_inserts_exact_hex() {
+        let generated = Config::generate_config_text();
+        let key = Config::private_key_from_toml(&generated).unwrap();
+        assert_eq!(key.len(), 128, "ed25519 keypair hex must be 128 chars");
+
+        let reused = Config::generate_config_text_from_private_key(&key);
+        assert!(
+            reused.contains(&format!("private_key = \"{key}\"")),
+            "generated text must contain the supplied private_key:\n{reused}"
+        );
+        let parsed: Config = toml::from_str(&reused).unwrap();
+        assert_eq!(parsed.private_key, key);
+        assert!(reused.contains("peers = []"));
+        assert!(reused.contains("[firewall]"));
+    }
+
+    #[test]
+    fn private_key_from_toml_reads_only_the_key() {
+        let toml_text = "private_key = \"aabb\"\npeers = [\"tcp://127.0.0.1:1\"]\n";
+        let err = Config::private_key_from_toml(toml_text).unwrap_err();
+        assert!(
+            err.contains("64 bytes") || err.contains("invalid private key"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn private_key_from_toml_rejects_empty_key() {
+        let err = Config::private_key_from_toml("private_key = \"\"\n").unwrap_err();
+        assert_eq!(err, "base config has empty private_key");
+    }
+
+    #[test]
+    fn private_key_from_toml_rejects_missing_key() {
+        let err = Config::private_key_from_toml("peers = []\n").unwrap_err();
+        assert_eq!(err, "base config has empty private_key");
+    }
+
+    #[test]
+    fn private_key_from_toml_rejects_invalid_toml() {
+        let err = Config::private_key_from_toml("this is = = not toml\n").unwrap_err();
+        assert!(
+            err.starts_with("invalid base config TOML:"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn private_key_from_toml_accepts_valid_generated_key() {
+        let generated = Config::generate_config_text();
+        let key = Config::private_key_from_toml(&generated).unwrap();
+        assert_eq!(key.len(), 128);
+        assert!(generated.contains(&key));
     }
 }

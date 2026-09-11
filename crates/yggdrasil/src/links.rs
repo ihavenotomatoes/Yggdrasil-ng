@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::atomic::{ AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -377,6 +377,17 @@ impl Drop for CountingStream {
     }
 }
 
+/// Compare two remote sockets on address, port and (for IPv6) scope id,
+/// ignoring `flowinfo`, which carries no identity and is not always set.
+fn same_socket(a: &SocketAddr, b: &SocketAddr) -> bool {
+    match (a, b) {
+        (SocketAddr::V6(a), SocketAddr::V6(b)) => {
+            a.ip() == b.ip() && a.port() == b.port() && a.scope_id() == b.scope_id()
+        }
+        _ => a == b,
+    }
+}
+
 /// Snapshot of a link's current state (for admin API).
 #[derive(Clone, Debug)]
 pub struct LinkPeerInfo {
@@ -393,6 +404,9 @@ pub struct LinkPeerInfo {
     pub latency_ms: f64,
     pub cost: u64,
     pub last_error: Option<String>,
+    /// ironwood's per-link peer id, or `None` if not yet known. Several links
+    /// may share `key`; this is what tells their stats apart.
+    pub peer_id: Option<u64>,
 }
 
 /// Fired when a peer connection is established or lost.
@@ -409,6 +423,10 @@ pub struct ActiveLinks {
     inner: Arc<Mutex<ActiveLinksInner>>,
     pub ban_list: BanList,
     peer_tx: broadcast::Sender<PeerEvent>,
+    /// Cap on simultaneous *inbound* links per remote key (0 = unlimited).
+    /// Outbound links are uncapped: each one traces back to a `peers` entry in
+    /// the config (or a multicast beacon), which is deduped before dialling.
+    max_inbound_links_per_peer: usize,
 }
 
 pub struct ActiveLinksInner {
@@ -416,13 +434,34 @@ pub struct ActiveLinksInner {
     connections: HashMap<u64, ActiveConn>,
 }
 
+/// Sentinel for "ironwood has not reported a peer id for this link yet".
+pub(crate) const NO_PEER_ID: u64 = u64::MAX;
+
+/// Why [`ActiveLinks::register`] turned a freshly handshaked link away.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RegisterRefusal {
+    /// A link to this key over this exact remote socket, in this direction,
+    /// is already up — typically two dials that raced.
+    DuplicateSocket,
+    /// The key already holds `max_inbound_links_per_peer` inbound links.
+    InboundLimit,
+}
+
 struct ActiveConn {
     uri: String,
+    /// Resolved remote socket, when the transport could report one. Used to tell
+    /// "already linked to this exact socket" from "another link to the same key",
+    /// which the URI string cannot do (multicast URIs embed the interface name).
+    remote_addr: Option<SocketAddr>,
     inbound: bool,
     key: [u8; 32],
     priority: u8,
     rx: Arc<AtomicUsize>,
     tx: Arc<AtomicUsize>,
+    /// ironwood's per-link peer id, filled in once `handle_conn` allocates it.
+    /// Used to line each row up with its own RTT/cost when several links share
+    /// one key. `NO_PEER_ID` until known.
+    peer_id: Arc<AtomicU64>,
     rx_rate: Arc<AtomicUsize>,
     tx_rate: Arc<AtomicUsize>,
     last_rx: usize,
@@ -431,7 +470,7 @@ struct ActiveConn {
 }
 
 impl ActiveLinks {
-    pub fn new() -> Self {
+    pub fn new(max_inbound_links_per_peer: usize) -> Self {
         let (peer_tx, _) = broadcast::channel(16);
         Self {
             inner: Arc::new(Mutex::new(ActiveLinksInner {
@@ -440,6 +479,7 @@ impl ActiveLinks {
             })),
             ban_list: BanList::new(),
             peer_tx,
+            max_inbound_links_per_peer,
         }
     }
 
@@ -450,25 +490,54 @@ impl ActiveLinks {
     }
     
 
-    async fn register(&self, uri: String, inbound: bool, key: [u8; 32], priority: u8) -> Option<(u64, Arc<AtomicUsize>, Arc<AtomicUsize>)> {
+    async fn register(
+        &self,
+        uri: String,
+        remote_addr: Option<SocketAddr>,
+        inbound: bool,
+        key: [u8; 32],
+        priority: u8,
+    ) -> Result<(u64, Arc<AtomicUsize>, Arc<AtomicUsize>, Arc<AtomicU64>), RegisterRefusal> {
         let mut inner = self.inner.lock().await;
-        // Reject duplicate: same key + same direction
-        if inner.connections.values().any(|c| c.key == key && c.inbound == inbound) {
-            return None;
+        // Several links to one peer are allowed — the routing core reuses a
+        // single peer port per key — but only over *distinct* remote sockets.
+        let duplicate_socket = remote_addr.is_some_and(|addr| {
+            inner.connections.values().any(|c| {
+                c.key == key
+                    && c.inbound == inbound
+                    && c.remote_addr.is_some_and(|a| same_socket(&a, &addr))
+            })
+        });
+        if duplicate_socket {
+            return Err(RegisterRefusal::DuplicateSocket);
+        }
+        if inbound
+            && self.max_inbound_links_per_peer > 0
+            && inner
+                .connections
+                .values()
+                .filter(|c| c.key == key && c.inbound)
+                .count()
+                >= self.max_inbound_links_per_peer
+        {
+            return Err(RegisterRefusal::InboundLimit);
         }
         let id = inner.next_id;
         inner.next_id += 1;
         let rx = Arc::new(AtomicUsize::new(0));
         let tx = Arc::new(AtomicUsize::new(0));
+        let peer_id = Arc::new(AtomicU64::new(NO_PEER_ID));
         inner.connections.insert(
             id,
             ActiveConn {
                 uri: uri.clone(),
+                remote_addr,
                 inbound,
                 key,
                 priority,
                 rx: rx.clone(),
                 tx: tx.clone(),
+                peer_id: peer_id.clone(),
                 rx_rate: Arc::new(AtomicUsize::new(0)),
                 tx_rate: Arc::new(AtomicUsize::new(0)),
                 last_rx: 0,
@@ -478,7 +547,7 @@ impl ActiveLinks {
         );
         drop(inner);
         let _ = self.peer_tx.send(PeerEvent::Connected { key, uri, inbound });
-        Some((id, rx, tx))
+        Ok((id, rx, tx, peer_id))
     }
 
     async fn unregister(&self, id: u64) {
@@ -535,10 +604,15 @@ impl ActiveLinks {
         self.peer_tx.subscribe()
     }
 
-    /// Check if there is an active connection to the given public key.
-    pub async fn has_key(&self, key: &[u8; 32]) -> bool {
+    /// Check if there is an active connection to `key` over exactly this remote
+    /// socket. Multiple links per key are allowed, so multicast matches on
+    /// key + socket rather than the key alone.
+    pub async fn has_key_addr(&self, key: &[u8; 32], addr: &SocketAddr) -> bool {
         let inner = self.inner.lock().await;
-        inner.connections.values().any(|c| &c.key == key)
+        inner
+            .connections
+            .values()
+            .any(|c| &c.key == key && c.remote_addr.as_ref().is_some_and(|a| same_socket(a, addr)))
     }
 
     /// Get a snapshot of all active connections for the admin API.
@@ -561,6 +635,10 @@ impl ActiveLinks {
                 latency_ms: 0.0,
                 cost: 0,
                 last_error: None,
+                peer_id: match c.peer_id.load(Ordering::Relaxed) {
+                    NO_PEER_ID => None,
+                    id => Some(id),
+                },
             })
             .collect()
     }
@@ -1212,7 +1290,8 @@ pub(crate) async fn handle_connection(
     } else {
         "outbound"
     };
-    let peer_addr = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
+    let remote_sock = stream.peer_addr().ok();
+    let peer_addr = remote_sock.map(|a| a.to_string()).unwrap_or_default();
     tracing::info!(
         "Connected {}: {} @ {} (v{}.{})",
         direction,
@@ -1222,14 +1301,31 @@ pub(crate) async fn handle_connection(
         remote_meta.minor_ver
     );
 
-    // Register in active links (rejects duplicate key+direction)
+    // Register in active links. Several links per key are fine, as long as they
+    // run over distinct remote sockets; inbound links are additionally capped.
     let inbound = link_type == LinkType::Incoming;
-    let (conn_id, rx_counter, tx_counter) = match active
-        .register(uri.to_string(), inbound, remote_meta.public_key, priority)
+    let (conn_id, rx_counter, tx_counter, peer_id_slot) = match active
+        .register(uri.to_string(), remote_sock, inbound, remote_meta.public_key, priority)
         .await
     {
-        Some(r) => r,
-        None => return Err("duplicate connection".to_string()),
+        Ok(r) => r,
+        Err(RegisterRefusal::InboundLimit) => {
+            tracing::info!(
+                "Rejected inbound from {} @ {}: max_inbound_links_per_peer reached",
+                remote_addr,
+                peer_addr
+            );
+            return Err("inbound link limit reached for peer".to_string());
+        }
+        Err(RegisterRefusal::DuplicateSocket) => {
+            tracing::debug!(
+                "Dropped {} link to {} @ {}: already linked over this socket",
+                direction,
+                remote_addr,
+                peer_addr
+            );
+            return Err("already linked to this peer over this socket".to_string());
+        }
     };
 
     let conn_start = Instant::now();
@@ -1237,9 +1333,18 @@ pub(crate) async fn handle_connection(
     // Wrap stream to count bytes
     let counting_stream = CountingStream::new(stream, rx_counter, tx_counter);
 
+    // ironwood reports the per-link peer id once it has allocated one; record it
+    // so `getPeers` can attribute RTT/cost to the right link.
+    let (id_tx, id_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        if let Ok(id) = id_rx.await {
+            peer_id_slot.store(id, Ordering::Relaxed);
+        }
+    });
+
     // Hand off to ironwood (blocks until peer disconnects)
     let result = core
-        .handle_conn(remote_meta.public_key, Box::new(counting_stream), priority)
+        .handle_conn(remote_meta.public_key, Box::new(counting_stream), priority, Some(id_tx))
         .await
         .map_err(|e| format!("ironwood: {}", e));
 
@@ -1561,5 +1666,127 @@ mod tests {
     fn test_parse_link_options_maxbackoff_too_small() {
         let url = Url::parse("tcp://example.com:12345?maxbackoff=3s").unwrap();
         assert!(parse_link_options(&url).is_err());
+    }
+
+    /// Register a link with a synthetic URI, no resolved socket.
+    async fn register_link(links: &ActiveLinks, n: usize, inbound: bool, key: [u8; 32]) -> bool {
+        links
+            .register(format!("tcp://[::1]:{}", 9000 + n), None, inbound, key, 0)
+            .await
+            .is_ok()
+    }
+
+    /// Register a link over a concrete remote socket.
+    async fn register_sock(
+        links: &ActiveLinks,
+        sock: SocketAddr,
+        inbound: bool,
+        key: [u8; 32],
+    ) -> Result<u64, RegisterRefusal> {
+        links
+            .register(format!("tls://{}", sock), Some(sock), inbound, key, 0)
+            .await
+            .map(|r| r.0)
+    }
+
+    #[tokio::test]
+    async fn test_inbound_links_capped_per_key() {
+        let links = ActiveLinks::new(3);
+        let key = [7u8; 32];
+
+        let mut ids = Vec::new();
+        for n in 0..3 {
+            let reg = links
+                .register(format!("tcp://[::1]:{}", 9000 + n), None, true, key, 0)
+                .await;
+            ids.push(reg.expect("inbound link below the cap must be accepted").0);
+        }
+
+        assert!(!register_link(&links, 3, true, key).await);
+        assert!(register_link(&links, 4, true, [8u8; 32]).await);
+        links.unregister(ids[0]).await;
+        assert!(register_link(&links, 5, true, key).await);
+    }
+
+    #[tokio::test]
+    async fn test_outbound_links_uncapped() {
+        let links = ActiveLinks::new(1);
+        let key = [7u8; 32];
+        for n in 0..8 {
+            assert!(register_link(&links, n, false, key).await);
+        }
+        assert_eq!(links.get_peers().await.len(), 8);
+    }
+
+    #[tokio::test]
+    async fn test_inbound_cap_does_not_block_outbound() {
+        let links = ActiveLinks::new(2);
+        let key = [7u8; 32];
+        assert!(register_link(&links, 0, true, key).await);
+        assert!(register_link(&links, 1, true, key).await);
+        assert!(!register_link(&links, 2, true, key).await);
+        assert!(register_link(&links, 3, false, key).await);
+    }
+
+    #[tokio::test]
+    async fn test_unlimited_inbound_links_when_zero() {
+        let links = ActiveLinks::new(0);
+        let key = [7u8; 32];
+        for n in 0..16 {
+            assert!(register_link(&links, n, true, key).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_socket_link_refused() {
+        use std::net::{Ipv6Addr, SocketAddrV6};
+
+        let links = ActiveLinks::new(0);
+        let key = [7u8; 32];
+        let sock = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 9001, 0, 2));
+        let first = register_sock(&links, sock, false, key).await.unwrap();
+
+        assert_eq!(
+            register_sock(&links, sock, false, key).await,
+            Err(RegisterRefusal::DuplicateSocket)
+        );
+
+        let other_port = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 9002, 0, 2));
+        assert!(register_sock(&links, other_port, false, key).await.is_ok());
+        let other_iface = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 9001, 0, 3));
+        assert!(register_sock(&links, other_iface, false, key).await.is_ok());
+        assert!(register_sock(&links, sock, false, [8u8; 32]).await.is_ok());
+        assert!(register_sock(&links, sock, true, key).await.is_ok());
+
+        links.unregister(first).await;
+        assert!(register_sock(&links, sock, false, key).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_links_without_socket_are_not_deduped() {
+        let links = ActiveLinks::new(0);
+        let key = [7u8; 32];
+        for n in 0..4 {
+            assert!(register_link(&links, n, false, key).await);
+        }
+        assert_eq!(links.get_peers().await.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_has_key_addr_matches_socket_not_key() {
+        use std::net::{Ipv6Addr, SocketAddrV6};
+
+        let links = ActiveLinks::new(0);
+        let key = [7u8; 32];
+        let sock = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 9001, 0, 2));
+        assert!(links
+            .register("tls://[::1%eth0]:9001".into(), Some(sock), false, key, 0)
+            .await
+            .is_ok());
+
+        assert!(links.has_key_addr(&key, &sock).await);
+        let other_iface = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 9001, 0, 3));
+        assert!(!links.has_key_addr(&key, &other_iface).await);
+        assert!(!links.has_key_addr(&[8u8; 32], &sock).await);
     }
 }

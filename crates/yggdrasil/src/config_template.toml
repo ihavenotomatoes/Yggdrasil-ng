@@ -57,6 +57,18 @@ if_mtu = 65535
 # DNS servers inside the Yggdrasil network. Ignored on other platforms.
 # if_dns_servers = ["308:84:68:55::", "308:62:45:62::"]
 
+# Enable GSO (generic segmentation offload) on the TUN interface. This lets the
+# kernel hand over large segmented buffers in a single read/write instead of one
+# syscall per packet. Linux only; ignored elsewhere.
+#
+# It pays off when many small packets arrive back to back -- peering with
+# 1500-byte-MTU meshes, or forwarding CKR/VPN traffic -- where it cut CPU per
+# gigabit by about a third in testing. It does nothing for bulk transfer at the
+# default MTU (segments already arrive at ~64 KB, so there is nothing to
+# coalesce) and nothing for sparse traffic, and it costs about 0.6 ms of loaded
+# latency. See docs/GSO.md.
+# if_gso = false
+
 # Closed-network group password. When set, this node only establishes encrypted
 # sessions with peers that use the EXACT same password, turning the mesh into a
 # private closed network. Every member must share the same value;
@@ -130,6 +142,14 @@ if_mtu = 65535
 # List of allowed public keys (hex-encoded). If non-empty, only peers with
 # these public keys will be allowed to connect. Leave empty to allow all peers.
 # allowed_public_keys = []
+
+# Maximum number of simultaneous *inbound* links from a single remote public key.
+# Several links to one peer over different transports (tcp + tls + ws + quic) are
+# supported and all stay up; this only bounds how many inbound sockets one remote
+# key can pin on us, since the remote side decides how many to open.
+# 0 = unlimited. Outbound links are not capped here — they are governed by the
+# `peers` list above.
+# max_inbound_links_per_peer = 4
 
 # Multicast peer discovery — automatically finds and connects to nearby nodes
 # on the local network without manual configuration.
