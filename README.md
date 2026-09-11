@@ -25,7 +25,10 @@
 > - Session and path keepalives (`session_path_timeout`, `keepalive_direct`, `keepalive_remote_count`, `keepalive_interval`) — [Key configuration options](#config-file-format-toml)
 >
 > - CKR route lists from `file://` and `http(s)://`, and `_` (system routes without a CKR tunnel) — [docs/CKR.md](docs/CKR.md#configuration)
-> - A second Windows service on another prefix (for example `YggFC` + `ygg_fc.exe`) — [docs/PREFIX.md](docs/PREFIX.md#windows-service-yggfc)
+>
+> - FreeBSD: auto-created TUN is renamed to a Linux-like `ygg0` / `ygg{prefix}{port}`; shutdown destroys that alias
+>
+>- NetBSD / OpenBSD: the TUN is created at the stock kernel MTU, then the highest accepted MTU is probed and and increased whenever possible
 
 A Rust rewrite of the [Yggdrasil Network](https://yggdrasil-network.github.io/) — an early-stage implementation of a fully end-to-end encrypted IPv6 networking protocol.
 This project aims to provide a lightweight, self-arranging, and secure mesh network alternative to the original Go implementation.
