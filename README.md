@@ -1,5 +1,24 @@
 # Yggdrasil-ng
 
+> **⚠️ This is not the upstream `master` branch. 🔰**
+>
+> This tree is the `development` branch of a fork that is slightly ahead of [Revertron/Yggdrasil-ng](https://github.com/Revertron/Yggdrasil-ng) `master`. It is not a drop-in replacement for that `master`. If you want the stable upstream tree, please use https://github.com/Revertron/Yggdrasil-ng instead.
+>
+> Extra features in this branch:
+>
+> - Custom `*00::/7` prefix and admin/multicast port taken from the binary / symlink / hardlink name — [docs/PREFIX.md](docs/PREFIX.md). As a complementary network to the public Yggdrasil Network, a private overlay network on a separate prefix is convenient to use together with `group_password` and with per-link `?password=` — [Group password (closed networks)](#group-password-closed-networks), [Protecting an isolated network](docs/PREFIX.md#protecting-an-isolated-network)
+> - A matching default config filename and TUN name [Default configuration file paths](#default-configuration-file-paths), [`-c` / `--config`](#command-line-options)
+> - Reuse an existing `private_key` when generating a new template (`-b` / `--base`) — [Command Line Options](#command-line-options), [Starting Yggdrasil](#starting-yggdrasil)
+> - Extra peers from the command line (`--peers`) — [Command Line Options](#command-line-options)
+> - Several simultaneous links to the same peer (different transports or
+  sockets), capped on inbound by `max_inbound_links_per_peer` — [Key configuration options](#config-file-format-toml)
+
+> - Linux TUN GSO (`if_gso`) — [docs/GSO.md](docs/GSO.md), [TUN segmentation offload (GSO)](#tun-segmentation-offload-gso)
+> - Peer liveness / read-deadline policy (`[peer_liveness]`) — [docs/PEER_LIVENESS.md](docs/PEER_LIVENESS.md)
+> - Session and path keepalives (`session_path_timeout`, `keepalive_direct`, `keepalive_remote_count`, `keepalive_interval`) — [Key configuration options](#config-file-format-toml)
+> - CKR route lists from `file://` and `https://`, and `_` (system routes without a CKR tunnel) — [docs/CKR.md](docs/CKR.md#configuration)
+> - A second Windows service on another prefix (for example `YggFC` + `ygg_fc.exe`) — [docs/PREFIX.md](docs/PREFIX.md#windows-service-yggfc)
+
 A Rust rewrite of the [Yggdrasil Network](https://yggdrasil-network.github.io/) — an early-stage implementation of a fully end-to-end encrypted IPv6 networking protocol.
 This project aims to provide a lightweight, self-arranging, and secure mesh network alternative to the original Go implementation.
 
@@ -255,6 +274,7 @@ Yggdrasil-ng uses **TOML** format for configuration (unlike the Go version which
 | `node_info` | table | Custom node metadata (TOML table) |
 | `node_info_privacy` | bool | Hide node info from other nodes (default: false) |
 | `allowed_public_keys` | array | Whitelist of allowed peer keys (empty = allow all) |
+| `max_inbound_links_per_peer` | integer | Max inbound links from one remote key (default: 4, `0` = unlimited). Outbound `peers` are uncapped. |
 | `[[multicast_interfaces]]` | array of tables | LAN multicast discovery (`filter`, `beacon`, `listen`, `port`, `priority`, `password`) |
 | `[tunnel_routing]` | table | CKR tunnel routing config (`ckr` feature, enabled by default) — see [docs/CKR.md](docs/CKR.md) |
 | `[peer_liveness]` | table | Peer liveness / read-deadline policy (fixed or adaptive interval + probe count). Default: fixed mode (`adaptive = false`). See [docs/PEER_LIVENESS.md](docs/PEER_LIVENESS.md) |
