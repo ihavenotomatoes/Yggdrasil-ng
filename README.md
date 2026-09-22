@@ -26,9 +26,11 @@
 >
 > - CKR route lists from `file://` and `http(s)://`, and `_` (system routes without a CKR tunnel) — [docs/CKR.md](docs/CKR.md#configuration)
 >
+> - Config `include = "PATH"` lines, spliced in place (nested files, extra `peers` / CKR table keys) — [Including other files](#including-other-files)
+>
 > - FreeBSD: auto-created TUN is renamed to a Linux-like `ygg0` / `ygg{prefix}{port}`; shutdown destroys that alias
 >
->- NetBSD / OpenBSD: the TUN is created at the stock kernel MTU, then the highest accepted MTU is probed and and increased whenever possible
+> - NetBSD / OpenBSD: the TUN is created at the stock kernel MTU, then the highest accepted MTU is probed and and increased whenever possible
 
 A Rust rewrite of the [Yggdrasil Network](https://yggdrasil-network.github.io/) — an early-stage implementation of a fully end-to-end encrypted IPv6 networking protocol.
 This project aims to provide a lightweight, self-arranging, and secure mesh network alternative to the original Go implementation.
@@ -270,6 +272,7 @@ Yggdrasil-ng uses **TOML** format for configuration (unlike the Go version which
 | Option | Type | Description |
 |--------|------|-------------|
 | `private_key` | string | Hex-encoded Ed25519 private key (128 hex chars, 64 bytes) |
+| `include` | string, repeatable | Replace this line with the text of another file. Relative paths are resolved against the file that contains the line. See [Including other files](#including-other-files) |
 | `peers` | array | Peer URIs to connect to, e.g. `["tcp://host:port"]` |
 | `listen` | array | Listen addresses, e.g. `["tcp://[::]:1234"]` |
 | `admin_listen` | string | Admin socket address, e.g. `"tcp://localhost:9001"` |
@@ -317,6 +320,52 @@ if_mtu = 65535
 name = "my-node"
 location = "datacenter-1"
 ```
+
+### Including other files
+
+An uncommented `include = "PATH"` or `include = 'PATH'` line is replaced with the contents of that file before the document is parsed. Repeat the line for several files; included files may contain further `include` lines. A missing file is skipped with a warning and startup continues.
+
+The included text is spliced **in place of that line**, so it must be valid TOML at that position:
+
+- a top-level fragment (other keys or tables);
+- extra elements inside an array such as `peers` / `listen`;
+- extra keys inside a table such as `[tunnel_routing.remote_subnets]`.
+
+Do not repeat a key or table header that already exists around the include line. Commented `# include = "..."` lines are ignored.
+
+```toml
+private_key = "0123456789abcdef..."
+
+peers = [
+    "tcp://192.0.2.1:443",
+include = "yggdrasil-peers.toml"
+]
+
+[tunnel_routing]
+enable = true
+
+[tunnel_routing.remote_subnets]
+include = "/etc/yggdrasil/yggdrasil-ckr.toml"
+```
+
+yggdrasil-peers.toml holds only array elements:
+```toml
+    "tcp://192.0.2.2:443",
+    "tcp://[2001:db8::1]:12345",
+```
+
+yggdrasil-ckr.toml holds only table keys:
+```toml
+"peer_public_key_hex_1" = ["10.99.0.0/24"]
+"peer_public_key_hex_2" = ["fd03:1:2:3::/64"]
+```
+
+##### Important note
+`--normalize` is refused while any include line is uncommented. `--genconf=...` `--base=...` reads private_key only from the `--base=...` file itself and does not follow its include lines.
+
+
+
+
 
 ### Transports
 

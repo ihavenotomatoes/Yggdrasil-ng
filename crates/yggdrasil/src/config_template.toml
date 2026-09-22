@@ -204,3 +204,17 @@ open_tcp = [22, 80, 443]
 open_udp = [53]
 # open_all_for = ["200:abcd:1234::/48"]   # trusted friend subnets
 allow_icmp_echo = true
+
+# Extra configuration text spliced in place of each uncommented
+# `include = "PATH"` line (relative paths are resolved against the
+# directory of the file that contains the line). Repeat the line for
+# several files; nested include lines are followed. A missing file is
+# skipped with a warning.
+#
+# The included file must be valid at that position: a full top-level
+# fragment, extra `peers = [ ... ]` elements inside an array, or extra
+# keys inside a table such as [tunnel_routing.remote_subnets]. Do not
+# repeat a key or table header that already exists around the include
+# line. --normalize is refused while any include line is uncommented.
+# include = "yggdrasil-peers.toml"
+# include = "/etc/yggdrasil/yggdrasil-listen.toml"

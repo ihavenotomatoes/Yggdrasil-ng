@@ -7,7 +7,7 @@ use tracing_subscriber::{fmt, EnvFilter};
 
 use yggdrasil::address::{addr_for_key, subnet_for_key};
 use yggdrasil::admin::AdminSocket;
-use yggdrasil::config::Config;
+use yggdrasil::config::{expand_config_includes, Config};
 use yggdrasil::core::Core;
 use yggdrasil::ipv6rwc::ReadWriteCloser;
 
@@ -184,46 +184,48 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
     init_logging(&loglevel, logto.as_deref());
 
-    // Load config
-    let config = if autoconf {
-        Config::default()
-    } else {
-        load_config_file(&config_path)?
-    };
+    if address || subnet {
+        // Load config
+        let config = if autoconf {
+            Config::default()
+        } else {
+            load_config_file(&config_path)?
+        };
 
-    // Parse or generate signing key
-    // Priority: config file > YGGDRASIL_PRIVATE_KEY env var > ephemeral
-    let signing_key = if !config.private_key.is_empty() {
-        config
-            .signing_key()
-            .map_err(|e| format!("invalid private key: {}", e))?
-    } else if let Ok(env_key) = std::env::var("YGGDRASIL_PRIVATE_KEY") {
-        tracing::info!("Using private key from YGGDRASIL_PRIVATE_KEY environment variable");
-        let bytes = hex::decode(&env_key)
-            .map_err(|e| format!("invalid YGGDRASIL_PRIVATE_KEY hex: {}", e))?;
-        let key_bytes: [u8; 64] = bytes.try_into()
-            .map_err(|v: Vec<u8>| format!("YGGDRASIL_PRIVATE_KEY should be 64 bytes, got {}", v.len()))?;
-        SigningKey::from_keypair_bytes(&key_bytes)
-            .map_err(|e| format!("invalid YGGDRASIL_PRIVATE_KEY: {}", e))?
-    } else {
-        tracing::warn!("No private key configured, generating ephemeral key");
-        SigningKey::generate(&mut rand::rngs::OsRng)
-    };
+        // Parse or generate signing key
+        // Priority: config file > YGGDRASIL_PRIVATE_KEY env var > ephemeral
+        let signing_key = if !config.private_key.is_empty() {
+            config
+                .signing_key()
+                .map_err(|e| format!("invalid private key: {}", e))?
+        } else if let Ok(env_key) = std::env::var("YGGDRASIL_PRIVATE_KEY") {
+            tracing::info!("Using private key from YGGDRASIL_PRIVATE_KEY environment variable");
+            let bytes = hex::decode(&env_key)
+                .map_err(|e| format!("invalid YGGDRASIL_PRIVATE_KEY hex: {}", e))?;
+            let key_bytes: [u8; 64] = bytes.try_into()
+                .map_err(|v: Vec<u8>| format!("YGGDRASIL_PRIVATE_KEY should be 64 bytes, got {}", v.len()))?;
+            SigningKey::from_keypair_bytes(&key_bytes)
+                .map_err(|e| format!("invalid YGGDRASIL_PRIVATE_KEY: {}", e))?
+        } else {
+            tracing::warn!("No private key configured, generating ephemeral key");
+            SigningKey::generate(&mut rand::rngs::OsRng)
+        };
 
-    let public_key = signing_key.verifying_key().to_bytes();
+        let public_key = signing_key.verifying_key().to_bytes();
 
-    // --address: print address and exit
-    if address {
-        let addr = addr_for_key(&public_key);
-        println!("{}", addr);
-        return Ok(());
-    }
+        // --address: print address and exit
+        if address {
+            let addr = addr_for_key(&public_key);
+            println!("{}", addr);
+            return Ok(());
+        }
 
-    // --subnet: print subnet and exit
-    if subnet {
-        let subnet = subnet_for_key(&public_key);
-        println!("{}", subnet);
-        return Ok(());
+        // --subnet: print subnet and exit
+        if subnet {
+            let subnet = subnet_for_key(&public_key);
+            println!("{}", subnet);
+            return Ok(());
+        }
     }
 
     // Shutdown on Ctrl+C, or on SIGTERM from a service manager.
@@ -697,6 +699,8 @@ fn rewrite_admin_listen_in_genconf_text(text: &str, port: u16) -> String {
 
 /// Build genconf text. If `base_path` is set, reuse `private_key` from that
 /// TOML file; otherwise mint a new keypair (existing generate_config_text()).
+/// Include files referenced by the base document are not opened: only the
+/// `private_key` in `base_path` itself is used.
 fn generate_config_text_maybe_from_base(
     base_path: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error>> {
@@ -1033,8 +1037,8 @@ fn system_config_path(filename: &str) -> String {
 /// no path was given). Other I/O and TOML errors are left unchanged.
 fn load_config_file(path: &str) -> Result<Config, Box<dyn std::error::Error>> {
     let open_path = expand_genconf_path(path);
-    let file = match File::open(&open_path) {
-        Ok(f) => f,
+    match File::open(&open_path) {
+        Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             eprintln!(
                 "Error: Can't find the configuration file. Create a configuration file with:\n    {} --genconf={}\n\n{}",
@@ -1047,7 +1051,10 @@ fn load_config_file(path: &str) -> Result<Config, Box<dyn std::error::Error>> {
         }
         Err(e) => return Err(e.into()),
     };
-    let text = std::io::read_to_string(file)?;
+    let (text, warnings) = expand_config_includes(Path::new(&open_path));
+    for warning in warnings {
+        tracing::warn!("{}", warning);
+    }
     Ok(toml::from_str::<Config>(&text)?)
 }
 
