@@ -698,9 +698,9 @@ fn rewrite_admin_listen_in_genconf_text(text: &str, port: u16) -> String {
 }
 
 /// Build genconf text. If `base_path` is set, reuse `private_key` from that
-/// TOML file; otherwise mint a new keypair (existing generate_config_text()).
-/// Include files referenced by the base document are not opened: only the
-/// `private_key` in `base_path` itself is used.
+/// TOML file (after splicing its `include` lines); otherwise mint a new
+/// keypair (existing generate_config_text()). Other fields from the base
+/// file and from its includes are not copied into the new template.
 fn generate_config_text_maybe_from_base(
     base_path: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error>> {
@@ -708,13 +708,17 @@ fn generate_config_text_maybe_from_base(
         None => Config::generate_config_text(),
         Some(path) => {
             let path = expand_genconf_path(path);
-            let text = match std::fs::read_to_string(&path) {
-                Ok(t) => t,
+            match File::open(&path) {
+                Ok(_) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     return Err(format!("base configuration file not found: {}", path).into());
                 }
                 Err(e) => return Err(e.into()),
-            };
+            }
+            let (text, warnings) = expand_config_includes(Path::new(&path));
+            for warning in warnings {
+                eprintln!("Warning: {}", warning);
+            }
             let key = Config::private_key_from_toml(&text)
                 .map_err(|e| format!("invalid --base file {}: {}", path, e))?;
             Config::generate_config_text_from_private_key(&key)
@@ -1445,6 +1449,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn generate_from_base_reads_private_key_from_include() {
+        let base_key = {
+            let generated = yggdrasil::config::Config::generate_config_text();
+            yggdrasil::config::Config::private_key_from_toml(&generated).unwrap()
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "ygg-base-include-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key_path = dir.join("key.toml");
+        let base_path = dir.join("base.toml");
+        std::fs::write(&key_path, format!("private_key = \"{base_key}\"\n")).unwrap();
+        std::fs::write(
+            &base_path,
+            "include = \"key.toml\"\npeers = [\"tcp://198.51.100.9:23456\"]\n",
+        )
+        .unwrap();
+
+        let text = generate_config_text_maybe_from_base(Some(base_path.to_str().unwrap())).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            text.contains(&format!("private_key = \"{base_key}\"")),
+            "private_key from the include file must be reused:\n{text}"
+        );
+        assert!(
+            !text.contains("tcp://198.51.100.9:23456"),
+            "peers from the base file must not be copied:\n{text}"
+        );
+    }
+    
     #[test]
     fn generate_from_missing_base_is_error() {
         let err = generate_config_text_maybe_from_base(Some("/no/such/ygg-base-file.toml"))

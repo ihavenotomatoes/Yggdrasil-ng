@@ -361,8 +361,7 @@ yggdrasil-ckr.toml holds only table keys:
 ```
 
 ##### Important note
-`--normalize` is refused while any include line is uncommented. `--genconf=...` `--base=...` reads private_key only from the `--base=...` file itself and does not follow its include lines.
-
+`--normalize` is refused while any include line is uncommented. `--genconf --base` follows `include` lines when reading `private_key`; other fields from the base file and from its includes are not copied into the new template.
 
 
 
