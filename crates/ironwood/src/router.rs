@@ -1183,7 +1183,11 @@ impl Router {
         let dest = tr.dest;
         let xform = self.blooms.x_key(&dest, &self.bloom_transform);
         self.pathfinder.ensure_rumor(xform);
-        self.pathfinder.cache_rumor_traffic(&xform, tr);
+        if tr.keepalive {
+            self.pathfinder.cache_rumor_traffic_if_absent(&xform, tr);
+        } else {
+            self.pathfinder.cache_rumor_traffic(&xform, tr);
+        }
 
         if !self.pathfinder.should_throttle_rumor(&xform, self.path_throttle) {
             self.pathfinder.mark_rumor_sent(&xform);
@@ -1211,8 +1215,10 @@ impl Router {
             tracing::debug!("Traffic arrived for us: {} bytes from {:?}", tr.payload.len(), hex::encode(&tr.source[..4]));
             // Adopt a path back to the source from its coords in the packet, so a
             // reply needs no lookup of its own (see learn_path_from_traffic).
+            // Only refresh an existing entry when `from` still matches it.
+            // A mismatch must not pin stale coordinates; the next send looks up.
             self.pathfinder.learn_path_from_traffic(&tr.source, &tr.from);
-            self.pathfinder.reset_timeout(&tr.source);
+            self.pathfinder.refresh_if_coords_match(&tr.source, &tr.from);
             vec![RouterAction::DeliverTraffic { traffic: tr }]
         } else {
             tracing::debug!("Broken path for traffic");

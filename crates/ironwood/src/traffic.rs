@@ -26,6 +26,9 @@ pub(crate) struct TrafficPacket {
     pub dest: PublicKey,
     pub watermark: u64,
     pub payload: Vec<u8>,
+    /// Local only, not on the wire. Set on a remote keepalive so a path
+    /// rumor does not drop an application packet that is already waiting.
+    pub keepalive: bool,
 }
 
 impl TrafficPacket {
@@ -37,7 +40,14 @@ impl TrafficPacket {
             dest,
             watermark: u64::MAX,
             payload,
+            keepalive: false,
         }
+    }
+
+    /// Mark this packet as a remote keepalive. Not serialized.
+    pub fn keepalive(mut self) -> Self {
+        self.keepalive = true;
+        self
     }
 
     /// Estimated wire size of the packet (used for queue size accounting).
@@ -64,6 +74,7 @@ impl TrafficPacket {
         self.watermark = other.watermark;
         self.payload.clear();
         self.payload.extend_from_slice(&other.payload);
+        self.keepalive = other.keepalive;
     }
 }
 
@@ -628,6 +639,7 @@ mod tests {
             dest: [dst; 32],
             watermark: u64::MAX,
             payload: payload.to_vec(),
+            keepalive: false,
         }
     }
 

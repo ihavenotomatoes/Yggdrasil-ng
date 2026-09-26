@@ -159,7 +159,8 @@ pub struct Config {
     pub keepalive_interval: u64,
 
     /// Maximum number of recently used non-direct destinations kept alive with
-    /// empty encrypted traffic. Clamped to [0, 1000]. 0 disables. Default: 0.
+    /// a session probe that a patched peer acks, so the cached path does not
+    /// expire. Clamped to [0, 1000]. 0 disables. Default: 0.
     #[serde(default)]
     pub keepalive_remote_count: u64,
 

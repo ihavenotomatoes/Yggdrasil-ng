@@ -283,7 +283,7 @@ Yggdrasil-ng uses **TOML** format for configuration (unlike the Go version which
 | `group_password` | string | Closed-network password; empty = open mesh. See [Group password (closed networks)](#group-password-closed-networks) |
 | `session_path_timeout` | integer | Timeout in seconds for both encrypted sessions and cached paths. (60-86400, default: 60) For geeks. |
 | `keepalive_direct` | bool | Send empty traffic to direct peers on a short interval so idle sessions do not expire. (default: false). |
-| `keepalive_remote_count` | integer | LRU size for recently used non-direct destinations to keep alive. (0–1000, default: 0 = off). |
+| `keepalive_remote_count` | integer | LRU size for recently used non-direct destinations. A patched peer acks the probe, which keeps the session and the cached path alive. (0–1000, default: 0 = off). |
 | `keepalive_interval` | integer | Seconds between keepalive probes (direct and remote LRU). (15-`session_path_timeout`/2) (default: 20). |
 | `node_info` | table | Custom node metadata (TOML table) |
 | `node_info_privacy` | bool | Hide node info from other nodes (default: false) |

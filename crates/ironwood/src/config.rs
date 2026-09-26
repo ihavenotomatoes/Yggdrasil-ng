@@ -46,7 +46,9 @@ pub struct Config {
     /// Interval between keepalive probes (direct and remote LRU). Default: 20 seconds.
     pub keepalive_interval: Duration,
     /// Maximum number of recently used non-direct destinations to keep alive
-    /// with empty encrypted traffic. 0 disables remote keepalive. Default: 0.
+    /// with a session probe that the peer must ack. The ack keeps the cached
+    /// path usable; the probe itself does not. 0 disables remote keepalive.
+    /// Default: 0.
     pub keepalive_remote_count: usize,
 }
 

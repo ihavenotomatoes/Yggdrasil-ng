@@ -89,10 +89,13 @@ if_mtu = 65535
 # yggdrasil-go and older yggdrasil-ng nodes.
 # keepalive_direct = false
 
-# Keep up to this many recently used non-direct destinations alive with
-# empty encrypted traffic after the first outbound application write
-# (LRU, range 0-1000). Default: 0 = disabled. Independent of keepalive_direct. 
-# Compatible with yggdrasil-go and older yggdrasil-ng nodes.
+# Keep up to this many recently used non-direct destinations reachable.
+# After the first outbound application write, send a session probe on
+# keepalive_interval; a patched peer answers once, which refreshes the
+# session and the cached path. Not delivered to the TUN. Older peers
+# ignore the probe as non-IP and do not answer, so the path can still
+# expire toward them. LRU, range 0-1000. Default: 0 = disabled.
+# Independent of keepalive_direct.
 # keepalive_remote_count = 0
 
 # Interval in seconds between keepalive probes for direct peers and for

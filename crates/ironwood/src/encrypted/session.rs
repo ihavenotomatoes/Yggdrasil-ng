@@ -41,6 +41,14 @@ const SESSION_TYPE_INIT: u8 = 1;
 const SESSION_TYPE_ACK: u8 = 2;
 const SESSION_TYPE_TRAFFIC: u8 = 3;
 
+/// Remote-keepalive probe plaintext. Not a valid IPv4/IPv6 packet.
+/// A peer with this fix answers with [`KEEPALIVE_ACK`] and does not deliver it.
+/// An older peer delivers it and drops it as non-IP; the session still refreshes.
+pub(crate) const KEEPALIVE_PROBE: &[u8] = b"\0ygg-ka";
+
+/// Reply to [`KEEPALIVE_PROBE`]. Must not be answered, or two patched nodes ping-pong.
+pub(crate) const KEEPALIVE_ACK: &[u8] = b"\0ygg-ka-ack";
+
 // ---------------------------------------------------------------------------
 // SessionInit
 // ---------------------------------------------------------------------------
@@ -694,6 +702,19 @@ impl ConcurrentSessionManager {
             info.recv_finalize(&snap, inner_key, payload.len() as u64);
         }
 
+        // keepalive_direct still sends an empty plaintext. Do not deliver it
+        // and do not answer it: an answer to [] would ping-pong with direct
+        // probes and with the old remote probe.
+        if payload.is_empty() || payload.as_slice() == KEEPALIVE_ACK {
+            return Vec::new();
+        }
+        // Remote probe. recv_finalize already refreshed this session.
+        // The ack is ordinary session traffic, so the sender's session and
+        // (if coords still match) the sender's path refresh when it arrives.
+        if payload.as_slice() == KEEPALIVE_PROBE {
+            return self.write_to(from, KEEPALIVE_ACK, our_ed_priv);
+        }
+
         vec![OutAction::Deliver {
             source: *from,
             data: payload,
@@ -1189,5 +1210,57 @@ mod tests {
             }
         }
         panic!("expected msg2 delivery");
+    }
+
+    #[test]
+    fn remote_keepalive_probe_is_acked_once_and_not_delivered() {
+        let (priv_a, pub_a, curve_priv_a) = make_keys();
+        let (priv_b, pub_b, curve_priv_b) = make_keys();
+        let mgr_a = ConcurrentSessionManager::new(GroupAuth::default(), Duration::from_secs(60));
+        let mgr_b = ConcurrentSessionManager::new(GroupAuth::default(), Duration::from_secs(60));
+
+        let init = match &mgr_a.write_to(&pub_b, b"msg1", &priv_a)[0] {
+            OutAction::SendToInner { data, .. } => data.clone(),
+            _ => panic!("expected init"),
+        };
+        let ack = match &mgr_b.handle_data(&pub_a, &init, &curve_priv_b, &priv_b)[0] {
+            OutAction::SendToInner { data, .. } => data.clone(),
+            _ => panic!("expected handshake ack"),
+        };
+        for action in mgr_a.handle_data(&pub_b, &ack, &curve_priv_a, &priv_a) {
+            if let OutAction::SendToInner { data, .. } = action {
+                let _ = mgr_b.handle_data(&pub_a, &data, &curve_priv_b, &priv_b);
+            }
+        }
+
+        let probe = match &mgr_a.write_to(&pub_b, KEEPALIVE_PROBE, &priv_a)[0] {
+            OutAction::SendToInner { data, .. } => data.clone(),
+            _ => panic!("expected probe"),
+        };
+        let b_actions = mgr_b.handle_data(&pub_a, &probe, &curve_priv_b, &priv_b);
+        assert!(
+            b_actions.iter().all(|a| !matches!(a, OutAction::Deliver { .. })),
+            "probe must not be delivered"
+        );
+        let ka_ack = match &b_actions[0] {
+            OutAction::SendToInner { data, .. } => data.clone(),
+            _ => panic!("expected keepalive ack"),
+        };
+
+        let a_actions = mgr_a.handle_data(&pub_b, &ka_ack, &curve_priv_a, &priv_a);
+        assert!(
+            a_actions.is_empty(),
+            "keepalive ack must not be delivered and must not be answered"
+        );
+
+        let app = match &mgr_a.write_to(&pub_b, b"still-here", &priv_a)[0] {
+            OutAction::SendToInner { data, .. } => data.clone(),
+            _ => panic!("expected app traffic"),
+        };
+        let delivered = mgr_b.handle_data(&pub_a, &app, &curve_priv_b, &priv_b);
+        assert!(delivered.iter().any(|a| matches!(
+            a,
+            OutAction::Deliver { data, .. } if data == b"still-here"
+        )));
     }
 }

@@ -648,6 +648,7 @@ pub(crate) async fn peer_reader(
                     dest: tr.dest,
                     watermark: tr.watermark,
                     payload: tr.payload,
+                    keepalive: false,
                 };
                 router.send(RouterMsg::HandleTraffic { traffic });
             }
