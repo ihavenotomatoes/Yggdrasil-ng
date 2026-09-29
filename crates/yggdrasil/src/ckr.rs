@@ -320,7 +320,7 @@ pub fn expand_cidrs(entries: &[String]) -> Result<Vec<IpNet>, String> {
         }
         if url.scheme() == "http" || url.scheme() == "https" {
             // HTTP(S) route lists (with optional "~", "_", "!"" prefixes) are downloaded
-            //  at startup into the OS-specific yggdrasil_routes_download cache.
+            // at startup into the OS-specific yggdrasil/routes_download cache.
             // Content is NOT expanded here — this prevents treating them as CIDR/IP
             // and because full integration happens at the next stage. Skip silently.
             continue;
@@ -599,7 +599,7 @@ pub fn install_routes(
             continue;
         }
 
-        // Include downloaded route lists from yggdrasil_routes_download
+        // Include downloaded route lists from yggdrasil/routes_download
         let mut effective_entries = subnet_list.clone();
         #[cfg(feature = "ckr-advanced")]
         effective_entries.extend(get_downloaded_virtual_file_entries(pubkey_hex));
@@ -680,7 +680,7 @@ pub fn remove_routes(config: &TunnelRoutingConfig, tun_name: &str, self_key: &[u
             continue;
         }
 
-        // Include downloaded HTTP/HTTPS route lists from yggdrasil_routes_download/<pubkey>/
+        // Include downloaded HTTP/HTTPS route lists from yggdrasil/routes_download/<pubkey>/
         // These are treated exactly the same as "file://" entries from the config.
         let mut effective_entries = subnet_list.clone();
         #[cfg(feature = "ckr-advanced")]
@@ -724,28 +724,30 @@ pub fn remove_routes(config: &TunnelRoutingConfig, tun_name: &str, self_key: &[u
 }
 
 /// Returns OS-specific base directory for downloaded route lists.
-/// Matches exactly the paths specified in the task (Linux/BSD, macOS, Windows).
+/// Layout: <os-cache>/yggdrasil/routes_download[_<prefix><port>]
+/// (Linux/BSD: /var/cache, macOS: /Library/Caches, Windows: %TEMP%).
 #[cfg(feature = "ckr-advanced")]
 fn get_routes_download_base_dir() -> PathBuf {
-    // When a custom prefix/port was applied, isolate the cache directory so multiple
+    // When a custom prefix/port was applied, isolate the leaf directory so multiple
     // instances with different prefixes/ports do not share downloaded lists.
-    let dir_name = if crate::address::prefix_port_set() {
+    // All instances share the common "yggdrasil" parent under the OS cache root.
+    let leaf = if crate::address::prefix_port_set() {
         format!(
-            "yggdrasil_routes_download_{:02x}{}",
+            "routes_download_{:02x}{}",
             crate::address::address_prefix(),
             crate::multicast::multicast_port()
         )
     } else {
-        "yggdrasil_routes_download".to_string()
+        "routes_download".to_string()
     };
 
     if cfg!(target_os = "macos") {
-        PathBuf::from(format!("/Library/Caches/{}", dir_name))
+        PathBuf::from("/Library/Caches/yggdrasil").join(leaf)
     } else if cfg!(target_os = "windows") {
-        std::env::temp_dir().join(dir_name)
+        std::env::temp_dir().join("yggdrasil").join(leaf)
     } else {
         // Linux, FreeBSD, OpenBSD, NetBSD etc.
-        PathBuf::from(format!("/var/cache/{}", dir_name))
+        PathBuf::from("/var/cache/yggdrasil").join(leaf)
     }
 }
 
@@ -849,7 +851,7 @@ fn remove_empty_dirs(base: &PathBuf) {
     }
 }
 
-/// Download HTTP/HTTPS route lists into yggdrasil_routes_download/<pubkey>/
+/// Download HTTP/HTTPS route lists into yggdrasil/routes_download/<pubkey>/
 /// right after "Multicast peer discovery started".
 /// - Only processes entries that look like http(s):// (with optional ~_! prefix).
 /// - Filename format: N-prefix-md5hex or N--md5hex (exactly as specified).
