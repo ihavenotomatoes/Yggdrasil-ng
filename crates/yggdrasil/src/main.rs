@@ -1012,6 +1012,27 @@ fn prefix_port_from_name(name: &str) -> Option<(u8, u16)> {
     parse_prefix_port(suffix)
 }
 
+/// Compile-time system config directory on Linux and Termux.
+/// `YGGDRASIL_CONFIG_DIR` is read when the binary is built. Unset or empty
+/// keeps the historic Linux default. Android keeps "no system directory"
+/// unless the variable is set. A trailing slash is stripped.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn compile_time_config_dir() -> Option<&'static str> {
+    match option_env!("YGGDRASIL_CONFIG_DIR") {
+        Some(dir) if !dir.is_empty() => Some(dir.trim_end_matches('/')),
+        _ => {
+            #[cfg(target_os = "linux")]
+            {
+                Some("/etc/yggdrasil")
+            }
+            #[cfg(target_os = "android")]
+            {
+                None
+            }
+        }
+    }
+}
+
 /// System default location for `filename` (the second of the two default
 /// paths). Used both to look the file up and to name it in the "not found"
 /// error when neither default exists.
@@ -1020,7 +1041,11 @@ fn prefix_port_from_name(name: &str) -> Option<(u8, u16)> {
 /// resolved ProgramData directory: that is what the error message should
 /// show. The actual existence check still uses `windows_program_data_dir()`.
 fn system_config_path(filename: &str) -> String {
-    #[cfg(all(unix, not(target_os = "android")))]
+    #[cfg(target_os = "linux")]
+    {
+        format!("{}/{}", compile_time_config_dir().unwrap(), filename)
+    }
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
     {
         format!("/etc/yggdrasil/{}", filename)
     }
@@ -1028,7 +1053,14 @@ fn system_config_path(filename: &str) -> String {
     {
         format!("%ALLUSERSPROFILE%\\Yggdrasil-ng\\{}", filename)
     }
-    #[cfg(not(any(all(unix, not(target_os = "android")), windows)))]
+    #[cfg(target_os = "android")]
+    {
+        match compile_time_config_dir() {
+            Some(dir) => format!("{}/{}", dir, filename),
+            None => filename.to_string(),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         filename.to_string()
     }
@@ -1073,7 +1105,11 @@ fn load_config_file(path: &str) -> Result<Config, Box<dyn std::error::Error>> {
 ///    - Otherwise fall back to the historic default `yggdrasil.toml`.
 /// 2. Try that filename in the current working directory.
 /// 3. If absent, try the OS-specific system directory with the same filename:
-///    - Unix-like (Linux except Android, BSD, macOS, …): `/etc/yggdrasil/<filename>`
+///    - Linux: `$YGGDRASIL_CONFIG_DIR/<filename>` if that variable was set at
+///      build time, otherwise `/etc/yggdrasil/<filename>`
+///    - Android/Termux: `$YGGDRASIL_CONFIG_DIR/<filename>` only when that
+///      variable was set at build time; otherwise the bare filename
+///    - Other Unix (BSD, macOS, …): `/etc/yggdrasil/<filename>`
 ///    - Windows: `<ProgramData>\Yggdrasil-ng\<filename>`, where ProgramData is
 ///      obtained via SHGetKnownFolderPath(FOLDERID_ProgramData)
 /// 4. If still not found, return the system path from step 3 (not the
@@ -1097,9 +1133,19 @@ fn resolve_config_path(matches: &getopts::Matches) -> String {
 
     #[cfg(all(unix, not(target_os = "android")))]
     {
-        let system = format!("/etc/yggdrasil/{}", local);
+        let system = system_config_path(&local);
         if Path::new(&system).exists() {
             return system;
+        }
+    }
+
+    #[cfg(target_os = "android")]
+    {
+        if let Some(dir) = compile_time_config_dir() {
+            let system = format!("{}/{}", dir, local);
+            if Path::new(&system).exists() {
+                return system;
+            }
         }
     }
 
@@ -1315,7 +1361,23 @@ mod tests {
 
     #[test]
     fn test_system_config_path() {
-        #[cfg(all(unix, not(target_os = "android")))]
+        #[cfg(target_os = "linux")]
+        {
+            let dir = compile_time_config_dir().unwrap();
+            assert_eq!(
+                system_config_path("yggdrasil.toml"),
+                format!("{}/yggdrasil.toml", dir)
+            );
+            assert_eq!(
+                system_config_path("ygg_0615001.toml"),
+                format!("{}/ygg_0615001.toml", dir)
+            );
+            assert_eq!(
+                system_config_path("yggdrasil_02.9001.toml"),
+                format!("{}/yggdrasil_02.9001.toml", dir)
+            );
+        }
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
         {
             assert_eq!(
                 system_config_path("yggdrasil.toml"),
@@ -1329,6 +1391,25 @@ mod tests {
                 system_config_path("yggdrasil_02.9001.toml"),
                 "/etc/yggdrasil/yggdrasil_02.9001.toml"
             );
+        }
+        #[cfg(target_os = "android")]
+        {
+            match compile_time_config_dir() {
+                Some(dir) => {
+                    assert_eq!(
+                        system_config_path("yggdrasil.toml"),
+                        format!("{}/yggdrasil.toml", dir)
+                    );
+                    assert_eq!(
+                        system_config_path("ygg_0615001.toml"),
+                        format!("{}/ygg_0615001.toml", dir)
+                    );
+                }
+                None => {
+                    assert_eq!(system_config_path("yggdrasil.toml"), "yggdrasil.toml");
+                    assert_eq!(system_config_path("ygg_0615001.toml"), "ygg_0615001.toml");
+                }
+            }
         }
         #[cfg(windows)]
         {

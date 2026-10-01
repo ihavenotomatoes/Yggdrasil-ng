@@ -724,8 +724,11 @@ pub fn remove_routes(config: &TunnelRoutingConfig, tun_name: &str, self_key: &[u
 }
 
 /// Returns OS-specific base directory for downloaded route lists.
-/// Layout: <os-cache>/yggdrasil/routes_download[_<prefix><port>]
-/// (Linux/BSD: /var/cache, macOS: /Library/Caches, Windows: %TEMP%).
+/// Layout: <root>/routes_download[_<prefix><port>]
+/// Linux and Android root is `/var/cache/yggdrasil`, or
+/// `YGGDRASIL_ROUTES_CACHE_DIR` when that variable was set at build time.
+/// Other Unix: `/var/cache/yggdrasil`. macOS: `/Library/Caches/yggdrasil`.
+/// Windows: `%TEMP%\yggdrasil`.).
 #[cfg(feature = "ckr-advanced")]
 fn get_routes_download_base_dir() -> PathBuf {
     // When a custom prefix/port was applied, isolate the leaf directory so multiple
@@ -745,8 +748,16 @@ fn get_routes_download_base_dir() -> PathBuf {
         PathBuf::from("/Library/Caches/yggdrasil").join(leaf)
     } else if cfg!(target_os = "windows") {
         std::env::temp_dir().join("yggdrasil").join(leaf)
+    } else if cfg!(any(target_os = "linux", target_os = "android")) {
+        // Build-time override for non-standard Linux/Termux layouts.
+        // Empty or unset keeps /var/cache/yggdrasil. BSD is the branch below.
+        let root = match option_env!("YGGDRASIL_ROUTES_CACHE_DIR") {
+            Some(dir) if !dir.is_empty() => dir.trim_end_matches('/'),
+            _ => "/var/cache/yggdrasil",
+        };
+        PathBuf::from(root).join(leaf)
     } else {
-        // Linux, FreeBSD, OpenBSD, NetBSD etc.
+        // FreeBSD, OpenBSD, NetBSD, DragonFly, etc. Not overridable.
         PathBuf::from("/var/cache/yggdrasil").join(leaf)
     }
 }
@@ -1922,6 +1933,19 @@ mod tests {
         assert!(expanded.iter().any(|p| p.to_string() == "192.168.0.0/16"));
     }
 
+    #[cfg(all(feature = "ckr-advanced", any(target_os = "linux", target_os = "android")))]
+    #[test]
+    fn test_routes_download_base_dir_build_override() {
+        let root = match option_env!("YGGDRASIL_ROUTES_CACHE_DIR") {
+            Some(dir) if !dir.is_empty() => dir.trim_end_matches('/'),
+            _ => "/var/cache/yggdrasil",
+        };
+        let base = get_routes_download_base_dir();
+        assert!(base.starts_with(root));
+        let name = base.file_name().unwrap().to_string_lossy();
+        assert!(name == "routes_download" || name.starts_with("routes_download_"));
+    }
+    
     #[test]
     fn test_default_route_minus_many_excludes() {
         // descending order so the sweep cannot rely on input ordering.

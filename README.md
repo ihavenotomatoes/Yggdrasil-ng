@@ -97,6 +97,13 @@ cargo build
 
 Binaries will be located in `./target/debug/`.
 
+Linux and Termux builds can override the two default directories at compile time. `YGGDRASIL_CONFIG_DIR` replaces `/etc/yggdrasil` as the system config directory; the filename is still taken from the binary name (`yggdrasil.toml`, or `<stem>.toml` for a prefix/port name such as `ygg_fc`). `YGGDRASIL_ROUTES_CACHE_DIR` replaces `/var/cache/yggdrasil` as the root for `http://` and `https://` route lists downloaded by the `ckr-advanced` feature; the `routes_download` or `routes_download_<prefix><port>` leaf is unchanged, and `file://` lists keep the path written in the config. Both variables are read while compiling, not when the binary starts. An empty value is the same as unset and keeps the historic default. On Android/Termux an unset `YGGDRASIL_CONFIG_DIR` still means the bare filename in the working directory. BSD, macOS and Windows ignore both variables.
+
+```bash
+YGGDRASIL_CONFIG_DIR=/data/yggdrasil \
+YGGDRASIL_ROUTES_CACHE_DIR=/data/yggdrasil/cache \
+cargo build --release
+
 ### Cross-Compilation
 
 To build for a different target, use the `--target` flag. For example, for Linux ARM64:
@@ -195,7 +202,7 @@ That filename is then searched in this order:
 
 1. the current working directory;
 2. the OS system directory, same filename:
-   - Unix-like (Linux except Android, BSD, macOS): `/etc/yggdrasil/<filename>`
+   - Unix-like (Linux except Android, BSD, macOS): `/etc/yggdrasil/<filename>`. Linux and Termux builds can replace that directory at compile time. `YGGDRASIL_CONFIG_DIR` is the system config directory (the filename is still derived from the binary name).
    - Windows: `%ALLUSERSPROFILE%\Yggdrasil-ng\<filename>` (resolved via `SHGetKnownFolderPath(FOLDERID_ProgramData)`, usually `C:\ProgramData\Yggdrasil-ng\`).
 
 If the file exists in either place, the daemon and control commands can be started **without** `-c`.
