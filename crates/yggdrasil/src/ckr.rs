@@ -575,6 +575,7 @@ pub fn install_routes(
     _config: &TunnelRoutingConfig,
     _tun_name: &str,
     _self_key: &[u8; 32],
+    _route_table: Option<u8>,
 ) -> Result<(), String> {
     Ok(())
 }
@@ -584,6 +585,7 @@ pub fn install_routes(
     config: &TunnelRoutingConfig,
     tun_name: &str,
     self_key: &[u8; 32],
+    route_table: Option<u8>,
 ) -> Result<(), String> {
     if !config.enable || !config.install_system_routes {
         return Ok(());
@@ -638,6 +640,14 @@ pub fn install_routes(
     for cidr in &cidrs {
         let route = route_manager::Route::new(cidr.network(), cidr.prefix_len())
             .with_if_name(tun_name.to_string());
+        // with_table exists only on Linux. None keeps the current main-table route.
+        #[cfg(target_os = "linux")]
+        let route = match route_table {
+            Some(table) => route.with_table(table),
+            None => route,
+        };
+        #[cfg(not(target_os = "linux"))]
+        let _ = route_table;
 
         match manager.add(&route) {
             Ok(()) => {
@@ -665,10 +675,21 @@ pub fn install_routes(
 
 /// Remove previously installed CKR routes from the system routing table.
 #[cfg(target_os = "android")]
-pub fn remove_routes(_config: &TunnelRoutingConfig, _tun_name: &str, _self_key: &[u8; 32]) {}
+pub fn remove_routes(
+    _config: &TunnelRoutingConfig,
+    _tun_name: &str,
+    _self_key: &[u8; 32],
+    _route_table: Option<u8>,
+) {
+}
 
 #[cfg(not(target_os = "android"))]
-pub fn remove_routes(config: &TunnelRoutingConfig, tun_name: &str, self_key: &[u8; 32]) {
+pub fn remove_routes(
+    config: &TunnelRoutingConfig,
+    tun_name: &str,
+    self_key: &[u8; 32],
+    route_table: Option<u8>,
+) {
     if !config.enable || !config.install_system_routes {
         return;
     }
@@ -717,6 +738,14 @@ pub fn remove_routes(config: &TunnelRoutingConfig, tun_name: &str, self_key: &[u
     for cidr in &cidrs {
         let route = route_manager::Route::new(cidr.network(), cidr.prefix_len())
             .with_if_name(tun_name.to_string());
+        // with_table exists only on Linux. None keeps the current main-table route.
+        #[cfg(target_os = "linux")]
+        let route = match route_table {
+            Some(table) => route.with_table(table),
+            None => route,
+        };
+        #[cfg(not(target_os = "linux"))]
+        let _ = route_table;
         if let Err(e) = manager.delete(&route) {
             tracing::debug!("Failed to remove route {}: {}", cidr, e);
         }
@@ -2012,5 +2041,15 @@ mod tests {
         assert_eq!(ckr.get_public_key_for_address(addr), Some([0x01u8; 32]));
         // And the table really contains all four lengths.
         assert_eq!(ckr.v4.len(), 4);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_route_table_is_optional() {
+        let plain = route_manager::Route::new(std::net::IpAddr::from([10, 0, 0, 0]), 8)
+            .with_if_name("ygg0".to_string());
+        assert_eq!(plain.table(), 0);
+        let tagged = plain.with_table(200);
+        assert_eq!(tagged.table(), 200);
     }
 }

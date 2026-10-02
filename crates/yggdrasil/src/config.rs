@@ -168,6 +168,11 @@ pub struct Config {
     /// Total silence budget ≈ current interval × `probe_count`.
     #[serde(default)]
     pub peer_liveness: PeerLivenessConfig,
+
+    /// Linux `ip rule` / routing-table selection. Ignored except on Linux.
+    /// Both `pref` and `lookup` must be > 0; see `IpRuleConfig::effective`.
+    #[serde(default)]
+    pub ip_rule: IpRuleConfig,
 }
 
 /// Nested `[peer_liveness]` table — one subsystem, one object (matches ironwood
@@ -231,6 +236,36 @@ fn default_peer_liveness_max_secs() -> u64 { 30 }
 fn default_peer_liveness_base_secs() -> u64 { 2 }
 fn default_peer_liveness_rtt_mult() -> u32 { 8 }
 fn default_peer_liveness_probe_count() -> u32 { 3 }
+
+/// Linux-only `[ip_rule]`. Other platforms parse it and do nothing.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct IpRuleConfig {
+    /// `ip rule` priority. `<= 0` disables the feature. Clamped to 32765.
+    #[serde(default)]
+    pub pref: i64,
+    /// Routing table id. `<= 0` disables the feature. Clamped to 251.
+    #[serde(default)]
+    pub lookup: i64,
+}
+
+impl Default for IpRuleConfig {
+    fn default() -> Self {
+        Self { pref: 0, lookup: 0 }
+    }
+}
+
+impl IpRuleConfig {
+    /// `Some((pref, lookup))` only when both configured values are positive.
+    /// `pref` is clamped to 1..=32765, `lookup` to 1..=251.
+    pub fn effective(&self) -> Option<(i64, u8)> {
+        if self.pref <= 0 || self.lookup <= 0 {
+            return None;
+        }
+        let pref = self.pref.min(32765);
+        let lookup = self.lookup.min(251) as u8;
+        Some((pref, lookup))
+    }
+}
 
 /// Built-in stateful firewall configuration. Default-off; when enabled,
 /// inbound mesh traffic is dropped unless it matches an outbound flow
@@ -394,6 +429,7 @@ impl Default for Config {
             keepalive_interval: default_keepalive_interval(),
             keepalive_remote_count: 0,
             peer_liveness: PeerLivenessConfig::default(),
+            ip_rule: IpRuleConfig::default(),
         }
     }
 }
@@ -881,6 +917,52 @@ mod normalize_tests {
         let cfg: Config = toml::from_str(text).unwrap();
         assert_eq!(cfg.keepalive_remote_count, 16);
         assert!(!cfg.keepalive_direct);
+    }
+
+    #[test]
+    fn ip_rule_defaults_and_clamp() {
+        let cfg = Config::default();
+        assert_eq!(cfg.ip_rule.pref, 0);
+        assert_eq!(cfg.ip_rule.lookup, 0);
+        assert_eq!(cfg.ip_rule.effective(), None);
+
+        let mut rule = IpRuleConfig { pref: 0, lookup: 200 };
+        assert_eq!(rule.effective(), None);
+        rule = IpRuleConfig { pref: 9000, lookup: 0 };
+        assert_eq!(rule.effective(), None);
+        rule = IpRuleConfig { pref: -1, lookup: 200 };
+        assert_eq!(rule.effective(), None);
+        rule = IpRuleConfig { pref: 9000, lookup: -5 };
+        assert_eq!(rule.effective(), None);
+
+        rule = IpRuleConfig { pref: 9000, lookup: 200 };
+        assert_eq!(rule.effective(), Some((9000, 200)));
+        rule = IpRuleConfig { pref: 1, lookup: 1 };
+        assert_eq!(rule.effective(), Some((1, 1)));
+        rule = IpRuleConfig { pref: 40000, lookup: 300 };
+        assert_eq!(rule.effective(), Some((32765, 251)));
+        rule = IpRuleConfig { pref: 32765, lookup: 251 };
+        assert_eq!(rule.effective(), Some((32765, 251)));
+    }
+
+    #[test]
+    fn ip_rule_parses_from_toml() {
+        let absent = r#"
+            private_key = ""
+        "#;
+        let cfg: Config = toml::from_str(absent).unwrap();
+        assert_eq!(cfg.ip_rule.effective(), None);
+
+        let text = r#"
+            private_key = ""
+            [ip_rule]
+            pref = 9000
+            lookup = 200
+        "#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        assert_eq!(cfg.ip_rule.pref, 9000);
+        assert_eq!(cfg.ip_rule.lookup, 200);
+        assert_eq!(cfg.ip_rule.effective(), Some((9000, 200)));
     }
 }
 

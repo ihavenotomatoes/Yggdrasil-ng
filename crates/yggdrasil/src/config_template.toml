@@ -135,6 +135,19 @@ if_mtu = 65535
 # rtt_mult = 8
 # probe_count = 3
 
+
+# Linux policy routing for CKR system routes. Ignored on every other OS.
+# While pref or lookup is 0 or negative, no ip rule is added and routes stay
+# in the main table, as before.
+# Both must be greater than 0 to take effect. pref is clamped to 32765,
+# lookup (routing table id) is clamped to 251.
+# On startup the node ensures this rule exists for IPv4 and IPv6:
+#   <pref>: from all lookup <lookup>
+# The rule is not removed on shutdown; other interfaces may use the same table.
+# [ip_rule]
+# pref = 9000
+# lookup = 200
+
 # Custom node info that is advertised to other nodes.
 # This can be any TOML table, e.g. { name = "my-node", location = "earth" }
 [node_info]

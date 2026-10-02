@@ -460,6 +460,20 @@ async fn run_node(
     #[cfg(all(feature = "ckr", not(target_os = "android")))]
     yggdrasil::ckr::prepare_peer_exclusions(&config.tunnel_routing, &core, &config.peers, &shutdown_rx);
 
+    // Visible to both install_routes and the later remove_routes. None keeps the main table.
+    #[cfg(target_os = "linux")]
+    let route_table = match config.ip_rule.effective() {
+        Some((pref, lookup)) => {
+            if let Err(e) = ensure_linux_ip_rule(pref, lookup) {
+                tracing::error!("Failed to ensure ip rule pref {} lookup {}: {}", pref, lookup, e);
+            }
+            Some(lookup)
+        }
+        None => None,
+    };
+    #[cfg(not(target_os = "linux"))]
+    let route_table = None;
+
     // If Ctrl+C arrived during download / peer-exclusion prep, skip the remaining
     // CKR init / IP assignment / route install so shutdown can proceed immediately.
     if !*shutdown_rx.borrow() {
@@ -492,6 +506,20 @@ async fn run_node(
         // The early installation block was removed from TunAdapter::new.
         // We reuse the exact same tun_name computation and error handling pattern
         // that already exists in the shutdown/remove_routes block below.
+        // // Linux only. A missing or non-positive [ip_rule] leaves routes on the main table.
+        // #[cfg(target_os = "linux")]
+        // let route_table = match config.ip_rule.effective() {
+        //     Some((pref, lookup)) => {
+        //         if let Err(e) = ensure_linux_ip_rule(pref, lookup) {
+        //             tracing::error!("Failed to ensure ip rule pref {} lookup {}: {}", pref, lookup, e);
+        //         }
+        //         Some(lookup)
+        //     }
+        //     None => None,
+        // };
+        // #[cfg(not(target_os = "linux"))]
+        // let route_table = None;
+
         #[cfg(feature = "ckr")]
         if config.tunnel_routing.enable && config.tunnel_routing.install_system_routes && config.if_name != "none" {
             // Prefer the real interface name reported by TunAdapter
@@ -523,7 +551,12 @@ async fn run_node(
                     }
                 }
             };
-            if let Err(e) = yggdrasil::ckr::install_routes(&config.tunnel_routing, tun_name, core.public_key()) {
+            if let Err(e) = yggdrasil::ckr::install_routes(
+                &config.tunnel_routing,
+                tun_name,
+                core.public_key(),
+                route_table,
+            ) {
                 tracing::error!("Failed to install CKR routes: {}", e);
             }
         }
@@ -576,7 +609,12 @@ async fn run_node(
                 }
             }
         };
-        yggdrasil::ckr::remove_routes(&config.tunnel_routing, tun_name, core.public_key());
+        yggdrasil::ckr::remove_routes(
+            &config.tunnel_routing,
+            tun_name,
+            core.public_key(),
+            route_table,
+        );
     }
 
     // Tear down TUN explicitly so the OS interface is removed before this
@@ -1208,6 +1246,79 @@ fn print_ctl_commands() {
     println!("    getLookup key=<hex>, forceLookup key=<hex>");
 }
 
+/// True when an `ip rule show` line is exactly `<pref>: from all lookup <lookup>`.
+#[cfg(target_os = "linux")]
+fn ip_rule_line_matches(line: &str, pref: i64, lookup: u8) -> bool {
+    let mut parts = line.split_whitespace();
+    let head = match parts.next() {
+        Some(head) => head,
+        None => return false,
+    };
+    if head != format!("{pref}:") {
+        return false;
+    }
+    let rest: Vec<&str> = parts.collect();
+    rest.len() == 4
+        && rest[0] == "from"
+        && rest[1] == "all"
+        && rest[2] == "lookup"
+        && rest[3] == lookup.to_string()
+}
+
+/// Add `pref: from all lookup <table>` for IPv4 and IPv6 if it is not already present.
+/// Does not delete the rule on shutdown.
+#[cfg(target_os = "linux")]
+fn ensure_linux_ip_rule(pref: i64, lookup: u8) -> Result<(), String> {
+    for ipv6 in [false, true] {
+        let mut show = std::process::Command::new("ip");
+        if ipv6 {
+            show.arg("-6");
+        }
+        let shown = show
+            .args(["rule", "show"])
+            .output()
+            .map_err(|e| format!("failed to run ip rule show: {e}"))?;
+        if !shown.status.success() {
+            return Err(format!(
+                "ip rule show failed: {}",
+                String::from_utf8_lossy(&shown.stderr).trim()
+            ));
+        }
+        let text = String::from_utf8_lossy(&shown.stdout);
+        if text.lines().any(|line| ip_rule_line_matches(line, pref, lookup)) {
+            continue;
+        }
+        let mut add = std::process::Command::new("ip");
+        if ipv6 {
+            add.arg("-6");
+        }
+        let added = add
+            .args([
+                "rule",
+                "add",
+                "pref",
+                &pref.to_string(),
+                "from",
+                "all",
+                "lookup",
+                &lookup.to_string(),
+            ])
+            .output()
+            .map_err(|e| format!("failed to run ip rule add: {e}"))?;
+        if !added.status.success() {
+            return Err(format!(
+                "ip rule add failed: {}",
+                String::from_utf8_lossy(&added.stderr).trim()
+            ));
+        }
+        tracing::info!(
+            "Ensured {} ip rule {pref}: from all lookup {lookup}",
+            if ipv6 { "IPv6" } else { "IPv4" }
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1635,5 +1746,15 @@ mod tests {
             !rewritten.contains("tcp://localhost:9001"),
             "historic default URI must not remain after rewrite:\n{rewritten}"
         );
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    #[test]
+    fn ip_rule_show_line_match() {
+        assert!(ip_rule_line_matches("9000:\tfrom all lookup 200", 9000, 200));
+        assert!(ip_rule_line_matches("9000:   from all lookup 200", 9000, 200));
+        assert!(!ip_rule_line_matches("9001: from all lookup 200", 9000, 200));
+        assert!(!ip_rule_line_matches("9000: from all lookup 201", 9000, 200));
+        assert!(!ip_rule_line_matches("9000: from 10.0.0.0/8 lookup 200", 9000, 200));
     }
 }
