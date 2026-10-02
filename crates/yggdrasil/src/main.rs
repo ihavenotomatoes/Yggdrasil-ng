@@ -506,20 +506,16 @@ async fn run_node(
         // The early installation block was removed from TunAdapter::new.
         // We reuse the exact same tun_name computation and error handling pattern
         // that already exists in the shutdown/remove_routes block below.
-        // // Linux only. A missing or non-positive [ip_rule] leaves routes on the main table.
-        // #[cfg(target_os = "linux")]
-        // let route_table = match config.ip_rule.effective() {
-        //     Some((pref, lookup)) => {
-        //         if let Err(e) = ensure_linux_ip_rule(pref, lookup) {
-        //             tracing::error!("Failed to ensure ip rule pref {} lookup {}: {}", pref, lookup, e);
-        //         }
-        //         Some(lookup)
-        //     }
-        //     None => None,
-        // };
-        // #[cfg(not(target_os = "linux"))]
-        // let route_table = None;
-
+        // Move the kernel overlay route (200::/7, or the configured prefix) into
+        // the same table as CKR routes. Independent of tunnel_routing.enable.
+        #[cfg(all(target_os = "linux", feature = "tun"))]
+        if let Some(table) = route_table {
+            if let Some(adapter) = tun.as_ref() {
+                if let Err(e) = install_overlay_route(adapter.name(), table) {
+                    tracing::error!("Failed to install overlay route: {}", e);
+                }
+            }
+        }
         #[cfg(feature = "ckr")]
         if config.tunnel_routing.enable && config.tunnel_routing.install_system_routes && config.if_name != "none" {
             // Prefer the real interface name reported by TunAdapter
@@ -582,6 +578,12 @@ async fn run_node(
     // Cleanup
     // Remove CKR routes before TUN is destroyed (critical on Windows where
     // routes don't auto-dissolve when the interface goes away).
+    #[cfg(all(target_os = "linux", feature = "tun"))]
+    if let Some(table) = route_table {
+        if let Some(adapter) = tun.as_ref() {
+            remove_overlay_route(adapter.name(), table);
+        }
+    }
     #[cfg(feature = "ckr")]
     if config.tunnel_routing.enable && config.if_name != "none" {
         // Prefer the real interface name reported by TunAdapter
@@ -1317,6 +1319,60 @@ fn ensure_linux_ip_rule(pref: i64, lookup: u8) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// Install `<prefix>/7 dev <tun> table <table>`, then drop the kernel copy from main.
+#[cfg(all(target_os = "linux", feature = "tun"))]
+fn install_overlay_route(tun_name: &str, table: u8) -> Result<(), String> {
+    let (addr, len) = yggdrasil::address::overlay_network();
+    let cidr = format!("{addr}/{len}");
+    let table_id = table.to_string();
+    let added = std::process::Command::new("ip")
+        .args(["-6", "route", "replace", &cidr, "dev", tun_name, "table", &table_id])
+        .output()
+        .map_err(|e| format!("failed to run ip route replace: {e}"))?;
+    if !added.status.success() {
+        return Err(format!(
+            "ip route replace {cidr} table {table} failed: {}",
+            String::from_utf8_lossy(&added.stderr).trim()
+        ));
+    }
+    tracing::info!("Installed overlay route {cidr} dev {tun_name} table {table}");
+
+    let deleted = std::process::Command::new("ip")
+        .args(["-6", "route", "del", &cidr, "dev", tun_name])
+        .output()
+        .map_err(|e| format!("failed to run ip route del: {e}"))?;
+    if !deleted.status.success() {
+        tracing::debug!(
+            "Overlay route {cidr} was not removed from main: {}",
+            String::from_utf8_lossy(&deleted.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Remove only the extra-table overlay route. The ip rule stays.
+#[cfg(all(target_os = "linux", feature = "tun"))]
+fn remove_overlay_route(tun_name: &str, table: u8) {
+    let (addr, len) = yggdrasil::address::overlay_network();
+    let cidr = format!("{addr}/{len}");
+    let table_id = table.to_string();
+    match std::process::Command::new("ip")
+        .args(["-6", "route", "del", &cidr, "dev", tun_name, "table", &table_id])
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            tracing::info!("Removed overlay route {cidr} dev {tun_name} table {table}");
+        }
+        Ok(out) => {
+            tracing::debug!(
+                "Overlay route {cidr} table {table} not removed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Err(e) => tracing::debug!("failed to run ip route del: {e}"),
+    }
 }
 
 #[cfg(test)]
