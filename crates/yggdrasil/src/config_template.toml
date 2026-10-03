@@ -83,27 +83,26 @@ if_mtu = 65535
 # default for compatibility with the public Yggdrasil network.
 # session_path_timeout = 60
 
-# When true, periodically send empty encrypted traffic to each directly
-# connected peer so that the encrypted session (and the remote path) do
-# not expire during idle periods. Default: false. Compatible with 
-# yggdrasil-go and older yggdrasil-ng nodes.
-# keepalive_direct = false
-
-# Keep up to this many recently used non-direct destinations reachable.
-# After the first outbound application write, send a session probe on
-# keepalive_interval; a patched peer answers once, which refreshes the
+# Session and path keepalives. Missing table uses the defaults below.
+# direct: send empty encrypted traffic to each directly connected peer so
+# the encrypted session (and the remote path) do not expire during idle
+# periods. Default: false. Compatible with yggdrasil-go and older
+# yggdrasil-ng nodes.
+# remote_count: keep up to this many recently used non-direct destinations
+# reachable. After the first outbound application write, send a session
+# probe on interval; a patched peer answers once, which refreshes the
 # session and the cached path. Not delivered to the TUN. Older peers
 # ignore the probe as non-IP and do not answer, so the path can still
 # expire toward them. LRU, range 0-1000. Default: 0 = disabled.
-# Independent of keepalive_direct.
-# keepalive_remote_count = 0
-
-# Interval in seconds between keepalive probes for direct peers and for
-# destinations tracked by keepalive_remote_count. Clamped to the range
+# Independent of direct.
+# interval: seconds between keepalive probes for direct peers and for
+# destinations tracked by remote_count. Clamped to the range
 # [15, session_path_timeout/2] at runtime (default: 20). Only meaningful
-# when keepalive_direct is true and/or keepalive_remote_count is greater
-# than zero.
-# keepalive_interval = 20
+# when direct is true and/or remote_count is greater than zero.
+# [keepalive]
+# direct = false
+# remote_count = 0
+# interval = 20
 
 # ---------------------------------------------------------------------------
 # Peer liveness (ironwood read-deadline after non-keepalive frames)

@@ -24,7 +24,7 @@
 >
 > - Linux policy routing (`[ip_rule]`) — a generated config adds `pref: from all lookup <table>` and installs the overlay prefix route plus CKR routes in that table — [Linux policy routing](#linux-policy-routing)
 >
-> - Session and path keepalives (`session_path_timeout`, `keepalive_direct`, `keepalive_remote_count`, `keepalive_interval`) — [Key configuration options](#config-file-format-toml)
+> - Session and path keepalives (`session_path_timeout`, `[keepalive]` `direct` / `remote_count` / `interval`) — [Key configuration options](#config-file-format-toml)
 >
 > - CKR route lists from `file://` and `http(s)://`, and `_` (system routes without a CKR tunnel) — [docs/CKR.md](docs/CKR.md#configuration)
 >
@@ -296,9 +296,6 @@ Yggdrasil-ng uses **TOML** format for configuration (unlike the Go version which
 | `if_gso` | bool | TUN segmentation offload, Linux only (default: false) — see [docs/GSO.md](docs/GSO.md) |
 | `group_password` | string | Closed-network password; empty = open mesh. See [Group password (closed networks)](#group-password-closed-networks) |
 | `session_path_timeout` | integer | Timeout in seconds for both encrypted sessions and cached paths. (60-86400, default: 60) For geeks. |
-| `keepalive_direct` | bool | Send empty traffic to direct peers on a short interval so idle sessions do not expire. (default: false). |
-| `keepalive_remote_count` | integer | LRU size for recently used non-direct destinations. A patched peer acks the probe, which keeps the session and the cached path alive. (0–1000, default: 0 = off). |
-| `keepalive_interval` | integer | Seconds between keepalive probes (direct and remote LRU). (15-`session_path_timeout`/2) (default: 20). |
 | `node_info` | table | Custom node metadata (TOML table) |
 | `node_info_privacy` | bool | Hide node info from other nodes (default: false) |
 | `allowed_public_keys` | array | Whitelist of allowed peer keys (empty = allow all) |
@@ -306,6 +303,7 @@ Yggdrasil-ng uses **TOML** format for configuration (unlike the Go version which
 | `[[multicast_interfaces]]` | array of tables | LAN multicast discovery (`filter`, `beacon`, `listen`, `port`, `priority`, `password`) |
 | `[tunnel_routing]` | table | CKR tunnel routing config (`ckr` feature, enabled by default) — see [docs/CKR.md](docs/CKR.md) |
 | `[peer_liveness]` | table | Peer liveness / read-deadline policy (fixed or adaptive interval + probe count). Default: fixed mode (`adaptive = false`). See [docs/PEER_LIVENESS.md](docs/PEER_LIVENESS.md) |
+| `[keepalive]` | table | Session and path keepalives. `direct` (bool, default: false) sends empty traffic to direct peers so idle sessions do not expire. `remote_count` (integer, 0–1000, default: 0 = off) is the LRU size for recently used non-direct destinations; a patched peer acks the probe, which keeps the session and the cached path alive. `interval` (integer, 15–`session_path_timeout`/2, default: 20) is the seconds between those probes. A missing table uses these defaults. |
 | `[ip_rule]` | table | Linux only. `pref` and `lookup` select an `ip rule` and a routing table for the overlay prefix route and CKR routes. A generated config sets `pref = 9000` and `lookup = 200`. See [Linux policy routing](#linux-policy-routing) |
 
 **Example minimal configuration:**
