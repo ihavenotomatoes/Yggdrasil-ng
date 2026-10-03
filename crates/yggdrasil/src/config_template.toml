@@ -135,12 +135,13 @@ if_mtu = 65535
 # probe_count = 3
 
 # Linux policy routing for the prefix route and CKR routes. Ignored on every other OS.
-# Both must be greater than 0 to take effect. pref is clamped to 32765,
-# lookup (routing table id) is clamped to 251.
+# enable defaults to true. pref is clamped to 1..=32765 (default 9000),
+# lookup (routing table id) is clamped to 1..=251 (default 200).
+# 0 and negative pref/lookup are raised to 1; they do not disable the rule.
 # The rule is not removed on shutdown; other interfaces may use the same table.
-# Default values: pref = 9000, lookup = 200. To disable ip_rule and return routes 
-# to the main table, uncomment the lines below and set pref = 0, lookup = 0
+# To keep routes in the main table, uncomment the lines below and set enable = false.
 # [ip_rule]
+# enable = true
 # pref = 9000
 # lookup = 200
 

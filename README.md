@@ -304,7 +304,7 @@ Yggdrasil-ng uses **TOML** format for configuration (unlike the Go version which
 | `[tunnel_routing]` | table | CKR tunnel routing config (`ckr` feature, enabled by default) — see [docs/CKR.md](docs/CKR.md) |
 | `[peer_liveness]` | table | Peer liveness / read-deadline policy (fixed or adaptive interval + probe count). Default: fixed mode (`adaptive = false`). See [docs/PEER_LIVENESS.md](docs/PEER_LIVENESS.md) |
 | `[keepalive]` | table | Session and path keepalives. `direct` (bool, default: false) sends empty traffic to direct peers so idle sessions do not expire. `remote_count` (integer, 0–1000, default: 0 = off) is the LRU size for recently used non-direct destinations; a patched peer acks the probe, which keeps the session and the cached path alive. `interval` (integer, 15–`session_path_timeout`/2, default: 20) is the seconds between those probes. A missing table uses these defaults. |
-| `[ip_rule]` | table | Linux only. `pref` and `lookup` select an `ip rule` and a routing table for the overlay prefix route and CKR routes. A generated config sets `pref = 9000` and `lookup = 200`. See [Linux policy routing](#linux-policy-routing) |
+| `[ip_rule]` | table | Linux only. `enable` (bool, default: true) selects an `ip rule` and a routing table for the overlay prefix route and CKR routes. `pref` (default: 9000, clamped to 1–32765) is the rule priority, `lookup` (default: 200, clamped to 1–251) is the table id. `enable = false` keeps routes in the main table. See [Linux policy routing](#linux-policy-routing) |
 
 **Example minimal configuration:**
 
@@ -477,11 +477,12 @@ Use group_password together with ?password= on every personal overlay. A differe
 
 ```toml
 [ip_rule]
+enable = true
 pref = 9000
 lookup = 200
 ```
 
-Default values: `pref = 9000`, `lookup = 200`. To disable ip_rule and return routes to the main table, set `pref = 0`, `lookup = 0`
+Default values: enable = true, pref = 9000, lookup = 200. To keep routes in the main table, set enable = false.
 
 ### Here's how it works
 
@@ -491,7 +492,7 @@ On Linux startup the node then ensures this rule exists for both IPv4 and IPv6:
 ```
 The same table is used for the overlay prefix route (`200::/7`, or `<prefix>00::/7` [when the address prefix was changed](docs/PREFIX.md)) and for CKR system routes. The kernel copy of the overlay route is removed from the main table.
 
-pref is the rule priority. Values above 32765 are clamped to 32765. lookup is the routing table id. Values above 251 are clamped to 251. Both must be greater than zero. If either is 0 or negative, no rule is added and routes stay in the main table, as before.
+`enable` is the master switch (default: true). `pref` is the rule priority. Values below 1 are raised to 1, values above 32765 are clamped to 32765. `lookup` is the routing table id. Values below 1 are raised to 1, values above 251 are clamped to 251. `0` and negative numbers do not disable the rule. If `enable` is false, no rule is added and routes stay in the main table.
 
 The rule is not removed on shutdown, so other interfaces can keep using the same table. Overlay and CKR routes that this node installed are removed.
 

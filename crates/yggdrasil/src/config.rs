@@ -156,7 +156,7 @@ pub struct Config {
     pub peer_liveness: PeerLivenessConfig,
 
     /// Linux `ip rule` / routing-table selection. Ignored except on Linux.
-    /// Both `pref` and `lookup` must be > 0; see `IpRuleConfig::effective`.
+    /// Disabled only when `enable` is false; see `IpRuleConfig::effective`.
     #[serde(default)]
     pub ip_rule: IpRuleConfig,
 }
@@ -259,29 +259,37 @@ fn default_peer_liveness_probe_count() -> u32 { 3 }
 /// Linux-only `[ip_rule]`. Other platforms parse it and do nothing.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IpRuleConfig {
-    /// `ip rule` priority. `<= 0` disables the feature. Clamped to 32765.
+    /// Install the rule and put overlay/CKR routes in `lookup`. Default: true.
+    /// False keeps routes in the main table and does not add a rule.
+    #[serde(default = "default_true")]
+    pub enable: bool,
+    /// `ip rule` priority. Default: 9000. Clamped to 1..=32765.
     #[serde(default)]
     pub pref: i64,
-    /// Routing table id. `<= 0` disables the feature. Clamped to 251.
+    /// Routing table id. Default: 200. Clamped to 1..=251.
     #[serde(default)]
     pub lookup: i64,
 }
 
 impl Default for IpRuleConfig {
     fn default() -> Self {
-        Self { pref: 9000, lookup: 200 }
+        Self {
+            enable: true,
+            pref: 9000,
+            lookup: 200,
+        }
     }
 }
 
 impl IpRuleConfig {
-    /// `Some((pref, lookup))` only when both configured values are positive.
-    /// `pref` is clamped to 1..=32765, `lookup` to 1..=251.
+    /// `None` only when `enable` is false. Otherwise `pref` is clamped to
+    /// 1..=32765 and `lookup` to 1..=251, including 0 and negative values.
     pub fn effective(&self) -> Option<(i64, u8)> {
-        if self.pref <= 0 || self.lookup <= 0 {
+        if !self.enable {
             return None;
         }
-        let pref = self.pref.min(32765);
-        let lookup = self.lookup.min(251) as u8;
+        let pref = self.pref.clamp(1, 32765);
+        let lookup = self.lookup.clamp(1, 251) as u8;
         Some((pref, lookup))
     }
 }
@@ -943,26 +951,32 @@ mod normalize_tests {
     #[test]
     fn ip_rule_defaults_and_clamp() {
         let cfg = Config::default();
+        assert!(cfg.ip_rule.enable);
         assert_eq!(cfg.ip_rule.pref, 9000);
         assert_eq!(cfg.ip_rule.lookup, 200);
         assert_eq!(cfg.ip_rule.effective(), Some((9000, 200)));
 
-        let mut rule = IpRuleConfig { pref: 0, lookup: 200 };
+        let mut rule = IpRuleConfig { enable: false, pref: 9000, lookup: 200 };
         assert_eq!(rule.effective(), None);
-        rule = IpRuleConfig { pref: 9000, lookup: 0 };
-        assert_eq!(rule.effective(), None);
-        rule = IpRuleConfig { pref: -1, lookup: 200 };
-        assert_eq!(rule.effective(), None);
-        rule = IpRuleConfig { pref: 9000, lookup: -5 };
+        rule = IpRuleConfig { enable: false, pref: 0, lookup: -5 };
         assert_eq!(rule.effective(), None);
 
-        rule = IpRuleConfig { pref: 9000, lookup: 200 };
+        rule = IpRuleConfig { enable: true, pref: 0, lookup: 200 };
+        assert_eq!(rule.effective(), Some((1, 200)));
+        rule = IpRuleConfig { enable: true, pref: 9000, lookup: 0 };
+        assert_eq!(rule.effective(), Some((9000, 1)));
+        rule = IpRuleConfig { enable: true, pref: -1, lookup: 200 };
+        assert_eq!(rule.effective(), Some((1, 200)));
+        rule = IpRuleConfig { enable: true, pref: 9000, lookup: -5 };
+        assert_eq!(rule.effective(), Some((9000, 1)));
+
+        rule = IpRuleConfig { enable: true, pref: 9000, lookup: 200 };
         assert_eq!(rule.effective(), Some((9000, 200)));
-        rule = IpRuleConfig { pref: 1, lookup: 1 };
+        rule = IpRuleConfig { enable: true, pref: 1, lookup: 1 };
         assert_eq!(rule.effective(), Some((1, 1)));
-        rule = IpRuleConfig { pref: 40000, lookup: 300 };
+        rule = IpRuleConfig { enable: true, pref: 40000, lookup: 300 };
         assert_eq!(rule.effective(), Some((32765, 251)));
-        rule = IpRuleConfig { pref: 32765, lookup: 251 };
+        rule = IpRuleConfig { enable: true, pref: 32765, lookup: 251 };
         assert_eq!(rule.effective(), Some((32765, 251)));
     }
 
@@ -972,6 +986,7 @@ mod normalize_tests {
             private_key = ""
         "#;
         let cfg: Config = toml::from_str(absent).unwrap();
+        assert!(cfg.ip_rule.enable);
         assert_eq!(cfg.ip_rule.pref, 9000);
         assert_eq!(cfg.ip_rule.lookup, 200);
         assert_eq!(cfg.ip_rule.effective(), Some((9000, 200)));
@@ -983,9 +998,31 @@ mod normalize_tests {
             lookup = 200
         "#;
         let cfg: Config = toml::from_str(text).unwrap();
+        assert!(cfg.ip_rule.enable);
         assert_eq!(cfg.ip_rule.pref, 9000);
         assert_eq!(cfg.ip_rule.lookup, 200);
         assert_eq!(cfg.ip_rule.effective(), Some((9000, 200)));
+
+        let clamped = r#"
+            private_key = ""
+            [ip_rule]
+            enable = true
+            pref = 0
+            lookup = -3
+        "#;
+        let cfg: Config = toml::from_str(clamped).unwrap();
+        assert_eq!(cfg.ip_rule.effective(), Some((1, 1)));
+
+        let disabled = r#"
+            private_key = ""
+            [ip_rule]
+            enable = false
+            pref = 9000
+            lookup = 200
+        "#;
+        let cfg: Config = toml::from_str(disabled).unwrap();
+        assert!(!cfg.ip_rule.enable);
+        assert_eq!(cfg.ip_rule.effective(), None);
     }
 }
 
