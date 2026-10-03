@@ -250,7 +250,7 @@ pub struct IpRuleConfig {
 
 impl Default for IpRuleConfig {
     fn default() -> Self {
-        Self { pref: 0, lookup: 0 }
+        Self { pref: 9000, lookup: 200 }
     }
 }
 
@@ -922,9 +922,9 @@ mod normalize_tests {
     #[test]
     fn ip_rule_defaults_and_clamp() {
         let cfg = Config::default();
-        assert_eq!(cfg.ip_rule.pref, 0);
-        assert_eq!(cfg.ip_rule.lookup, 0);
-        assert_eq!(cfg.ip_rule.effective(), None);
+        assert_eq!(cfg.ip_rule.pref, 9000);
+        assert_eq!(cfg.ip_rule.lookup, 200);
+        assert_eq!(cfg.ip_rule.effective(), Some((9000, 200)));
 
         let mut rule = IpRuleConfig { pref: 0, lookup: 200 };
         assert_eq!(rule.effective(), None);
@@ -951,7 +951,9 @@ mod normalize_tests {
             private_key = ""
         "#;
         let cfg: Config = toml::from_str(absent).unwrap();
-        assert_eq!(cfg.ip_rule.effective(), None);
+        assert_eq!(cfg.ip_rule.pref, 9000);
+        assert_eq!(cfg.ip_rule.lookup, 200);
+        assert_eq!(cfg.ip_rule.effective(), Some((9000, 200)));
 
         let text = r#"
             private_key = ""

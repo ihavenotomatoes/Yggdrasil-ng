@@ -470,22 +470,25 @@ Use group_password together with ?password= on every personal overlay. A differe
 
 ## Linux policy routing
 
-Linux only. Other operating systems parse `[ip_rule]` and ignore it.
-
-A newly generated config enables this by default:
+**Linux only.** Other operating systems parse `[ip_rule]` and ignore it.
 
 ```toml
 [ip_rule]
 pref = 9000
 lookup = 200
 ```
+
+Default values: `pref = 9000`, `lookup = 200`. To disable ip_rule and return routes to the main table, set `pref = 0`, `lookup = 0`
+
+### Here's how it works
+
 On Linux startup the node then ensures this rule exists for both IPv4 and IPv6:
 ```text
 9000:	from all lookup 200
 ```
-The same table is used for the overlay prefix route (200::/7, or <prefix>::/7 when the address prefix was changed) and for CKR system routes. The kernel copy of the overlay route is removed from the main table. CKR routes are installed only in the selected table.
+The same table is used for the overlay prefix route (`200::/7`, or `<prefix>00::/7` [when the address prefix was changed](docs/PREFIX.md)) and for CKR system routes. The kernel copy of the overlay route is removed from the main table.
 
-pref is the rule priority. Values above 32765 are clamped to 32765. lookup is the routing table id. Values above 251 are clamped to 251. Both must be greater than zero. If either is 0 or negative, or if [ip_rule] is absent, no rule is added and routes stay in the main table, as before.
+pref is the rule priority. Values above 32765 are clamped to 32765. lookup is the routing table id. Values above 251 are clamped to 251. Both must be greater than zero. If either is 0 or negative, no rule is added and routes stay in the main table, as before.
 
 The rule is not removed on shutdown, so other interfaces can keep using the same table. Overlay and CKR routes that this node installed are removed.
 
