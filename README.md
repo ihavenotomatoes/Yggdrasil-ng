@@ -116,7 +116,7 @@ cargo build --release --target aarch64-unknown-linux-gnu
 #### Build for Termux to run on rooted devices
 [Read this!](docs/TERMUX.md)
 
-#### Build for ancient Linux distributions, and Windows 7 and newer
+#### Build for ancient Linux distributions, and for Windows 7 and newer
 [You can do it!](docs/LEGACY.md)
 
 ## Installation

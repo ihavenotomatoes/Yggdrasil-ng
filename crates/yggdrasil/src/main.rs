@@ -474,6 +474,10 @@ async fn run_node(
     #[cfg(not(target_os = "linux"))]
     let route_table = None;
 
+    // JoinHandle must outlive the startup block so shutdown can stop the retry loop.
+    #[cfg(target_os = "linux")]
+    let mut local_subnet_route_task: Option<tokio::task::JoinHandle<()>> = None;
+
     // If Ctrl+C arrived during download / peer-exclusion prep, skip the remaining
     // CKR init / IP assignment / route install so shutdown can proceed immediately.
     if !*shutdown_rx.borrow() {
@@ -557,6 +561,17 @@ async fn run_node(
             }
         }
 
+        // Node /64 via the LAN interface that holds <subnet>::1, into the same
+        // table as the overlay route. Independent of tunnel_routing.enable.
+        #[cfg(target_os = "linux")]
+        if let Some(table) = route_table {
+            let subnet = subnet_for_key(core.public_key());
+            let mut retry_shutdown = shutdown_rx.clone();
+            local_subnet_route_task = Some(tokio::spawn(async move {
+                install_local_subnet_route_with_retries(subnet, table, &mut retry_shutdown).await;
+            }));
+        }
+
         // Wait for shutdown signal
         tracing::info!("Yggdrasil NG started");
     }
@@ -574,6 +589,17 @@ async fn run_node(
 
     shutdown_rx.changed().await.ok();
     tracing::info!("Shutting down...");
+
+    #[cfg(target_os = "linux")]
+    if let Some(task) = local_subnet_route_task.take() {
+        task.abort();
+        let _ = task.await;
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(table) = route_table {
+        let subnet = subnet_for_key(core.public_key());
+        remove_local_subnet_route(&subnet.to_string(), table);
+    }
 
     // Cleanup
     // Remove CKR routes before TUN is destroyed (critical on Windows where
@@ -1375,6 +1401,164 @@ fn remove_overlay_route(tun_name: &str, table: u8) {
     }
 }
 
+const LOCAL_SUBNET_ROUTE_RETRIES: u32 = 10;
+const LOCAL_SUBNET_ROUTE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `<subnet>::1`. The first 8 bytes are the node subnet; the host part is `::1`.
+#[cfg(target_os = "linux")]
+fn local_subnet_gateway(subnet: &yggdrasil::address::Subnet) -> std::net::Ipv6Addr {
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&subnet.0);
+    bytes[15] = 1;
+    std::net::Ipv6Addr::from(bytes)
+}
+
+/// Interfaces from `ip -6 -o addr show` that have `wanted` with prefix 64..=128.
+/// The same name twice counts once. `tentative` / `dadfailed` are skipped so a
+/// later retry can see the address after DAD.
+#[cfg(target_os = "linux")]
+fn local_subnet_gateway_ifaces(text: &str, wanted: std::net::Ipv6Addr) -> Vec<String> {
+    let mut found = Vec::new();
+    for line in text.lines() {
+        if line.contains("tentative") || line.contains("dadfailed") {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let _index = parts.next();
+        let iface = match parts.next() {
+            Some(name) => name.split('@').next().unwrap_or(name),
+            None => continue,
+        };
+        if iface.is_empty() {
+            continue;
+        }
+        let addr_tok = loop {
+            match parts.next() {
+                Some("inet6") => break parts.next(),
+                Some(_) => continue,
+                None => break None,
+            }
+        };
+        let Some(addr_tok) = addr_tok else { continue };
+        let Some((addr_str, prefix_str)) = addr_tok.split_once('/') else { continue };
+        let Ok(prefix) = prefix_str.parse::<u8>() else { continue };
+        if !(64..=128).contains(&prefix) {
+            continue;
+        }
+        let Ok(addr) = addr_str.parse::<std::net::Ipv6Addr>() else { continue };
+        if addr == wanted && !found.iter().any(|name: &String| name == iface) {
+            found.push(iface.to_string());
+        }
+    }
+    found
+}
+
+#[cfg(target_os = "linux")]
+fn list_local_subnet_gateway_ifaces(wanted: std::net::Ipv6Addr) -> Result<Vec<String>, String> {
+    let output = std::process::Command::new("ip")
+        .args(["-6", "-o", "addr", "show"])
+        .output()
+        .map_err(|e| format!("failed to run ip -6 addr show: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "ip -6 addr show failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    Ok(local_subnet_gateway_ifaces(&text, wanted))
+}
+
+#[cfg(target_os = "linux")]
+fn install_local_subnet_route(cidr: &str, iface: &str, table: u8) -> Result<(), String> {
+    let table_id = table.to_string();
+    let added = std::process::Command::new("ip")
+        .args(["-6", "route", "replace", cidr, "dev", iface, "table", &table_id])
+        .output()
+        .map_err(|e| format!("failed to run ip route replace: {e}"))?;
+    if !added.status.success() {
+        return Err(format!(
+            "ip route replace {cidr} dev {iface} table {table} failed: {}",
+            String::from_utf8_lossy(&added.stderr).trim()
+        ));
+    }
+    tracing::info!("Installed local subnet route {cidr} dev {iface} table {table}");
+    Ok(())
+}
+
+/// Delete only the extra-table /64. Missing route is not an error.
+#[cfg(target_os = "linux")]
+fn remove_local_subnet_route(cidr: &str, table: u8) {
+    let table_id = table.to_string();
+    match std::process::Command::new("ip")
+        .args(["-6", "route", "del", cidr, "table", &table_id])
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            tracing::info!("Removed local subnet route {cidr} table {table}");
+        }
+        Ok(out) => {
+            tracing::debug!(
+                "Local subnet route {cidr} table {table} not removed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Err(e) => tracing::debug!("failed to run ip route del: {e}"),
+    }
+}
+
+/// First look is immediate. Up to 10 more looks, 60s apart. Stop once the route
+/// is installed, or when shutdown is signalled. Ambiguous interfaces install nothing.
+#[cfg(target_os = "linux")]
+async fn install_local_subnet_route_with_retries(
+    subnet: yggdrasil::address::Subnet,
+    table: u8,
+    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+) {
+    let cidr = subnet.to_string();
+    let wanted = local_subnet_gateway(&subnet);
+    for attempt in 0..=LOCAL_SUBNET_ROUTE_RETRIES {
+        if *shutdown_rx.borrow() {
+            return;
+        }
+        match list_local_subnet_gateway_ifaces(wanted) {
+            Ok(ifaces) if ifaces.len() == 1 => {
+                match install_local_subnet_route(&cidr, &ifaces[0], table) {
+                    Ok(()) => return,
+                    Err(e) => tracing::error!("Failed to install local subnet route: {e}"),
+                }
+            }
+            Ok(ifaces) if ifaces.len() > 1 => {
+                tracing::debug!(
+                    "Local subnet gateway {wanted} is on multiple interfaces ({}); not installing {cidr} table {table}",
+                    ifaces.join(", ")
+                );
+            }
+            Ok(_) => {
+                tracing::debug!(
+                    "Local subnet gateway {wanted} not found; not installing {cidr} table {table}"
+                );
+            }
+            Err(e) => tracing::debug!("Failed to list IPv6 addresses: {e}"),
+        }
+        if attempt == LOCAL_SUBNET_ROUTE_RETRIES {
+            tracing::debug!(
+                "Stopped looking for local subnet gateway {wanted} after {LOCAL_SUBNET_ROUTE_RETRIES} retries"
+            );
+            return;
+        }
+        tracing::debug!(
+            "Retrying local subnet route {cidr} table {table} in 60s ({}/{})",
+            attempt + 1,
+            LOCAL_SUBNET_ROUTE_RETRIES
+        );
+        tokio::select! {
+            _ = shutdown_rx.changed() => return,
+            _ = tokio::time::sleep(LOCAL_SUBNET_ROUTE_INTERVAL) => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1812,5 +1996,36 @@ mod tests {
         assert!(!ip_rule_line_matches("9001: from all lookup 200", 9000, 200));
         assert!(!ip_rule_line_matches("9000: from all lookup 201", 9000, 200));
         assert!(!ip_rule_line_matches("9000: from 10.0.0.0/8 lookup 200", 9000, 200));
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    #[test]
+    fn local_subnet_gateway_iface_parse() {
+        let subnet = yggdrasil::address::Subnet([0x03, 0x00, 0x00, 0x10, 0x00, 0x20, 0x00, 0x30]);
+        let wanted = local_subnet_gateway(&subnet);
+        assert_eq!(wanted, "300:10:20:30::1".parse::<std::net::Ipv6Addr>().unwrap());
+        assert_eq!(subnet.to_string(), "300:10:20:30::/64");
+
+        let text = "\
+1: lo    inet6 ::1/128 scope host \n\
+2: br0    inet6 300:10:20:30::1/64 scope global \n\
+3: eth0    inet6 300:10:20:30::1/128 scope global \n\
+4: eth1    inet6 300:10:20:30::2/64 scope global \n\
+5: eth2    inet6 300:10:20:31::1/64 scope global \n\
+6: eth3    inet6 300:10:20:30::1/63 scope global \n\
+7: eth4    inet6 300:10:20:30::1/64 scope global tentative \n\
+8: mac0@eth5    inet6 300:10:20:30::1/96 scope global \n\
+2: br0    inet6 300:10:20:30::1/64 scope global \n";
+
+        assert_eq!(
+            local_subnet_gateway_ifaces(text, wanted),
+            vec!["br0".to_string(), "eth0".to_string(), "mac0".to_string()]
+        );
+
+        let one = "3: br0    inet6 300:10:20:30::1/64 scope global \n";
+        assert_eq!(local_subnet_gateway_ifaces(one, wanted), vec!["br0".to_string()]);
+
+        let none = "3: br0    inet6 300:10:20:30::2/64 scope global \n";
+        assert!(local_subnet_gateway_ifaces(none, wanted).is_empty());
     }
 }
