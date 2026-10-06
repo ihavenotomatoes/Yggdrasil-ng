@@ -1401,7 +1401,9 @@ fn remove_overlay_route(tun_name: &str, table: u8) {
     }
 }
 
+#[cfg(target_os = "linux")]
 const LOCAL_SUBNET_ROUTE_RETRIES: u32 = 10;
+#[cfg(target_os = "linux")]
 const LOCAL_SUBNET_ROUTE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// `<subnet>::1`. The first 8 bytes are the node subnet; the host part is `::1`.
@@ -1414,8 +1416,8 @@ fn local_subnet_gateway(subnet: &yggdrasil::address::Subnet) -> std::net::Ipv6Ad
 }
 
 /// Interfaces from `ip -6 -o addr show` that have `wanted` with prefix 64..=128.
-/// The same name twice counts once. `tentative` / `dadfailed` are skipped so a
-/// later retry can see the address after DAD.
+/// The same name twice counts once. `lo` is never a target. `tentative` /
+/// `dadfailed` are skipped so a later retry can see the address after DAD.
 #[cfg(target_os = "linux")]
 fn local_subnet_gateway_ifaces(text: &str, wanted: std::net::Ipv6Addr) -> Vec<String> {
     let mut found = Vec::new();
@@ -1429,7 +1431,7 @@ fn local_subnet_gateway_ifaces(text: &str, wanted: std::net::Ipv6Addr) -> Vec<St
             Some(name) => name.split('@').next().unwrap_or(name),
             None => continue,
         };
-        if iface.is_empty() {
+        if iface.is_empty() || iface == "lo" {
             continue;
         }
         let addr_tok = loop {
@@ -2007,7 +2009,7 @@ mod tests {
         assert_eq!(subnet.to_string(), "300:10:20:30::/64");
 
         let text = "\
-1: lo    inet6 ::1/128 scope host \n\
+1: lo    inet6 300:10:20:30::1/128 scope host \n\
 2: br0    inet6 300:10:20:30::1/64 scope global \n\
 3: eth0    inet6 300:10:20:30::1/128 scope global \n\
 4: eth1    inet6 300:10:20:30::2/64 scope global \n\
@@ -2027,5 +2029,8 @@ mod tests {
 
         let none = "3: br0    inet6 300:10:20:30::2/64 scope global \n";
         assert!(local_subnet_gateway_ifaces(none, wanted).is_empty());
+        
+        let only_lo = "1: lo    inet6 300:10:20:30::1/128 scope host \n";
+        assert!(local_subnet_gateway_ifaces(only_lo, wanted).is_empty());
     }
 }
