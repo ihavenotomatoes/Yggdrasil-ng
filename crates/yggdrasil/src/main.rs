@@ -838,7 +838,7 @@ fn make_cli_options() -> Options {
     opts.optflag("j", "json", "Output control command results as raw JSON");
     #[cfg(windows)]
     opts.optflag("", "service", "Run as a Windows service (launched by the Service Control Manager)");
-    opts.optopt("", "peers", "Comma-separated list of additional peer URIs to connect to (appended to config peers)", "PEERS");
+    opts.optopt("p", "peers", "Comma-separated list of additional peer URIs to connect to (appended to config peers)", "PEERS");
     opts.optflag("h", "help", "Print this help");
     opts.optflag("v", "version", "Print version");
     opts
