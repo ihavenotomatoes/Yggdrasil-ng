@@ -13,7 +13,7 @@
 >
 > - Reuse an existing `private_key` when generating a new template (`-b` / `--base`) — [Command Line Options](#command-line-options), [Starting Yggdrasil](#starting-yggdrasil)
 >
-> - Extra peers from the command line (`--peers`) — [Command Line Options](#command-line-options)
+> - The `--peers` option, instead of `--peer`, to easily add multiple peers. — [Command Line Options](#command-line-options)
 >
 > - Several simultaneous links to the same peer (different transports or
   sockets), capped on inbound by `max_inbound_links_per_peer` — [Key configuration options](#config-file-format-toml)
@@ -159,7 +159,7 @@ yggdrasil [options]
 | `-b, --base FILE` | With `--genconf`, copy `private_key` from this existing config |
 | `--logto FILE` | Log to a file instead of stderr (appends) |
 | `--service` | Run as a Windows service (Windows only) |
-| `--peers PEERS` | Peer URIs. Comma-separated and may be quoted. |
+| `-p, --peers PEERS` | Peer URIs. Comma-separated and may be quoted. |
 | `-h, --help` | Print help message |
 | `-v, --version` | Print version |
 
