@@ -13,7 +13,7 @@
 >
 > - Reuse an existing `private_key` when generating a new template (`-b` / `--base`) — [Command Line Options](#command-line-options), [Starting Yggdrasil](#starting-yggdrasil)
 >
-> - Extra peers from the command line (`--peers`) — [Command Line Options](#command-line-options)
+> - The `--peers` option, instead of `--peer`, to easily add multiple peers. — [Command Line Options](#command-line-options)
 >
 > - Several simultaneous links to the same peer (different transports or
   sockets), capped on inbound by `max_inbound_links_per_peer` — [Key configuration options](#config-file-format-toml)
@@ -22,13 +22,17 @@
 >
 > - Peer liveness / read-deadline policy (`[peer_liveness]`) — [docs/PEER_LIVENESS.md](docs/PEER_LIVENESS.md)
 >
-> - Session and path keepalives (`session_path_timeout`, `keepalive_direct`, `keepalive_remote_count`, `keepalive_interval`) — [Key configuration options](#config-file-format-toml)
+> - Linux policy routing (`[ip_rule]`) — a generated config adds `pref: from all lookup <table>` and installs the overlay prefix route plus CKR routes in that table — [Linux policy routing](#linux-policy-routing)
+>
+> - Session and path keepalives (`session_path_timeout`, `[keepalive]` `direct` / `remote_count` / `interval`) — [Key configuration options](#config-file-format-toml)
 >
 > - CKR route lists from `file://` and `http(s)://`, and `_` (system routes without a CKR tunnel) — [docs/CKR.md](docs/CKR.md#configuration)
 >
+> - Config `include = "PATH"` lines, spliced in place (nested files, extra `peers` / CKR table keys) — [Including other files](#including-other-files)
+>
 > - FreeBSD: auto-created TUN is renamed to a Linux-like `ygg0` / `ygg{prefix}{port}`; shutdown destroys that alias
 >
->- NetBSD / OpenBSD: the TUN is created at the stock kernel MTU, then the highest accepted MTU is probed and and increased whenever possible
+> - NetBSD / OpenBSD: the TUN is created at the stock kernel MTU, then the highest accepted MTU is probed and and increased whenever possible
 
 A Rust rewrite of the [Yggdrasil Network](https://yggdrasil-network.github.io/) — an early-stage implementation of a fully end-to-end encrypted IPv6 networking protocol.
 This project aims to provide a lightweight, self-arranging, and secure mesh network alternative to the original Go implementation.
@@ -95,6 +99,13 @@ cargo build
 
 Binaries will be located in `./target/debug/`.
 
+Linux and Termux builds can override the two default directories at compile time. `YGGDRASIL_CONFIG_DIR` replaces `/etc/yggdrasil` as the system config directory; the filename is still taken from the binary name (`yggdrasil.toml`, or `<stem>.toml` for a prefix/port name such as `ygg_fc`). `YGGDRASIL_ROUTES_CACHE_DIR` replaces `/var/cache/yggdrasil` as the root for `http://` and `https://` route lists downloaded by the `ckr-advanced` feature; the `routes_download` or `routes_download_<prefix><port>` leaf is unchanged, and `file://` lists keep the path written in the config. Both variables are read while compiling, not when the binary starts. An empty value is the same as unset and keeps the historic default. On Android/Termux an unset `YGGDRASIL_CONFIG_DIR` still means the bare filename in the working directory. BSD, macOS and Windows ignore both variables.
+
+```bash
+YGGDRASIL_CONFIG_DIR=/data/yggdrasil \
+YGGDRASIL_ROUTES_CACHE_DIR=/data/yggdrasil/cache \
+cargo build --release
+
 ### Cross-Compilation
 
 To build for a different target, use the `--target` flag. For example, for Linux ARM64:
@@ -102,6 +113,11 @@ To build for a different target, use the `--target` flag. For example, for Linux
 ```bash
 cargo build --release --target aarch64-unknown-linux-gnu
 ```
+#### Build for Termux to run on rooted devices
+[Read this!](docs/TERMUX.md)
+
+#### Build for ancient Linux distributions, and for Windows 7 and newer
+[You can do it!](docs/LEGACY.md)
 
 ## Installation
 
@@ -143,7 +159,7 @@ yggdrasil [options]
 | `-b, --base FILE` | With `--genconf`, copy `private_key` from this existing config |
 | `--logto FILE` | Log to a file instead of stderr (appends) |
 | `--service` | Run as a Windows service (Windows only) |
-| `--peers PEERS` | Peer URIs. Comma-separated and may be quoted. |
+| `-p, --peers PEERS` | Peer URIs. Comma-separated and may be quoted. |
 | `-h, --help` | Print help message |
 | `-v, --version` | Print version |
 
@@ -193,8 +209,8 @@ That filename is then searched in this order:
 
 1. the current working directory;
 2. the OS system directory, same filename:
-   - Unix-like (Linux except Android, BSD, macOS): `/etc/yggdrasil/<filename>`
-   - Windows: `%ALLUSERSPROFILE%\Yggdrasil-ng\<filename>` (resolved via `SHGetKnownFolderPath(FOLDERID_ProgramData)`, usually `C:\ProgramData\Yggdrasil-ng\`).
+   - Unix-like (Linux except Android, BSD, macOS): `/etc/yggdrasil/<filename>`. Linux and Termux builds can replace that directory at compile time. `YGGDRASIL_CONFIG_DIR` is the system config directory (the filename is still derived from the binary name).
+   - Windows: `%ALLUSERSPROFILE%\Yggdrasil-ng\<filename>` (resolved from the `ProgramData` environment variable, then `ALLUSERSPROFILE`, then `C:\ProgramData`; usually `C:\ProgramData\Yggdrasil-ng\`).
 
 If the file exists in either place, the daemon and control commands can be started **without** `-c`.
 ```bash
@@ -270,6 +286,7 @@ Yggdrasil-ng uses **TOML** format for configuration (unlike the Go version which
 | Option | Type | Description |
 |--------|------|-------------|
 | `private_key` | string | Hex-encoded Ed25519 private key (128 hex chars, 64 bytes) |
+| `include` | string, repeatable | Replace this line with the text of another file. Relative paths are resolved against the file that contains the line. See [Including other files](#including-other-files) |
 | `peers` | array | Peer URIs to connect to, e.g. `["tcp://host:port"]` |
 | `listen` | array | Listen addresses, e.g. `["tcp://[::]:1234"]` |
 | `admin_listen` | string | Admin socket address, e.g. `"tcp://localhost:9001"` |
@@ -279,9 +296,6 @@ Yggdrasil-ng uses **TOML** format for configuration (unlike the Go version which
 | `if_gso` | bool | TUN segmentation offload, Linux only (default: false) — see [docs/GSO.md](docs/GSO.md) |
 | `group_password` | string | Closed-network password; empty = open mesh. See [Group password (closed networks)](#group-password-closed-networks) |
 | `session_path_timeout` | integer | Timeout in seconds for both encrypted sessions and cached paths. (60-86400, default: 60) For geeks. |
-| `keepalive_direct` | bool | Send empty traffic to direct peers on a short interval so idle sessions do not expire. (default: false). |
-| `keepalive_remote_count` | integer | LRU size for recently used non-direct destinations to keep alive. (0–1000, default: 0 = off). |
-| `keepalive_interval` | integer | Seconds between keepalive probes (direct and remote LRU). (15-`session_path_timeout`/2) (default: 20). |
 | `node_info` | table | Custom node metadata (TOML table) |
 | `node_info_privacy` | bool | Hide node info from other nodes (default: false) |
 | `allowed_public_keys` | array | Whitelist of allowed peer keys (empty = allow all) |
@@ -289,6 +303,8 @@ Yggdrasil-ng uses **TOML** format for configuration (unlike the Go version which
 | `[[multicast_interfaces]]` | array of tables | LAN multicast discovery (`filter`, `beacon`, `listen`, `port`, `priority`, `password`) |
 | `[tunnel_routing]` | table | CKR tunnel routing config (`ckr` feature, enabled by default) — see [docs/CKR.md](docs/CKR.md) |
 | `[peer_liveness]` | table | Peer liveness / read-deadline policy (fixed or adaptive interval + probe count). Default: fixed mode (`adaptive = false`). See [docs/PEER_LIVENESS.md](docs/PEER_LIVENESS.md) |
+| `[keepalive]` | table | Session and path keepalives. `direct` (bool, default: false) sends empty traffic to direct peers so idle sessions do not expire. `remote_count` (integer, 0–1000, default: 0 = off) is the LRU size for recently used non-direct destinations; a patched peer acks the probe, which keeps the session and the cached path alive. `interval` (integer, 15–`session_path_timeout`/2, default: 20) is the seconds between those probes. A missing table uses these defaults. |
+| `[ip_rule]` | table | Linux only. `enable` (bool, default: true) selects an `ip rule` and a routing table for the overlay prefix route and CKR routes. `pref` (default: 9000, clamped to 1–32765) is the rule priority, `lookup` (default: 200, clamped to 1–251) is the table id. `enable = false` keeps routes in the main table. See [Linux policy routing](#linux-policy-routing) |
 
 **Example minimal configuration:**
 
@@ -317,6 +333,51 @@ if_mtu = 65535
 name = "my-node"
 location = "datacenter-1"
 ```
+
+### Including other files
+
+An uncommented `include = "PATH"` or `include = 'PATH'` line is replaced with the contents of that file before the document is parsed. Repeat the line for several files; included files may contain further `include` lines. A missing file is skipped with a warning and startup continues.
+
+The included text is spliced **in place of that line**, so it must be valid TOML at that position:
+
+- a top-level fragment (other keys or tables);
+- extra elements inside an array such as `peers` / `listen`;
+- extra keys inside a table such as `[tunnel_routing.remote_subnets]`.
+
+Do not repeat a key or table header that already exists around the include line. Commented `# include = "..."` lines are ignored.
+
+```toml
+private_key = "0123456789abcdef..."
+
+peers = [
+    "tcp://192.0.2.1:443",
+include = "yggdrasil-peers.toml"
+]
+
+[tunnel_routing]
+enable = true
+
+[tunnel_routing.remote_subnets]
+include = "/etc/yggdrasil/yggdrasil-ckr.toml"
+```
+
+yggdrasil-peers.toml holds only array elements:
+```toml
+    "tcp://192.0.2.2:443",
+    "tcp://[2001:db8::1]:12345",
+```
+
+yggdrasil-ckr.toml holds only table keys:
+```toml
+"peer_public_key_hex_1" = ["10.99.0.0/24"]
+"peer_public_key_hex_2" = ["fd03:1:2:3::/64"]
+```
+
+##### Important note
+`--normalize` is refused while any include line is uncommented. `--genconf --base` follows `include` lines when reading `private_key`; other fields from the base file and from its includes are not copied into the new template.
+
+
+
 
 ### Transports
 
@@ -409,6 +470,31 @@ Use group_password together with ?password= on every personal overlay. A differe
 2. Rename all fields from PascalCase to snake_case
 3. Transport URIs (`tcp://`, `tls://`, `ws://`, `wss://`, `quic://`) work unchanged
 4. Update admin socket to TCP format if using Unix socket
+
+## Linux policy routing
+
+**Linux only.** Other operating systems parse `[ip_rule]` and ignore it.
+
+```toml
+[ip_rule]
+enable = true
+pref = 9000
+lookup = 200
+```
+
+Default values: enable = true, pref = 9000, lookup = 200. To keep routes in the main table, set enable = false.
+
+### Here's how it works
+
+On Linux startup the node then ensures this rule exists for both IPv4 and IPv6:
+```text
+9000:	from all lookup 200
+```
+The same table is used for the overlay prefix route (`200::/7`, or `<prefix>00::/7` [when the address prefix was changed](docs/PREFIX.md)) and for CKR system routes. The kernel copy of the overlay route is removed from the main table.
+
+`enable` is the master switch (default: true). `pref` is the rule priority. Values below 1 are raised to 1, values above 32765 are clamped to 32765. `lookup` is the routing table id. Values below 1 are raised to 1, values above 251 are clamped to 251. `0` and negative numbers do not disable the rule. If `enable` is false, no rule is added and routes stay in the main table.
+
+The rule is not removed on shutdown, so other interfaces can keep using the same table. Overlay and CKR routes that this node installed are removed.
 
 ## Crypto-Key Routing (CKR)
 

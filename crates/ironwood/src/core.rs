@@ -22,11 +22,11 @@ use crate::bloom::BloomFilter;
 use crate::config::Config;
 use crate::crypto::{Crypto, PublicKey};
 use crate::peers::{
-    dispatch_actions, peer_reader, peer_writer, LastWrite, PeerMessage, Peers, ReadDeadline,
+    dispatch_actions, peer_reader, peer_writer, LastWrite, PeerMessage, Peers, ReadDeadline, SigReqSent,
 };
 use crate::router::{PeerEntry, PeerId, Router, RouterAction, RouterAnnounce};
 use crate::traffic::{DeliveryQueue, TrafficPacket};
-use crate::types::{Addr, AsyncConn, Error, Result};
+use crate::types::{Addr, AsyncConn, Error, PacketConn, Result};
 use crate::wire;
 
 /// Default channel capacity for inbound traffic delivery.
@@ -65,6 +65,8 @@ pub(crate) enum RouterMsg {
         peer_id: PeerId,
         key: PublicKey,
         res: wire::SigRes,
+        /// SigRes arrival minus SigReq flush, measured on the link itself.
+        rtt: Duration,
     },
     HandleAnnounce {
         peer_id: PeerId,
@@ -384,8 +386,8 @@ async fn handle_router_msg(
                 }
             }
         }
-        RouterMsg::HandleResponse { peer_id, key, res } => {
-            router.handle_response(peer_id, &key, &res);
+        RouterMsg::HandleResponse { peer_id, key, res, rtt } => {
+            router.handle_response(peer_id, &key, &res, rtt);
         }
         RouterMsg::HandleAnnounce { peer_id, peer_key, ann } => {
             let actions = router.handle_announce(peer_id, &peer_key, &ann);
@@ -440,7 +442,7 @@ async fn handle_router_msg(
             for (key, entries) in &router.peers {
                 for (_id, entry) in entries {
                     let latency_ms = router
-                        .lags
+                        .rtts
                         .get(&entry.id)
                         .map(|d| d.as_secs_f64() * 1000.0)
                         .unwrap_or(0.0);
@@ -530,7 +532,7 @@ async fn handle_router_msg(
                 .map(|(key, entries)| {
                     let latency = entries
                         .keys()
-                        .find_map(|id| router.lags.get(id))
+                        .find_map(|id| router.rtts.get(id))
                         .map(|d| d.as_secs_f64() * 1000.0)
                         .unwrap_or(0.0);
                     (*key, latency)
@@ -639,6 +641,25 @@ impl PacketConnImpl {
             _actor_handle: actor_handle,
         }
     }
+
+    /// Same as `write_to`, but the router will not let this packet replace
+    /// an application packet already sitting in a path rumor. Remote
+    /// keepalive only. The flag is not on the wire.
+    pub(crate) async fn write_keepalive(&self, buf: &[u8], addr: &Addr) -> Result<usize> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Error::Closed);
+        }
+
+        let mtu = self.mtu();
+        if buf.len() as u64 > mtu {
+            return Err(Error::OversizedMessage);
+        }
+
+        let traffic = TrafficPacket::new(self.pub_key, addr.0, buf.to_vec()).keepalive();
+        self.router_handle.send(RouterMsg::SendTraffic { traffic });
+
+        Ok(buf.len())
+    }
 }
 
 #[async_trait::async_trait]
@@ -713,7 +734,7 @@ impl crate::types::PacketConn for PacketConnImpl {
 
         Ok(buf.len())
     }
-
+    
     async fn handle_conn(&self, key: Addr, conn: Box<dyn AsyncConn>, prio: u8) -> Result<()> {
         self.handle_conn_with_id(key, conn, prio, None).await
     }
@@ -866,6 +887,9 @@ impl PacketConnImpl {
         // still writing when the link ended.
         let last_write: LastWrite = Arc::new(std::sync::Mutex::new(None));
 
+        // Writer stamps SigReq flushes; reader measures RTT from it.
+        let sig_req_sent: SigReqSent = Arc::new(std::sync::Mutex::new(None));
+
         // Spawn writer task
         let writer_cancel = peer_cancel.clone();
         let _writer_handle = tokio::spawn(peer_writer(
@@ -882,6 +906,7 @@ impl PacketConnImpl {
             liveness.clone(),
             read_deadline.clone(),
             last_write.clone(),
+            sig_req_sent.clone(),
             writer_cancel,
         ));
 
@@ -901,6 +926,7 @@ impl PacketConnImpl {
             self.config.peer_keepalive_delay,
             read_deadline,
             last_write,
+            sig_req_sent,
         )
         .await;
 

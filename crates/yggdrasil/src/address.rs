@@ -29,6 +29,21 @@ pub fn address_prefix() -> u8 {
     ADDRESS_PREFIX.load(Ordering::Relaxed)
 }
 
+/// Overlay network routed at the TUN. Prefix length stays 7; the network
+/// address is the current address prefix with the subnet bit cleared.
+/// Default prefix byte 0x02 is `200::/7`.
+pub fn overlay_network_for_prefix(prefix: u8) -> (std::net::Ipv6Addr, u8) {
+    let first = prefix & 0xfe;
+    (
+        std::net::Ipv6Addr::from([first, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+        7,
+    )
+}
+
+pub fn overlay_network() -> (std::net::Ipv6Addr, u8) {
+    overlay_network_for_prefix(address_prefix())
+}
+
 /// Returns true if a custom prefix/port was successfully applied at startup
 /// (via binary/symlink/hardlink name suffix).
 pub fn prefix_port_set() -> bool {
@@ -318,6 +333,27 @@ mod tests {
                 bloom_full, bloom_partial,
                 "subnet bloom transform mismatch for key {:02x?}",
                 &full_key[..4]
+            );
+        }
+    }
+
+    #[cfg(test)]
+    mod overlay_tests {
+        use super::*;
+
+        #[test]
+        fn overlay_network_follows_prefix_byte() {
+            assert_eq!(
+                overlay_network_for_prefix(0x02),
+                ("200::".parse().unwrap(), 7)
+            );
+            assert_eq!(
+                overlay_network_for_prefix(0x03),
+                ("200::".parse().unwrap(), 7)
+            );
+            assert_eq!(
+                overlay_network_for_prefix(0xfc),
+                ("fc00::".parse().unwrap(), 7)
             );
         }
     }

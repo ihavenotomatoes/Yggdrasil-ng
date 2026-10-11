@@ -83,24 +83,26 @@ if_mtu = 65535
 # default for compatibility with the public Yggdrasil network.
 # session_path_timeout = 60
 
-# When true, periodically send empty encrypted traffic to each directly
-# connected peer so that the encrypted session (and the remote path) do
-# not expire during idle periods. Default: false. Compatible with 
-# yggdrasil-go and older yggdrasil-ng nodes.
-# keepalive_direct = false
-
-# Keep up to this many recently used non-direct destinations alive with
-# empty encrypted traffic after the first outbound application write
-# (LRU, range 0-1000). Default: 0 = disabled. Independent of keepalive_direct. 
-# Compatible with yggdrasil-go and older yggdrasil-ng nodes.
-# keepalive_remote_count = 0
-
-# Interval in seconds between keepalive probes for direct peers and for
-# destinations tracked by keepalive_remote_count. Clamped to the range
+# Session and path keepalives. Missing table uses the defaults below.
+# direct: send empty encrypted traffic to each directly connected peer so
+# the encrypted session (and the remote path) do not expire during idle
+# periods. Default: false. Compatible with yggdrasil-go and older
+# yggdrasil-ng nodes.
+# remote_count: keep up to this many recently used non-direct destinations
+# reachable. After the first outbound application write, send a session
+# probe on interval; a patched peer answers once, which refreshes the
+# session and the cached path. Not delivered to the TUN. Older peers
+# ignore the probe as non-IP and do not answer, so the path can still
+# expire toward them. LRU, range 0-1000. Default: 0 = disabled.
+# Independent of direct.
+# interval: seconds between keepalive probes for direct peers and for
+# destinations tracked by remote_count. Clamped to the range
 # [15, session_path_timeout/2] at runtime (default: 20). Only meaningful
-# when keepalive_direct is true and/or keepalive_remote_count is greater
-# than zero.
-# keepalive_interval = 20
+# when direct is true and/or remote_count is greater than zero.
+# [keepalive]
+# direct = false
+# remote_count = 0
+# interval = 20
 
 # ---------------------------------------------------------------------------
 # Peer liveness (ironwood read-deadline after non-keepalive frames)
@@ -131,6 +133,17 @@ if_mtu = 65535
 # base_secs = 2
 # rtt_mult = 8
 # probe_count = 3
+
+# Linux policy routing for the prefix route and CKR routes. Ignored on every other OS.
+# enable defaults to true. pref is clamped to 1..=32765 (default 9000),
+# lookup (routing table id) is clamped to 1..=251 (default 200).
+# 0 and negative pref/lookup are raised to 1; they do not disable the rule.
+# The rule is not removed on shutdown; other interfaces may use the same table.
+# To keep routes in the main table, uncomment the lines below and set enable = false.
+# [ip_rule]
+# enable = true
+# pref = 9000
+# lookup = 200
 
 # Custom node info that is advertised to other nodes.
 # This can be any TOML table, e.g. { name = "my-node", location = "earth" }
@@ -204,3 +217,17 @@ open_tcp = [22, 80, 443]
 open_udp = [53]
 # open_all_for = ["200:abcd:1234::/48"]   # trusted friend subnets
 allow_icmp_echo = true
+
+# Extra configuration text spliced in place of each uncommented
+# `include = "PATH"` line (relative paths are resolved against the
+# directory of the file that contains the line). Repeat the line for
+# several files; nested include lines are followed. A missing file is
+# skipped with a warning.
+#
+# The included file must be valid at that position: a full top-level
+# fragment, extra `peers = [ ... ]` elements inside an array, or extra
+# keys inside a table such as [tunnel_routing.remote_subnets]. Do not
+# repeat a key or table header that already exists around the include
+# line. --normalize is refused while any include line is uncommented.
+# include = "yggdrasil-peers.toml"
+# include = "/etc/yggdrasil/yggdrasil-listen.toml"

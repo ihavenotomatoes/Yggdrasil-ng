@@ -312,8 +312,9 @@ impl Pathfinder {
     /// get a packet delivered to us could replace a signed PathNotify path or
     /// un-break a broken one (path-cache poisoning). We therefore only fill an empty
     /// slot, with `seq = 0` so any signed PathNotify (`seq > 0`) supersedes it. A live
-    /// learned entry is kept fresh by `reset_timeout` (non-broken only); a broken or
-    /// expired one is dropped by `cleanup_expired` and re-learned from the next packet.
+    /// learned entry is kept fresh by `refresh_if_coords_match` (non-broken, and
+    /// only when `from` still equals the cached path); a broken or expired one 
+    /// is dropped by `cleanup_expired` and re-learned from the next packet.
     /// An empty path (sender is the tree root) is cached too, as `send_traffic` has no
     /// special case for the root.
     pub fn learn_path_from_traffic(&mut self, source: &PublicKey, path: &[PeerPort]) {
@@ -332,6 +333,38 @@ impl Pathfinder {
         if let Some(info) = self.paths.get_mut(key) {
             if !info.broken {
                 info.last_refresh = Instant::now();
+            }
+        }
+    }
+
+    /// Refresh `last_refresh` only when `from` is still the cached path.
+    ///
+    /// A remote keepalive (and any other packet) that still reaches us must
+    /// not extend a stale reverse path: `learn_path_from_traffic` will not
+    /// replace those coordinates, so `reset_timeout` alone would pin them
+    /// until the peer stops sending. On a mismatch we leave the entry alone
+    /// and let `cleanup_expired` drop it, so the next send does a signed lookup.
+    /// Does not install `from` and does not un-break.
+    pub fn refresh_if_coords_match(&mut self, key: &PublicKey, from: &[PeerPort]) {
+        let matches = self.paths.get(key).is_some_and(|info| {
+            !info.broken && info.path.as_slice() == from
+        });
+        if matches {
+            self.reset_timeout(key);
+        }
+    }
+
+    /// Cache traffic only when the rumor slot is empty.
+    /// A remote keepalive must not replace an application packet that is
+    /// already waiting for a path.
+    pub fn cache_rumor_traffic_if_absent(
+        &mut self,
+        xformed_dest: &PublicKey,
+        traffic: super::traffic::TrafficPacket,
+    ) {
+        if let Some(rumor) = self.rumors.get_mut(xformed_dest) {
+            if rumor.traffic.is_none() {
+                rumor.traffic = Some(traffic);
             }
         }
     }
@@ -533,6 +566,50 @@ mod tests {
         assert_eq!(pf.paths[&src].path, vec![1, 2, 3]);
     }
 
+    #[test]
+    fn refresh_if_coords_match_does_not_pin_a_different_path() {
+        let crypto = make_crypto();
+        let mut pf = Pathfinder::new(&crypto);
+        let src = [7u8; 32];
+
+        pf.learn_path_from_traffic(&src, &[1, 2, 3]);
+        let stamped = Instant::now() - Duration::from_secs(30);
+        pf.paths.get_mut(&src).unwrap().last_refresh = stamped;
+
+        pf.refresh_if_coords_match(&src, &[1, 2, 3]);
+        assert!(pf.paths[&src].last_refresh > stamped);
+        assert_eq!(pf.paths[&src].path, vec![1, 2, 3]);
+
+        let stamped = Instant::now() - Duration::from_secs(30);
+        pf.paths.get_mut(&src).unwrap().last_refresh = stamped;
+        pf.refresh_if_coords_match(&src, &[9, 9]);
+        assert_eq!(pf.paths[&src].last_refresh, stamped, "mismatch must not refresh");
+        assert_eq!(pf.paths[&src].path, vec![1, 2, 3], "mismatch must not install from");
+        assert!(!pf.paths[&src].broken);
+
+        pf.handle_broken(&src);
+        pf.refresh_if_coords_match(&src, &[1, 2, 3]);
+        assert!(pf.paths[&src].broken, "must not un-break via unsigned traffic");
+    }
+
+    #[test]
+    fn keepalive_rumor_does_not_replace_waiting_traffic() {
+        let crypto = make_crypto();
+        let mut pf = Pathfinder::new(&crypto);
+        let xform = [3u8; 32];
+        pf.ensure_rumor(xform);
+
+        let app = super::super::traffic::TrafficPacket::new([1u8; 32], [2u8; 32], vec![9, 9, 9]);
+        let probe = super::super::traffic::TrafficPacket::new([1u8; 32], [2u8; 32], b"\0ygg-ka".to_vec())
+            .keepalive();
+        pf.cache_rumor_traffic(&xform, app);
+        pf.cache_rumor_traffic_if_absent(&xform, probe);
+        assert_eq!(
+            pf.rumors[&xform].traffic.as_ref().unwrap().payload,
+            vec![9, 9, 9]
+        );
+    }
+    
     // A maintenance retry must be throttled by path_throttle, but must NOT reset the
     // rumor's expiry clock (send_time) — otherwise an unreachable peer is looked up
     // forever instead of expiring path_timeout after the last application write.

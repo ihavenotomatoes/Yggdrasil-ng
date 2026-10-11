@@ -165,6 +165,7 @@ That filename is then looked up in this order:
 1. the current working directory;
 2. the OS system directory, same filename:
    - Unix-like (Linux except Android, BSD, macOS): `/etc/yggdrasil/<filename>`
+   On Linux and Termux this directory may instead be the build-time `YGGDRASIL_CONFIG_DIR`; see README.
    - Windows: `%ALLUSERSPROFILE%\Yggdrasil-ng\<filename>`
 
 If a file exists at either default location, the daemon can be started

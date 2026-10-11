@@ -1,5 +1,7 @@
 #[cfg(feature = "ckr")]
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
@@ -144,27 +146,52 @@ pub struct Config {
     #[serde(default = "default_session_path_timeout")]
     pub session_path_timeout: u64,
 
-    /// When true, periodically send empty encrypted traffic to each directly
-    /// connected peer so idle sessions (and the remote path) do not expire.
-    /// Default: false.
+    /// Session and path keepalives. Missing table uses the defaults.
     #[serde(default)]
-    pub keepalive_direct: bool,
-
-    /// Interval in seconds between direct-peer keepalive probes.
-    /// Clamped to [15, session_path_timeout/2] via `effective_keepalive_interval`.
-    /// Default: 20. Not documented in the config template yet.
-    #[serde(default = "default_keepalive_interval")]
-    pub keepalive_interval: u64,
-
-    /// Maximum number of recently used non-direct destinations kept alive with
-    /// empty encrypted traffic. Clamped to [0, 1000]. 0 disables. Default: 0.
-    #[serde(default)]
-    pub keepalive_remote_count: u64,
+    pub keepalive: KeepaliveConfig,
 
     /// Peer liveness / ironwood read-deadline policy.
     /// Total silence budget ≈ current interval × `probe_count`.
     #[serde(default)]
     pub peer_liveness: PeerLivenessConfig,
+
+    /// Linux `ip rule` / routing-table selection. Ignored except on Linux.
+    /// Disabled only when `enable` is false; see `IpRuleConfig::effective`.
+    #[serde(default)]
+    pub ip_rule: IpRuleConfig,
+}
+
+/// Nested `[keepalive]` table.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KeepaliveConfig {
+    /// When true, periodically send empty encrypted traffic to each directly
+    /// connected peer so idle sessions (and the remote path) do not expire.
+    /// Default: false.
+    #[serde(default)]
+    pub direct: bool,
+
+    /// Maximum number of recently used non-direct destinations kept alive with
+    /// a session probe that a patched peer acks, so the cached path does not
+    /// expire. Clamped to [0, 1000] via `Config::effective_keepalive_remote_count`.
+    /// 0 disables. Default: 0.
+    #[serde(default)]
+    pub remote_count: u64,
+
+    /// Interval in seconds between keepalive probes.
+    /// Clamped to [15, session_path_timeout/2] via `Config::effective_keepalive_interval`.
+    /// Default: 20.
+    #[serde(default = "default_keepalive_interval")]
+    pub interval: u64,
+}
+
+impl Default for KeepaliveConfig {
+    fn default() -> Self {
+        Self {
+            direct: false,
+            remote_count: 0,
+            interval: default_keepalive_interval(),
+        }
+    }
 }
 
 /// Nested `[peer_liveness]` table — one subsystem, one object (matches ironwood
@@ -228,6 +255,44 @@ fn default_peer_liveness_max_secs() -> u64 { 30 }
 fn default_peer_liveness_base_secs() -> u64 { 2 }
 fn default_peer_liveness_rtt_mult() -> u32 { 8 }
 fn default_peer_liveness_probe_count() -> u32 { 3 }
+
+/// Linux-only `[ip_rule]`. Other platforms parse it and do nothing.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct IpRuleConfig {
+    /// Install the rule and put overlay/CKR routes in `lookup`. Default: true.
+    /// False keeps routes in the main table and does not add a rule.
+    #[serde(default = "default_true")]
+    pub enable: bool,
+    /// `ip rule` priority. Default: 9000. Clamped to 1..=32765.
+    #[serde(default)]
+    pub pref: i64,
+    /// Routing table id. Default: 200. Clamped to 1..=251.
+    #[serde(default)]
+    pub lookup: i64,
+}
+
+impl Default for IpRuleConfig {
+    fn default() -> Self {
+        Self {
+            enable: true,
+            pref: 9000,
+            lookup: 200,
+        }
+    }
+}
+
+impl IpRuleConfig {
+    /// `None` only when `enable` is false. Otherwise `pref` is clamped to
+    /// 1..=32765 and `lookup` to 1..=251, including 0 and negative values.
+    pub fn effective(&self) -> Option<(i64, u8)> {
+        if !self.enable {
+            return None;
+        }
+        let pref = self.pref.clamp(1, 32765);
+        let lookup = self.lookup.clamp(1, 251) as u8;
+        Some((pref, lookup))
+    }
+}
 
 /// Built-in stateful firewall configuration. Default-off; when enabled,
 /// inbound mesh traffic is dropped unless it matches an outbound flow
@@ -387,10 +452,9 @@ impl Default for Config {
             firewall: FirewallConfig::default(),
             group_password: String::new(),
             session_path_timeout: default_session_path_timeout(),
-            keepalive_direct: false,
-            keepalive_interval: default_keepalive_interval(),
-            keepalive_remote_count: 0,
+            keepalive: KeepaliveConfig::default(),
             peer_liveness: PeerLivenessConfig::default(),
+            ip_rule: IpRuleConfig::default(),
         }
     }
 }
@@ -440,6 +504,10 @@ impl Config {
     pub fn normalize_config_text(user_toml: &str) -> Result<String, NormalizeError> {
         use toml_edit::DocumentMut;
 
+        if has_uncommented_include(user_toml) {
+            return Err(NormalizeError::IncludesPresent);
+        }
+
         let mut user_doc: DocumentMut = user_toml.parse().map_err(NormalizeError::ParseUser)?;
         // Strip the {{PRIVATE_KEY}} placeholder so absent user keys stay empty
         // (genconf is the path that mints keys; normalize must be deterministic).
@@ -459,6 +527,131 @@ pub enum NormalizeError {
     ParseUser(toml_edit::TomlError),
     #[error("internal: template TOML is invalid: {0}")]
     ParseTemplate(toml_edit::TomlError),
+    #[error("normalization refused because the configuration uses include")]
+    IncludesPresent,
+}
+
+/// True if the text has at least one uncommented top-level
+/// `include = "..."` / `include = '...'` line.
+pub fn has_uncommented_include(text: &str) -> bool {
+    !uncommented_include_paths(text).is_empty()
+}
+
+/// Paths from uncommented `include = "..."` lines, in file order.
+/// Commented lines (`# ...`) are ignored. Duplicate `include` keys are
+/// accepted here because they are collected before TOML parsing.
+pub fn uncommented_include_paths(text: &str) -> Vec<String> {
+    text.lines().filter_map(include_path_from_line).collect()
+}
+
+/// If `line` is an uncommented `include = "..."` / `include = '...'`,
+/// return the path. Otherwise None. Leading whitespace is ignored.
+fn include_path_from_line(raw: &str) -> Option<String> {
+    let line = raw.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let rest = line.strip_prefix("include")?;
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix('=')?;
+    let rest = rest.trim_start();
+    let path = parse_quoted_toml_string(rest)?;
+    if path.is_empty() {
+        None
+    } else {
+        Some(path)
+    }
+}
+
+/// First `"..."` or `'...'` token on the line. Inline comments after
+/// the closing quote are ignored.
+fn parse_quoted_toml_string(s: &str) -> Option<String> {
+    let s = s.trim_start();
+    let bytes = s.as_bytes();
+    if bytes.len() < 2 {
+        return None;
+    }
+    let quote = bytes[0];
+    if quote != b'"' && quote != b'\'' {
+        return None;
+    }
+    let rest = &s[1..];
+    let end = rest.find(quote as char)?;
+    Some(rest[..end].to_string())
+}
+
+/// Read `path` and append each include target on a new line.
+/// Relative include paths are resolved against the directory of the
+/// file that declared them. A missing target is skipped after a warning.
+/// Each file is expanded at most once (cycle / diamond includes).
+pub fn expand_config_includes(path: &Path) -> (String, Vec<String>) {
+    let mut warnings = Vec::new();
+    let mut visited: HashSet<PathBuf> = HashSet::new();
+    let text = expand_config_includes_inner(path, &mut visited, &mut warnings);
+    (text, warnings)
+}
+
+fn expand_config_includes_inner(
+    path: &Path,
+    visited: &mut HashSet<PathBuf>,
+    warnings: &mut Vec<String>,
+) -> String {
+    let display = path.display().to_string();
+    let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if !visited.insert(key) {
+        warnings.push(format!(
+            "skipping already-included configuration file {}",
+            display
+        ));
+        return String::new();
+    }
+
+    let raw = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            warnings.push(format!(
+                "include file not found, skipping: {}",
+                display
+            ));
+            return String::new();
+        }
+        Err(e) => {
+            warnings.push(format!(
+                "failed to read include file {}, skipping: {}",
+                display, e
+            ));
+            return String::new();
+        }
+    };
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut out = String::with_capacity(raw.len());
+    for raw_line in raw.lines() {
+        if let Some(inc) = include_path_from_line(raw_line) {
+            // Replace the include line in-place with the target file text
+            // so fragments stay inside the surrounding array or table.
+            let target = {
+                let p = Path::new(&inc);
+                if p.is_absolute() {
+                    p.to_path_buf()
+                } else {
+                    parent.join(p)
+                }
+            };
+            let piece = expand_config_includes_inner(&target, visited, warnings);
+            if piece.is_empty() {
+                continue;
+            }
+            out.push_str(&piece);
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+        } else {
+            out.push_str(raw_line);
+            out.push('\n');
+        }
+    }
+    out
 }
 
 /// Walk `from` in declaration order; for each key absent from `into`, splice
@@ -538,13 +731,13 @@ impl Config {
     pub fn effective_keepalive_interval(&self) -> std::time::Duration {
         let session_secs = self.session_path_timeout.clamp(60, 86400);
         let upper = (session_secs / 2).max(15);
-        let secs = self.keepalive_interval.clamp(15, upper);
+        let secs = self.keepalive.interval.clamp(15, upper);
         std::time::Duration::from_secs(secs)
     }
 
     /// Returns the effective remote LRU capacity, clamped to [0, 1000].
     pub fn effective_keepalive_remote_count(&self) -> usize {
-        self.keepalive_remote_count.clamp(0, 1000) as usize
+        self.keepalive.remote_count.clamp(0, 1000) as usize
     }   
 
     /// Get node info as JSON string (for protocol responses).
@@ -704,18 +897,41 @@ mod normalize_tests {
             "normalize must not mint a key:\n{out}"
         );
     }
-    
+
+    #[test]
+    fn normalize_refuses_uncommented_include() {
+        let input = "private_key = \"\"\ninclude = \"peers.toml\"\n";
+        let err = Config::normalize_config_text(input).unwrap_err();
+        match err {
+            NormalizeError::IncludesPresent => {}
+            other => panic!("expected IncludesPresent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn normalize_allows_commented_include() {
+        let input = "private_key = \"\"\n# include = \"peers.toml\"\n";
+        let out = Config::normalize_config_text(input).unwrap();
+        assert!(out.contains("private_key = \"\""));
+        assert!(
+            out.contains("# include = \"peers.toml\""),
+            "commented include must be preserved:\n{out}"
+        );
+    }
+
     #[test]
     fn keepalive_remote_count_defaults_and_clamp() {
         let cfg = Config::default();
-        assert_eq!(cfg.keepalive_remote_count, 0);
+        assert_eq!(cfg.keepalive.remote_count, 0);
+        assert!(!cfg.keepalive.direct);
+        assert_eq!(cfg.keepalive.interval, 20);
         assert_eq!(cfg.effective_keepalive_remote_count(), 0);
 
         let mut cfg = Config::default();
-        cfg.keepalive_remote_count = 50;
+        cfg.keepalive.remote_count = 50;
         assert_eq!(cfg.effective_keepalive_remote_count(), 50);
 
-        cfg.keepalive_remote_count = 5000;
+        cfg.keepalive.remote_count = 5000;
         assert_eq!(cfg.effective_keepalive_remote_count(), 1000);
     }
 
@@ -723,11 +939,90 @@ mod normalize_tests {
     fn keepalive_remote_count_parses_from_toml() {
         let text = r#"
             private_key = ""
-            keepalive_remote_count = 16
+            [keepalive]
+            remote_count = 16
         "#;
         let cfg: Config = toml::from_str(text).unwrap();
-        assert_eq!(cfg.keepalive_remote_count, 16);
-        assert!(!cfg.keepalive_direct);
+        assert_eq!(cfg.keepalive.remote_count, 16);
+        assert!(!cfg.keepalive.direct);
+        assert_eq!(cfg.keepalive.interval, 20);
+    }
+
+    #[test]
+    fn ip_rule_defaults_and_clamp() {
+        let cfg = Config::default();
+        assert!(cfg.ip_rule.enable);
+        assert_eq!(cfg.ip_rule.pref, 9000);
+        assert_eq!(cfg.ip_rule.lookup, 200);
+        assert_eq!(cfg.ip_rule.effective(), Some((9000, 200)));
+
+        let mut rule = IpRuleConfig { enable: false, pref: 9000, lookup: 200 };
+        assert_eq!(rule.effective(), None);
+        rule = IpRuleConfig { enable: false, pref: 0, lookup: -5 };
+        assert_eq!(rule.effective(), None);
+
+        rule = IpRuleConfig { enable: true, pref: 0, lookup: 200 };
+        assert_eq!(rule.effective(), Some((1, 200)));
+        rule = IpRuleConfig { enable: true, pref: 9000, lookup: 0 };
+        assert_eq!(rule.effective(), Some((9000, 1)));
+        rule = IpRuleConfig { enable: true, pref: -1, lookup: 200 };
+        assert_eq!(rule.effective(), Some((1, 200)));
+        rule = IpRuleConfig { enable: true, pref: 9000, lookup: -5 };
+        assert_eq!(rule.effective(), Some((9000, 1)));
+
+        rule = IpRuleConfig { enable: true, pref: 9000, lookup: 200 };
+        assert_eq!(rule.effective(), Some((9000, 200)));
+        rule = IpRuleConfig { enable: true, pref: 1, lookup: 1 };
+        assert_eq!(rule.effective(), Some((1, 1)));
+        rule = IpRuleConfig { enable: true, pref: 40000, lookup: 300 };
+        assert_eq!(rule.effective(), Some((32765, 251)));
+        rule = IpRuleConfig { enable: true, pref: 32765, lookup: 251 };
+        assert_eq!(rule.effective(), Some((32765, 251)));
+    }
+
+    #[test]
+    fn ip_rule_parses_from_toml() {
+        let absent = r#"
+            private_key = ""
+        "#;
+        let cfg: Config = toml::from_str(absent).unwrap();
+        assert!(cfg.ip_rule.enable);
+        assert_eq!(cfg.ip_rule.pref, 9000);
+        assert_eq!(cfg.ip_rule.lookup, 200);
+        assert_eq!(cfg.ip_rule.effective(), Some((9000, 200)));
+
+        let text = r#"
+            private_key = ""
+            [ip_rule]
+            pref = 9000
+            lookup = 200
+        "#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        assert!(cfg.ip_rule.enable);
+        assert_eq!(cfg.ip_rule.pref, 9000);
+        assert_eq!(cfg.ip_rule.lookup, 200);
+        assert_eq!(cfg.ip_rule.effective(), Some((9000, 200)));
+
+        let clamped = r#"
+            private_key = ""
+            [ip_rule]
+            enable = true
+            pref = 0
+            lookup = -3
+        "#;
+        let cfg: Config = toml::from_str(clamped).unwrap();
+        assert_eq!(cfg.ip_rule.effective(), Some((1, 1)));
+
+        let disabled = r#"
+            private_key = ""
+            [ip_rule]
+            enable = false
+            pref = 9000
+            lookup = 200
+        "#;
+        let cfg: Config = toml::from_str(disabled).unwrap();
+        assert!(!cfg.ip_rule.enable);
+        assert_eq!(cfg.ip_rule.effective(), None);
     }
 }
 
@@ -789,5 +1084,154 @@ mod private_key_from_toml_tests {
         let key = Config::private_key_from_toml(&generated).unwrap();
         assert_eq!(key.len(), 128);
         assert!(generated.contains(&key));
+    }
+}
+
+#[cfg(test)]
+mod include_tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn tmp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ygg-include-{}-{}",
+            name,
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn uncommented_include_paths_reads_several_lines() {
+        let text = r#"
+# include = "skip.toml"
+private_key = ""
+include = "a.toml"
+include="b.toml"
+include = '/etc/yggdrasil/c.toml' # trailing comment
+"#;
+        assert_eq!(
+            uncommented_include_paths(text),
+            vec![
+                "a.toml".to_string(),
+                "b.toml".to_string(),
+                "/etc/yggdrasil/c.toml".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn expand_splices_nested_includes_in_place_and_skips_missing() {
+        let dir = tmp_dir("nested");
+        let main = dir.join("main.toml");
+        let peers = dir.join("peers.toml");
+        let extra = dir.join("extra.toml");
+        fs::write(
+            &main,
+            "private_key = \"aabb\"\ninclude = \"peers.toml\"\ninclude = \"missing.toml\"\n",
+        )
+        .unwrap();
+        fs::write(
+            &peers,
+            "peers = [\"tcp://127.0.0.1:1\"]\ninclude = \"extra.toml\"\n",
+        )
+        .unwrap();
+        fs::write(&extra, "listen = [\"tcp://0.0.0.0:0\"]\n").unwrap();
+
+        let (text, warnings) = expand_config_includes(&main);
+        assert!(text.contains("private_key = \"aabb\""));
+        assert!(text.contains("peers = [\"tcp://127.0.0.1:1\"]"));
+        assert!(text.contains("listen = [\"tcp://0.0.0.0:0\"]"));
+        assert!(!text.contains("include ="));
+        assert!(
+            warnings.iter().any(|w| w.contains("missing.toml")),
+            "missing include must warn: {warnings:?}"
+        );
+
+        let cfg: Config = toml::from_str(&text).unwrap();
+        assert_eq!(cfg.private_key, "aabb");
+        assert_eq!(cfg.peers, vec!["tcp://127.0.0.1:1".to_string()]);
+        assert_eq!(cfg.listen, vec!["tcp://0.0.0.0:0".to_string()]);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn expand_splices_into_array_and_table() {
+        let dir = tmp_dir("splice");
+        let main = dir.join("main.toml");
+        let peers = dir.join("peers.toml");
+        let ckr = dir.join("ckr.toml");
+        fs::write(
+            &main,
+            "peers = [\ninclude = \"peers.toml\"\n]\n\n[tunnel_routing.remote_subnets]\ninclude = \"ckr.toml\"\n",
+        )
+        .unwrap();
+        fs::write(
+            &peers,
+            "\"tcp://127.0.0.1:1\",\n\"tcp://127.0.0.1:2\",\n",
+        )
+        .unwrap();
+        fs::write(
+            &ckr,
+            "\"aabbccdd\" = [\"10.0.0.0/24\"]\n\"eeff0011\" = [\"10.1.0.0/24\"]\n",
+        )
+        .unwrap();
+
+        let (text, warnings) = expand_config_includes(&main);
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert_eq!(
+            text,
+            "peers = [\n\"tcp://127.0.0.1:1\",\n\"tcp://127.0.0.1:2\",\n]\n\n[tunnel_routing.remote_subnets]\n\"aabbccdd\" = [\"10.0.0.0/24\"]\n\"eeff0011\" = [\"10.1.0.0/24\"]\n"
+        );
+
+        let cfg: Config = toml::from_str(&text).unwrap();
+        assert_eq!(
+            cfg.peers,
+            vec![
+                "tcp://127.0.0.1:1".to_string(),
+                "tcp://127.0.0.1:2".to_string()
+            ]
+        );
+        #[cfg(feature = "ckr")]
+        {
+            assert_eq!(
+                cfg.tunnel_routing.remote_subnets.get("aabbccdd"),
+                Some(&vec!["10.0.0.0/24".to_string()])
+            );
+            assert_eq!(
+                cfg.tunnel_routing.remote_subnets.get("eeff0011"),
+                Some(&vec!["10.1.0.0/24".to_string()])
+            );
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn expand_does_not_revisit_the_same_file() {
+        let dir = tmp_dir("cycle");
+        let a = dir.join("a.toml");
+        let b = dir.join("b.toml");
+        fs::write(&a, "if_name = \"auto\"\ninclude = \"b.toml\"\n").unwrap();
+        fs::write(&b, "if_mtu = 1280\ninclude = \"a.toml\"\n").unwrap();
+
+        let (text, warnings) = expand_config_includes(&a);
+        assert!(text.contains("if_name = \"auto\""));
+        assert!(text.contains("if_mtu = 1280"));
+        assert_eq!(
+            text.matches("if_name = \"auto\"").count(),
+            1,
+            "cycle must not duplicate the root file:\n{text}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("already-included")),
+            "cycle must warn: {warnings:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

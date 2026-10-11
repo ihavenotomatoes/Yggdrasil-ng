@@ -16,9 +16,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::bloom::BloomFilter;
 use crate::core::{RouterHandle, RouterMsg};
-use crate::crypto::{Crypto, PublicKey};
+use crate::crypto::PublicKey;
+use crate::router::{PeerId, PeerEntry, Router, RouterAction, RouterAnnounce};
 use crate::peer_timeout::PeerTimeoutCtrl;
-use crate::router::{PeerId, PeerEntry, RouterAction, RouterAnnounce};
 use crate::traffic::{PacketQueue, TrafficPacket};
 use crate::types::Error;
 use crate::wire::{self, PeerPort};
@@ -354,6 +354,18 @@ fn mark_written(last_write: &LastWrite) {
     *last_write.lock().unwrap() = Some(std::time::Instant::now());
 }
 
+/// When the writer last got a SigReq out to the transport (Go's `peer.srst`).
+/// The reader subtracts it from the SigRes arrival time (Go's `peer.srrt`), so
+/// the RTT excludes time spent queued in the router and writer channels.
+pub(crate) type SigReqSent = Arc<std::sync::Mutex<Option<std::time::Instant>>>;
+
+/// Stamp the SigReq send time if `frame` is a SigReq that was just flushed.
+fn mark_sig_req_sent(frame: &[u8], sig_req_sent: &SigReqSent) {
+    if peek_frame_type(frame) == Some(wire::PacketType::ProtoSigReq) {
+        *sig_req_sent.lock().unwrap() = Some(std::time::Instant::now());
+    }
+}
+
 /// Age of an optional timestamp, rendered for logs.
 fn age_of(t: &Option<std::time::Instant>) -> String {
     match t {
@@ -383,6 +395,7 @@ pub(crate) async fn peer_reader(
     _keepalive_delay: Duration,
     read_deadline: ReadDeadline,
     last_write: LastWrite,
+    sig_req_sent: SigReqSent,
 ) -> Result<(), Error> {
     // Use a larger BufReader to reduce syscall count on high-throughput connections.
     let mut reader = BufReader::with_capacity(128 * 1024, conn_read);
@@ -561,21 +574,18 @@ pub(crate) async fn peer_reader(
                         break;
                     },
                 };
-                // Verify the signature before sending to the actor
-                let bs = {
-                    let mut out = Vec::new();
-                    out.extend_from_slice(&our_key);
-                    out.extend_from_slice(&peer_key);
-                    wire::encode_uvarint(&mut out, res.seq);
-                    wire::encode_uvarint(&mut out, res.nonce);
-                    wire::encode_uvarint(&mut out, res.port);
-                    out
-                };
-                if !Crypto::verify(&peer_key, &bs, &res.psig) {
+                // Verify the response before sending to the actor
+                if !Router::check_sig_res(&res, &our_key, &peer_key) {
                     disconnect_reason = Some(Error::BadMessage);
                     break;
                 }
-                router.send(RouterMsg::HandleResponse { peer_id, key: peer_key, res });
+                // RTT = SigRes arrival − SigReq flush, as in Go's srrt − srst.
+                let rtt = sig_req_sent
+                    .lock()
+                    .unwrap()
+                    .map(|t| t.elapsed())
+                    .unwrap_or(Duration::ZERO);
+                router.send(RouterMsg::HandleResponse { peer_id, key: peer_key, res, rtt });
             }
             wire::PacketType::ProtoAnnounce => {
                 let ann = match wire::Announce::decode(payload) {
@@ -648,6 +658,7 @@ pub(crate) async fn peer_reader(
                     dest: tr.dest,
                     watermark: tr.watermark,
                     payload: tr.payload,
+                    keepalive: false,
                 };
                 router.send(RouterMsg::HandleTraffic { traffic });
             }
@@ -893,6 +904,7 @@ pub(crate) async fn peer_writer(
     liveness: Arc<PeerTimeoutCtrl>,
     read_deadline: ReadDeadline,
     last_write: LastWrite,
+    sig_req_sent: SigReqSent,
     cancel: CancellationToken,
 ) {
     use crate::wire;
@@ -995,6 +1007,9 @@ pub(crate) async fn peer_writer(
                         }
                     }
                     mark_written(&last_write);
+                    if ptype == Some(wire::PacketType::ProtoSigReq) {
+                        *sig_req_sent.lock().unwrap() = Some(std::time::Instant::now());
+                    }
 
                     if needs_deadline {
                         arm_read_deadline(&read_deadline, &liveness);
@@ -1015,6 +1030,7 @@ pub(crate) async fn peer_writer(
                                 if !write_and_flush(peer_id, &mut conn_write, &data, &last_write).await {
                                     break;
                                 }
+                                mark_sig_req_sent(&data, &sig_req_sent);
                                 keepalive_owed = false;
                             }
                             PeerMessage::ScheduleKeepalive => keepalive_owed = true,

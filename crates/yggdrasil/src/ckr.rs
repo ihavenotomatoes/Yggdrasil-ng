@@ -320,7 +320,7 @@ pub fn expand_cidrs(entries: &[String]) -> Result<Vec<IpNet>, String> {
         }
         if url.scheme() == "http" || url.scheme() == "https" {
             // HTTP(S) route lists (with optional "~", "_", "!"" prefixes) are downloaded
-            //  at startup into the OS-specific yggdrasil_routes_download cache.
+            // at startup into the OS-specific yggdrasil/routes_download cache.
             // Content is NOT expanded here — this prevents treating them as CIDR/IP
             // and because full integration happens at the next stage. Skip silently.
             continue;
@@ -575,6 +575,7 @@ pub fn install_routes(
     _config: &TunnelRoutingConfig,
     _tun_name: &str,
     _self_key: &[u8; 32],
+    _route_table: Option<u8>,
 ) -> Result<(), String> {
     Ok(())
 }
@@ -584,6 +585,7 @@ pub fn install_routes(
     config: &TunnelRoutingConfig,
     tun_name: &str,
     self_key: &[u8; 32],
+    route_table: Option<u8>,
 ) -> Result<(), String> {
     if !config.enable || !config.install_system_routes {
         return Ok(());
@@ -599,7 +601,7 @@ pub fn install_routes(
             continue;
         }
 
-        // Include downloaded route lists from yggdrasil_routes_download
+        // Include downloaded route lists from yggdrasil/routes_download
         let mut effective_entries = subnet_list.clone();
         #[cfg(feature = "ckr-advanced")]
         effective_entries.extend(get_downloaded_virtual_file_entries(pubkey_hex));
@@ -638,6 +640,14 @@ pub fn install_routes(
     for cidr in &cidrs {
         let route = route_manager::Route::new(cidr.network(), cidr.prefix_len())
             .with_if_name(tun_name.to_string());
+        // with_table exists only on Linux. None keeps the current main-table route.
+        #[cfg(target_os = "linux")]
+        let route = match route_table {
+            Some(table) => route.with_table(table),
+            None => route,
+        };
+        #[cfg(not(target_os = "linux"))]
+        let _ = route_table;
 
         match manager.add(&route) {
             Ok(()) => {
@@ -665,10 +675,21 @@ pub fn install_routes(
 
 /// Remove previously installed CKR routes from the system routing table.
 #[cfg(target_os = "android")]
-pub fn remove_routes(_config: &TunnelRoutingConfig, _tun_name: &str, _self_key: &[u8; 32]) {}
+pub fn remove_routes(
+    _config: &TunnelRoutingConfig,
+    _tun_name: &str,
+    _self_key: &[u8; 32],
+    _route_table: Option<u8>,
+) {
+}
 
 #[cfg(not(target_os = "android"))]
-pub fn remove_routes(config: &TunnelRoutingConfig, tun_name: &str, self_key: &[u8; 32]) {
+pub fn remove_routes(
+    config: &TunnelRoutingConfig,
+    tun_name: &str,
+    self_key: &[u8; 32],
+    route_table: Option<u8>,
+) {
     if !config.enable || !config.install_system_routes {
         return;
     }
@@ -680,7 +701,7 @@ pub fn remove_routes(config: &TunnelRoutingConfig, tun_name: &str, self_key: &[u
             continue;
         }
 
-        // Include downloaded HTTP/HTTPS route lists from yggdrasil_routes_download/<pubkey>/
+        // Include downloaded HTTP/HTTPS route lists from yggdrasil/routes_download/<pubkey>/
         // These are treated exactly the same as "file://" entries from the config.
         let mut effective_entries = subnet_list.clone();
         #[cfg(feature = "ckr-advanced")]
@@ -717,6 +738,14 @@ pub fn remove_routes(config: &TunnelRoutingConfig, tun_name: &str, self_key: &[u
     for cidr in &cidrs {
         let route = route_manager::Route::new(cidr.network(), cidr.prefix_len())
             .with_if_name(tun_name.to_string());
+        // with_table exists only on Linux. None keeps the current main-table route.
+        #[cfg(target_os = "linux")]
+        let route = match route_table {
+            Some(table) => route.with_table(table),
+            None => route,
+        };
+        #[cfg(not(target_os = "linux"))]
+        let _ = route_table;
         if let Err(e) = manager.delete(&route) {
             tracing::debug!("Failed to remove route {}: {}", cidr, e);
         }
@@ -724,28 +753,41 @@ pub fn remove_routes(config: &TunnelRoutingConfig, tun_name: &str, self_key: &[u
 }
 
 /// Returns OS-specific base directory for downloaded route lists.
-/// Matches exactly the paths specified in the task (Linux/BSD, macOS, Windows).
+/// Layout: <root>/routes_download[_<prefix><port>]
+/// Linux and Android root is `/var/cache/yggdrasil`, or
+/// `YGGDRASIL_ROUTES_CACHE_DIR` when that variable was set at build time.
+/// Other Unix: `/var/cache/yggdrasil`. macOS: `/Library/Caches/yggdrasil`.
+/// Windows: `%TEMP%\yggdrasil`.).
 #[cfg(feature = "ckr-advanced")]
 fn get_routes_download_base_dir() -> PathBuf {
-    // When a custom prefix/port was applied, isolate the cache directory so multiple
+    // When a custom prefix/port was applied, isolate the leaf directory so multiple
     // instances with different prefixes/ports do not share downloaded lists.
-    let dir_name = if crate::address::prefix_port_set() {
+    // All instances share the common "yggdrasil" parent under the OS cache root.
+    let leaf = if crate::address::prefix_port_set() {
         format!(
-            "yggdrasil_routes_download_{:02x}{}",
+            "routes_download_{:02x}{}",
             crate::address::address_prefix(),
             crate::multicast::multicast_port()
         )
     } else {
-        "yggdrasil_routes_download".to_string()
+        "routes_download".to_string()
     };
 
     if cfg!(target_os = "macos") {
-        PathBuf::from(format!("/Library/Caches/{}", dir_name))
+        PathBuf::from("/Library/Caches/yggdrasil").join(leaf)
     } else if cfg!(target_os = "windows") {
-        std::env::temp_dir().join(dir_name)
+        std::env::temp_dir().join("yggdrasil").join(leaf)
+    } else if cfg!(any(target_os = "linux", target_os = "android")) {
+        // Build-time override for non-standard Linux/Termux layouts.
+        // Empty or unset keeps /var/cache/yggdrasil. BSD is the branch below.
+        let root = match option_env!("YGGDRASIL_ROUTES_CACHE_DIR") {
+            Some(dir) if !dir.is_empty() => dir.trim_end_matches('/'),
+            _ => "/var/cache/yggdrasil",
+        };
+        PathBuf::from(root).join(leaf)
     } else {
-        // Linux, FreeBSD, OpenBSD, NetBSD etc.
-        PathBuf::from(format!("/var/cache/{}", dir_name))
+        // FreeBSD, OpenBSD, NetBSD, DragonFly, etc. Not overridable.
+        PathBuf::from("/var/cache/yggdrasil").join(leaf)
     }
 }
 
@@ -849,7 +891,7 @@ fn remove_empty_dirs(base: &PathBuf) {
     }
 }
 
-/// Download HTTP/HTTPS route lists into yggdrasil_routes_download/<pubkey>/
+/// Download HTTP/HTTPS route lists into yggdrasil/routes_download/<pubkey>/
 /// right after "Multicast peer discovery started".
 /// - Only processes entries that look like http(s):// (with optional ~_! prefix).
 /// - Filename format: N-prefix-md5hex or N--md5hex (exactly as specified).
@@ -1920,6 +1962,19 @@ mod tests {
         assert!(expanded.iter().any(|p| p.to_string() == "192.168.0.0/16"));
     }
 
+    #[cfg(all(feature = "ckr-advanced", any(target_os = "linux", target_os = "android")))]
+    #[test]
+    fn test_routes_download_base_dir_build_override() {
+        let root = match option_env!("YGGDRASIL_ROUTES_CACHE_DIR") {
+            Some(dir) if !dir.is_empty() => dir.trim_end_matches('/'),
+            _ => "/var/cache/yggdrasil",
+        };
+        let base = get_routes_download_base_dir();
+        assert!(base.starts_with(root));
+        let name = base.file_name().unwrap().to_string_lossy();
+        assert!(name == "routes_download" || name.starts_with("routes_download_"));
+    }
+    
     #[test]
     fn test_default_route_minus_many_excludes() {
         // descending order so the sweep cannot rely on input ordering.
@@ -1986,5 +2041,15 @@ mod tests {
         assert_eq!(ckr.get_public_key_for_address(addr), Some([0x01u8; 32]));
         // And the table really contains all four lengths.
         assert_eq!(ckr.v4.len(), 4);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_route_table_is_optional() {
+        let plain = route_manager::Route::new(std::net::IpAddr::from([10, 0, 0, 0]), 8)
+            .with_if_name("ygg0".to_string());
+        assert_eq!(plain.table(), 0);
+        let tagged = plain.with_table(200);
+        assert_eq!(tagged.table(), 200);
     }
 }

@@ -285,24 +285,39 @@ async fn session_cleanup_loop(sessions: Arc<ConcurrentSessionManager>, cancel: C
     }
 }
 
-/// Send empty encrypted traffic to `key` if a session already exists.
+/// Send session traffic to `key` if a session already exists.
 /// Does not start Init/handshake for cold destinations.
+///
+/// `remote == false` is keepalive_direct: empty plaintext, no ack expected
+/// (the direct-peer shortcut does not use the path cache).
+/// `remote == true` is keepalive_remote_count: a probe the peer must ack.
+/// The ack, not this send, is what refreshes the sender's path.
 async fn keepalive_send_if_session(
     inner: &PacketConnImpl,
     sessions: &ConcurrentSessionManager,
     signing_key: &SigningKey,
     key: &PublicKey,
+    remote: bool,
 ) {
     use crate::types::PacketConn;
 
     if !sessions.has_session(key) {
         return;
     }
-    let actions = sessions.write_to(key, &[], signing_key);
+    let payload: &[u8] = if remote {
+        session::KEEPALIVE_PROBE
+    } else {
+        &[]
+    };
+    let actions = sessions.write_to(key, payload, signing_key);
     for action in actions {
         match action {
             OutAction::SendToInner { dest, data } => {
-                let _ = inner.write_to(&data, &Addr(dest)).await;
+                if remote {
+                    let _ = inner.write_keepalive(&data, &Addr(dest)).await;
+                } else {
+                    let _ = inner.write_to(&data, &Addr(dest)).await;
+                }
             }
             OutAction::Deliver { .. } => {}
         }
@@ -313,8 +328,11 @@ async fn keepalive_send_if_session(
 /// - currently connected direct peers (when `keepalive_direct` is true);
 /// - keys in the remote LRU (when capacity > 0), excluding current direct peers.
 ///
-/// Only refreshes sessions that already exist (`has_session`). Path
-/// `last_refresh` on the sender is only updated when traffic is received back.
+/// Only refreshes sessions that already exist (`has_session`).
+/// Direct probes are empty and are not answered. Remote probes are
+/// [`session::KEEPALIVE_PROBE`]; the peer's [`session::KEEPALIVE_ACK`]
+/// is what refreshes the sender's path, and only if the ack's `from`
+/// still matches the cached coordinates.
 async fn keepalive_loop(
     inner: Arc<PacketConnImpl>,
     sessions: Arc<ConcurrentSessionManager>,
@@ -342,7 +360,7 @@ async fn keepalive_loop(
                 if keepalive_direct {
                     for key in &direct_keys {
                         keepalive_send_if_session(
-                            &inner, &sessions, &signing_key, key,
+                            &inner, &sessions, &signing_key, key, false,
                         ).await;
                     }
                 }
@@ -356,7 +374,7 @@ async fn keepalive_loop(
                         continue;
                     }
                     keepalive_send_if_session(
-                        &inner, &sessions, &signing_key, &key,
+                        &inner, &sessions, &signing_key, &key, true,
                     ).await;
                 }
             }

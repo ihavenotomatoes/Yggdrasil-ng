@@ -7,7 +7,7 @@ use tracing_subscriber::{fmt, EnvFilter};
 
 use yggdrasil::address::{addr_for_key, subnet_for_key};
 use yggdrasil::admin::AdminSocket;
-use yggdrasil::config::Config;
+use yggdrasil::config::{expand_config_includes, Config};
 use yggdrasil::core::Core;
 use yggdrasil::ipv6rwc::ReadWriteCloser;
 
@@ -184,46 +184,48 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
     init_logging(&loglevel, logto.as_deref());
 
-    // Load config
-    let config = if autoconf {
-        Config::default()
-    } else {
-        load_config_file(&config_path)?
-    };
+    if address || subnet {
+        // Load config
+        let config = if autoconf {
+            Config::default()
+        } else {
+            load_config_file(&config_path)?
+        };
 
-    // Parse or generate signing key
-    // Priority: config file > YGGDRASIL_PRIVATE_KEY env var > ephemeral
-    let signing_key = if !config.private_key.is_empty() {
-        config
-            .signing_key()
-            .map_err(|e| format!("invalid private key: {}", e))?
-    } else if let Ok(env_key) = std::env::var("YGGDRASIL_PRIVATE_KEY") {
-        tracing::info!("Using private key from YGGDRASIL_PRIVATE_KEY environment variable");
-        let bytes = hex::decode(&env_key)
-            .map_err(|e| format!("invalid YGGDRASIL_PRIVATE_KEY hex: {}", e))?;
-        let key_bytes: [u8; 64] = bytes.try_into()
-            .map_err(|v: Vec<u8>| format!("YGGDRASIL_PRIVATE_KEY should be 64 bytes, got {}", v.len()))?;
-        SigningKey::from_keypair_bytes(&key_bytes)
-            .map_err(|e| format!("invalid YGGDRASIL_PRIVATE_KEY: {}", e))?
-    } else {
-        tracing::warn!("No private key configured, generating ephemeral key");
-        SigningKey::generate(&mut rand::rngs::OsRng)
-    };
+        // Parse or generate signing key
+        // Priority: config file > YGGDRASIL_PRIVATE_KEY env var > ephemeral
+        let signing_key = if !config.private_key.is_empty() {
+            config
+                .signing_key()
+                .map_err(|e| format!("invalid private key: {}", e))?
+        } else if let Ok(env_key) = std::env::var("YGGDRASIL_PRIVATE_KEY") {
+            tracing::info!("Using private key from YGGDRASIL_PRIVATE_KEY environment variable");
+            let bytes = hex::decode(&env_key)
+                .map_err(|e| format!("invalid YGGDRASIL_PRIVATE_KEY hex: {}", e))?;
+            let key_bytes: [u8; 64] = bytes.try_into()
+                .map_err(|v: Vec<u8>| format!("YGGDRASIL_PRIVATE_KEY should be 64 bytes, got {}", v.len()))?;
+            SigningKey::from_keypair_bytes(&key_bytes)
+                .map_err(|e| format!("invalid YGGDRASIL_PRIVATE_KEY: {}", e))?
+        } else {
+            tracing::warn!("No private key configured, generating ephemeral key");
+            SigningKey::generate(&mut rand::rngs::OsRng)
+        };
 
-    let public_key = signing_key.verifying_key().to_bytes();
+        let public_key = signing_key.verifying_key().to_bytes();
 
-    // --address: print address and exit
-    if address {
-        let addr = addr_for_key(&public_key);
-        println!("{}", addr);
-        return Ok(());
-    }
+        // --address: print address and exit
+        if address {
+            let addr = addr_for_key(&public_key);
+            println!("{}", addr);
+            return Ok(());
+        }
 
-    // --subnet: print subnet and exit
-    if subnet {
-        let subnet = subnet_for_key(&public_key);
-        println!("{}", subnet);
-        return Ok(());
+        // --subnet: print subnet and exit
+        if subnet {
+            let subnet = subnet_for_key(&public_key);
+            println!("{}", subnet);
+            return Ok(());
+        }
     }
 
     // Shutdown on Ctrl+C, or on SIGTERM from a service manager.
@@ -458,6 +460,24 @@ async fn run_node(
     #[cfg(all(feature = "ckr", not(target_os = "android")))]
     yggdrasil::ckr::prepare_peer_exclusions(&config.tunnel_routing, &core, &config.peers, &shutdown_rx);
 
+    // Visible to both install_routes and the later remove_routes. None keeps the main table.
+    #[cfg(target_os = "linux")]
+    let route_table = match config.ip_rule.effective() {
+        Some((pref, lookup)) => {
+            if let Err(e) = ensure_linux_ip_rule(pref, lookup) {
+                tracing::error!("Failed to ensure ip rule pref {} lookup {}: {}", pref, lookup, e);
+            }
+            Some(lookup)
+        }
+        None => None,
+    };
+    #[cfg(not(target_os = "linux"))]
+    let route_table = None;
+
+    // JoinHandle must outlive the startup block so shutdown can stop the retry loop.
+    #[cfg(target_os = "linux")]
+    let mut local_subnet_route_task: Option<tokio::task::JoinHandle<()>> = None;
+
     // If Ctrl+C arrived during download / peer-exclusion prep, skip the remaining
     // CKR init / IP assignment / route install so shutdown can proceed immediately.
     if !*shutdown_rx.borrow() {
@@ -490,6 +510,16 @@ async fn run_node(
         // The early installation block was removed from TunAdapter::new.
         // We reuse the exact same tun_name computation and error handling pattern
         // that already exists in the shutdown/remove_routes block below.
+        // Move the kernel overlay route (200::/7, or the configured prefix) into
+        // the same table as CKR routes. Independent of tunnel_routing.enable.
+        #[cfg(all(target_os = "linux", feature = "tun"))]
+        if let Some(table) = route_table {
+            if let Some(adapter) = tun.as_ref() {
+                if let Err(e) = install_overlay_route(adapter.name(), table) {
+                    tracing::error!("Failed to install overlay route: {}", e);
+                }
+            }
+        }
         #[cfg(feature = "ckr")]
         if config.tunnel_routing.enable && config.tunnel_routing.install_system_routes && config.if_name != "none" {
             // Prefer the real interface name reported by TunAdapter
@@ -521,9 +551,25 @@ async fn run_node(
                     }
                 }
             };
-            if let Err(e) = yggdrasil::ckr::install_routes(&config.tunnel_routing, tun_name, core.public_key()) {
+            if let Err(e) = yggdrasil::ckr::install_routes(
+                &config.tunnel_routing,
+                tun_name,
+                core.public_key(),
+                route_table,
+            ) {
                 tracing::error!("Failed to install CKR routes: {}", e);
             }
+        }
+
+        // Node /64 via the LAN interface that holds <subnet>::1, into the same
+        // table as the overlay route. Independent of tunnel_routing.enable.
+        #[cfg(target_os = "linux")]
+        if let Some(table) = route_table {
+            let subnet = subnet_for_key(core.public_key());
+            let mut retry_shutdown = shutdown_rx.clone();
+            local_subnet_route_task = Some(tokio::spawn(async move {
+                install_local_subnet_route_with_retries(subnet, table, &mut retry_shutdown).await;
+            }));
         }
 
         // Wait for shutdown signal
@@ -544,9 +590,26 @@ async fn run_node(
     shutdown_rx.changed().await.ok();
     tracing::info!("Shutting down...");
 
+    #[cfg(target_os = "linux")]
+    if let Some(task) = local_subnet_route_task.take() {
+        task.abort();
+        let _ = task.await;
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(table) = route_table {
+        let subnet = subnet_for_key(core.public_key());
+        remove_local_subnet_route(&subnet.to_string(), table);
+    }
+
     // Cleanup
     // Remove CKR routes before TUN is destroyed (critical on Windows where
     // routes don't auto-dissolve when the interface goes away).
+    #[cfg(all(target_os = "linux", feature = "tun"))]
+    if let Some(table) = route_table {
+        if let Some(adapter) = tun.as_ref() {
+            remove_overlay_route(adapter.name(), table);
+        }
+    }
     #[cfg(feature = "ckr")]
     if config.tunnel_routing.enable && config.if_name != "none" {
         // Prefer the real interface name reported by TunAdapter
@@ -574,7 +637,12 @@ async fn run_node(
                 }
             }
         };
-        yggdrasil::ckr::remove_routes(&config.tunnel_routing, tun_name, core.public_key());
+        yggdrasil::ckr::remove_routes(
+            &config.tunnel_routing,
+            tun_name,
+            core.public_key(),
+            route_table,
+        );
     }
 
     // Tear down TUN explicitly so the OS interface is removed before this
@@ -696,7 +764,9 @@ fn rewrite_admin_listen_in_genconf_text(text: &str, port: u16) -> String {
 }
 
 /// Build genconf text. If `base_path` is set, reuse `private_key` from that
-/// TOML file; otherwise mint a new keypair (existing generate_config_text()).
+/// TOML file (after splicing its `include` lines); otherwise mint a new
+/// keypair (existing generate_config_text()). Other fields from the base
+/// file and from its includes are not copied into the new template.
 fn generate_config_text_maybe_from_base(
     base_path: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error>> {
@@ -704,13 +774,17 @@ fn generate_config_text_maybe_from_base(
         None => Config::generate_config_text(),
         Some(path) => {
             let path = expand_genconf_path(path);
-            let text = match std::fs::read_to_string(&path) {
-                Ok(t) => t,
+            match File::open(&path) {
+                Ok(_) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     return Err(format!("base configuration file not found: {}", path).into());
                 }
                 Err(e) => return Err(e.into()),
-            };
+            }
+            let (text, warnings) = expand_config_includes(Path::new(&path));
+            for warning in warnings {
+                eprintln!("Warning: {}", warning);
+            }
             let key = Config::private_key_from_toml(&text)
                 .map_err(|e| format!("invalid --base file {}: {}", path, e))?;
             Config::generate_config_text_from_private_key(&key)
@@ -764,7 +838,7 @@ fn make_cli_options() -> Options {
     opts.optflag("j", "json", "Output control command results as raw JSON");
     #[cfg(windows)]
     opts.optflag("", "service", "Run as a Windows service (launched by the Service Control Manager)");
-    opts.optopt("", "peers", "Comma-separated list of additional peer URIs to connect to (appended to config peers)", "PEERS");
+    opts.optopt("p", "peers", "Comma-separated list of additional peer URIs to connect to (appended to config peers)", "PEERS");
     opts.optflag("h", "help", "Print this help");
     opts.optflag("v", "version", "Print version");
     opts
@@ -1004,6 +1078,27 @@ fn prefix_port_from_name(name: &str) -> Option<(u8, u16)> {
     parse_prefix_port(suffix)
 }
 
+/// Compile-time system config directory on Linux and Termux.
+/// `YGGDRASIL_CONFIG_DIR` is read when the binary is built. Unset or empty
+/// keeps the historic Linux default. Android keeps "no system directory"
+/// unless the variable is set. A trailing slash is stripped.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn compile_time_config_dir() -> Option<&'static str> {
+    match option_env!("YGGDRASIL_CONFIG_DIR") {
+        Some(dir) if !dir.is_empty() => Some(dir.trim_end_matches('/')),
+        _ => {
+            #[cfg(target_os = "linux")]
+            {
+                Some("/etc/yggdrasil")
+            }
+            #[cfg(target_os = "android")]
+            {
+                None
+            }
+        }
+    }
+}
+
 /// System default location for `filename` (the second of the two default
 /// paths). Used both to look the file up and to name it in the "not found"
 /// error when neither default exists.
@@ -1012,7 +1107,11 @@ fn prefix_port_from_name(name: &str) -> Option<(u8, u16)> {
 /// resolved ProgramData directory: that is what the error message should
 /// show. The actual existence check still uses `windows_program_data_dir()`.
 fn system_config_path(filename: &str) -> String {
-    #[cfg(all(unix, not(target_os = "android")))]
+    #[cfg(target_os = "linux")]
+    {
+        format!("{}/{}", compile_time_config_dir().unwrap(), filename)
+    }
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
     {
         format!("/etc/yggdrasil/{}", filename)
     }
@@ -1020,7 +1119,14 @@ fn system_config_path(filename: &str) -> String {
     {
         format!("%ALLUSERSPROFILE%\\Yggdrasil-ng\\{}", filename)
     }
-    #[cfg(not(any(all(unix, not(target_os = "android")), windows)))]
+    #[cfg(target_os = "android")]
+    {
+        match compile_time_config_dir() {
+            Some(dir) => format!("{}/{}", dir, filename),
+            None => filename.to_string(),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         filename.to_string()
     }
@@ -1033,8 +1139,8 @@ fn system_config_path(filename: &str) -> String {
 /// no path was given). Other I/O and TOML errors are left unchanged.
 fn load_config_file(path: &str) -> Result<Config, Box<dyn std::error::Error>> {
     let open_path = expand_genconf_path(path);
-    let file = match File::open(&open_path) {
-        Ok(f) => f,
+    match File::open(&open_path) {
+        Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             eprintln!(
                 "Error: Can't find the configuration file. Create a configuration file with:\n    {} --genconf={}\n\n{}",
@@ -1047,7 +1153,10 @@ fn load_config_file(path: &str) -> Result<Config, Box<dyn std::error::Error>> {
         }
         Err(e) => return Err(e.into()),
     };
-    let text = std::io::read_to_string(file)?;
+    let (text, warnings) = expand_config_includes(Path::new(&open_path));
+    for warning in warnings {
+        tracing::warn!("{}", warning);
+    }
     Ok(toml::from_str::<Config>(&text)?)
 }
 
@@ -1062,9 +1171,16 @@ fn load_config_file(path: &str) -> Result<Config, Box<dyn std::error::Error>> {
 ///    - Otherwise fall back to the historic default `yggdrasil.toml`.
 /// 2. Try that filename in the current working directory.
 /// 3. If absent, try the OS-specific system directory with the same filename:
-///    - Unix-like (Linux except Android, BSD, macOS, …): `/etc/yggdrasil/<filename>`
+///    - Linux: `$YGGDRASIL_CONFIG_DIR/<filename>` if that variable was set at
+///      build time, otherwise `/etc/yggdrasil/<filename>`
+///    - Android/Termux: `$YGGDRASIL_CONFIG_DIR/<filename>` only when that
+///      variable was set at build time; otherwise the bare filename
+///    - Other Unix (BSD, macOS, …): `/etc/yggdrasil/<filename>`
 ///    - Windows: `<ProgramData>\Yggdrasil-ng\<filename>`, where ProgramData is
-///      obtained via SHGetKnownFolderPath(FOLDERID_ProgramData)
+///      the `ProgramData` environment variable, then `ALLUSERSPROFILE`, then
+///      `C:\ProgramData`. `SHGetKnownFolderPath` is not used: the `windows`
+///      crate links it as a raw-dylib import of shell32.dll, which does not
+///      link on the `*-win7-windows-gnu` targets.
 /// 4. If still not found, return the system path from step 3 (not the
 ///    working-directory filename) so the subsequent open() error names
 ///    the location the user is expected to create.
@@ -1086,9 +1202,19 @@ fn resolve_config_path(matches: &getopts::Matches) -> String {
 
     #[cfg(all(unix, not(target_os = "android")))]
     {
-        let system = format!("/etc/yggdrasil/{}", local);
+        let system = system_config_path(&local);
         if Path::new(&system).exists() {
             return system;
+        }
+    }
+
+    #[cfg(target_os = "android")]
+    {
+        if let Some(dir) = compile_time_config_dir() {
+            let system = format!("{}/{}", dir, local);
+            if Path::new(&system).exists() {
+                return system;
+            }
         }
     }
 
@@ -1106,27 +1232,23 @@ fn resolve_config_path(matches: &getopts::Matches) -> String {
     system_config_path(&local)
 }
 
-/// Return the real ProgramData directory via SHGetKnownFolderPath(FOLDERID_ProgramData).
+/// Return the ProgramData directory without linking shell32 or ole32.
+///
+/// `SHGetKnownFolderPath` / `CoTaskMemFree` are not called. The `windows` crate
+/// imports them as raw-dylibs (`shell32.dll`, `ole32.dll`), and that import
+/// does not link for `x86_64-win7-windows-gnu` / `i686-win7-windows-gnu`
+/// (`cargo zigbuild`). On Windows 7 the same folder is already published as
+/// `ProgramData` (Vista+) and `ALLUSERSPROFILE`.
 #[cfg(windows)]
 fn windows_program_data_dir() -> Option<std::path::PathBuf> {
-    use std::ffi::OsString;
-    use std::os::windows::ffi::OsStringExt;
-    use windows::Win32::System::Com::CoTaskMemFree;
-    use windows::Win32::UI::Shell::{FOLDERID_ProgramData, KNOWN_FOLDER_FLAG, SHGetKnownFolderPath};
-
-    unsafe {
-        let pwstr = SHGetKnownFolderPath(
-            &FOLDERID_ProgramData,
-            KNOWN_FOLDER_FLAG(0),
-            None,
-        )
-        .ok()?;
-        // PWSTR is a null-terminated wide string allocated by CoTaskMemAlloc.
-        let wide = pwstr.as_wide();
-        let path = std::path::PathBuf::from(OsString::from_wide(wide));
-        CoTaskMemFree(Some(pwstr.0 as _));
-        Some(path)
+    for key in ["ProgramData", "ALLUSERSPROFILE"] {
+        if let Some(dir) = std::env::var_os(key) {
+            if !dir.is_empty() {
+                return Some(std::path::PathBuf::from(dir));
+            }
+        }
     }
+    Some(std::path::PathBuf::from(r"C:\ProgramData"))
 }
 
 /// Resolve (prefix, port) from the binary/symlink/hardlink name.
@@ -1149,6 +1271,293 @@ fn print_ctl_commands() {
     println!("    debug_remoteGetPeers key=<hex>, debug_remoteGetTree key=<hex>");
     println!("  Path diagnostics:");
     println!("    getLookup key=<hex>, forceLookup key=<hex>");
+}
+
+/// True when an `ip rule show` line is exactly `<pref>: from all lookup <lookup>`.
+#[cfg(target_os = "linux")]
+fn ip_rule_line_matches(line: &str, pref: i64, lookup: u8) -> bool {
+    let mut parts = line.split_whitespace();
+    let head = match parts.next() {
+        Some(head) => head,
+        None => return false,
+    };
+    if head != format!("{pref}:") {
+        return false;
+    }
+    let rest: Vec<&str> = parts.collect();
+    rest.len() == 4
+        && rest[0] == "from"
+        && rest[1] == "all"
+        && rest[2] == "lookup"
+        && rest[3] == lookup.to_string()
+}
+
+/// Add `pref: from all lookup <table>` for IPv4 and IPv6 if it is not already present.
+/// Does not delete the rule on shutdown.
+#[cfg(target_os = "linux")]
+fn ensure_linux_ip_rule(pref: i64, lookup: u8) -> Result<(), String> {
+    for ipv6 in [false, true] {
+        let mut show = std::process::Command::new("ip");
+        if ipv6 {
+            show.arg("-6");
+        }
+        let shown = show
+            .args(["rule", "show"])
+            .output()
+            .map_err(|e| format!("failed to run ip rule show: {e}"))?;
+        if !shown.status.success() {
+            return Err(format!(
+                "ip rule show failed: {}",
+                String::from_utf8_lossy(&shown.stderr).trim()
+            ));
+        }
+        let text = String::from_utf8_lossy(&shown.stdout);
+        if text.lines().any(|line| ip_rule_line_matches(line, pref, lookup)) {
+            continue;
+        }
+        let mut add = std::process::Command::new("ip");
+        if ipv6 {
+            add.arg("-6");
+        }
+        let added = add
+            .args([
+                "rule",
+                "add",
+                "pref",
+                &pref.to_string(),
+                "from",
+                "all",
+                "lookup",
+                &lookup.to_string(),
+            ])
+            .output()
+            .map_err(|e| format!("failed to run ip rule add: {e}"))?;
+        if !added.status.success() {
+            return Err(format!(
+                "ip rule add failed: {}",
+                String::from_utf8_lossy(&added.stderr).trim()
+            ));
+        }
+        tracing::info!(
+            "Ensured {} ip rule {pref}: from all lookup {lookup}",
+            if ipv6 { "IPv6" } else { "IPv4" }
+        );
+    }
+    Ok(())
+}
+
+/// Install `<prefix>/7 dev <tun> table <table>`, then drop the kernel copy from main.
+#[cfg(all(target_os = "linux", feature = "tun"))]
+fn install_overlay_route(tun_name: &str, table: u8) -> Result<(), String> {
+    let (addr, len) = yggdrasil::address::overlay_network();
+    let cidr = format!("{addr}/{len}");
+    let table_id = table.to_string();
+    let added = std::process::Command::new("ip")
+        .args(["-6", "route", "replace", &cidr, "dev", tun_name, "table", &table_id])
+        .output()
+        .map_err(|e| format!("failed to run ip route replace: {e}"))?;
+    if !added.status.success() {
+        return Err(format!(
+            "ip route replace {cidr} table {table} failed: {}",
+            String::from_utf8_lossy(&added.stderr).trim()
+        ));
+    }
+    tracing::info!("Installed overlay route {cidr} dev {tun_name} table {table}");
+
+    let deleted = std::process::Command::new("ip")
+        .args(["-6", "route", "del", &cidr, "dev", tun_name])
+        .output()
+        .map_err(|e| format!("failed to run ip route del: {e}"))?;
+    if !deleted.status.success() {
+        tracing::debug!(
+            "Overlay route {cidr} was not removed from main: {}",
+            String::from_utf8_lossy(&deleted.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Remove only the extra-table overlay route. The ip rule stays.
+#[cfg(all(target_os = "linux", feature = "tun"))]
+fn remove_overlay_route(tun_name: &str, table: u8) {
+    let (addr, len) = yggdrasil::address::overlay_network();
+    let cidr = format!("{addr}/{len}");
+    let table_id = table.to_string();
+    match std::process::Command::new("ip")
+        .args(["-6", "route", "del", &cidr, "dev", tun_name, "table", &table_id])
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            tracing::info!("Removed overlay route {cidr} dev {tun_name} table {table}");
+        }
+        Ok(out) => {
+            tracing::debug!(
+                "Overlay route {cidr} table {table} not removed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Err(e) => tracing::debug!("failed to run ip route del: {e}"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+const LOCAL_SUBNET_ROUTE_RETRIES: u32 = 10;
+#[cfg(target_os = "linux")]
+const LOCAL_SUBNET_ROUTE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `<subnet>::1`. The first 8 bytes are the node subnet; the host part is `::1`.
+#[cfg(target_os = "linux")]
+fn local_subnet_gateway(subnet: &yggdrasil::address::Subnet) -> std::net::Ipv6Addr {
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&subnet.0);
+    bytes[15] = 1;
+    std::net::Ipv6Addr::from(bytes)
+}
+
+/// Interfaces from `ip -6 -o addr show` that have `wanted` with prefix 64..=128.
+/// The same name twice counts once. `lo` is never a target. `tentative` /
+/// `dadfailed` are skipped so a later retry can see the address after DAD.
+#[cfg(target_os = "linux")]
+fn local_subnet_gateway_ifaces(text: &str, wanted: std::net::Ipv6Addr) -> Vec<String> {
+    let mut found = Vec::new();
+    for line in text.lines() {
+        if line.contains("tentative") || line.contains("dadfailed") {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let _index = parts.next();
+        let iface = match parts.next() {
+            Some(name) => name.split('@').next().unwrap_or(name),
+            None => continue,
+        };
+        if iface.is_empty() || iface == "lo" {
+            continue;
+        }
+        let addr_tok = loop {
+            match parts.next() {
+                Some("inet6") => break parts.next(),
+                Some(_) => continue,
+                None => break None,
+            }
+        };
+        let Some(addr_tok) = addr_tok else { continue };
+        let Some((addr_str, prefix_str)) = addr_tok.split_once('/') else { continue };
+        let Ok(prefix) = prefix_str.parse::<u8>() else { continue };
+        if !(64..=128).contains(&prefix) {
+            continue;
+        }
+        let Ok(addr) = addr_str.parse::<std::net::Ipv6Addr>() else { continue };
+        if addr == wanted && !found.iter().any(|name: &String| name == iface) {
+            found.push(iface.to_string());
+        }
+    }
+    found
+}
+
+#[cfg(target_os = "linux")]
+fn list_local_subnet_gateway_ifaces(wanted: std::net::Ipv6Addr) -> Result<Vec<String>, String> {
+    let output = std::process::Command::new("ip")
+        .args(["-6", "-o", "addr", "show"])
+        .output()
+        .map_err(|e| format!("failed to run ip -6 addr show: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "ip -6 addr show failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    Ok(local_subnet_gateway_ifaces(&text, wanted))
+}
+
+#[cfg(target_os = "linux")]
+fn install_local_subnet_route(cidr: &str, iface: &str, table: u8) -> Result<(), String> {
+    let table_id = table.to_string();
+    let added = std::process::Command::new("ip")
+        .args(["-6", "route", "replace", cidr, "dev", iface, "table", &table_id])
+        .output()
+        .map_err(|e| format!("failed to run ip route replace: {e}"))?;
+    if !added.status.success() {
+        return Err(format!(
+            "ip route replace {cidr} dev {iface} table {table} failed: {}",
+            String::from_utf8_lossy(&added.stderr).trim()
+        ));
+    }
+    tracing::info!("Installed local subnet route {cidr} dev {iface} table {table}");
+    Ok(())
+}
+
+/// Delete only the extra-table /64. Missing route is not an error.
+#[cfg(target_os = "linux")]
+fn remove_local_subnet_route(cidr: &str, table: u8) {
+    let table_id = table.to_string();
+    match std::process::Command::new("ip")
+        .args(["-6", "route", "del", cidr, "table", &table_id])
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            tracing::info!("Removed local subnet route {cidr} table {table}");
+        }
+        Ok(out) => {
+            tracing::debug!(
+                "Local subnet route {cidr} table {table} not removed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Err(e) => tracing::debug!("failed to run ip route del: {e}"),
+    }
+}
+
+/// First look is immediate. Up to 10 more looks, 60s apart. Stop once the route
+/// is installed, or when shutdown is signalled. Ambiguous interfaces install nothing.
+#[cfg(target_os = "linux")]
+async fn install_local_subnet_route_with_retries(
+    subnet: yggdrasil::address::Subnet,
+    table: u8,
+    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+) {
+    let cidr = subnet.to_string();
+    let wanted = local_subnet_gateway(&subnet);
+    for attempt in 0..=LOCAL_SUBNET_ROUTE_RETRIES {
+        if *shutdown_rx.borrow() {
+            return;
+        }
+        match list_local_subnet_gateway_ifaces(wanted) {
+            Ok(ifaces) if ifaces.len() == 1 => {
+                match install_local_subnet_route(&cidr, &ifaces[0], table) {
+                    Ok(()) => return,
+                    Err(e) => tracing::error!("Failed to install local subnet route: {e}"),
+                }
+            }
+            Ok(ifaces) if ifaces.len() > 1 => {
+                tracing::debug!(
+                    "Local subnet gateway {wanted} is on multiple interfaces ({}); not installing {cidr} table {table}",
+                    ifaces.join(", ")
+                );
+            }
+            Ok(_) => {
+                tracing::debug!(
+                    "Local subnet gateway {wanted} not found; not installing {cidr} table {table}"
+                );
+            }
+            Err(e) => tracing::debug!("Failed to list IPv6 addresses: {e}"),
+        }
+        if attempt == LOCAL_SUBNET_ROUTE_RETRIES {
+            tracing::debug!(
+                "Stopped looking for local subnet gateway {wanted} after {LOCAL_SUBNET_ROUTE_RETRIES} retries"
+            );
+            return;
+        }
+        tracing::debug!(
+            "Retrying local subnet route {cidr} table {table} in 60s ({}/{})",
+            attempt + 1,
+            LOCAL_SUBNET_ROUTE_RETRIES
+        );
+        tokio::select! {
+            _ = shutdown_rx.changed() => return,
+            _ = tokio::time::sleep(LOCAL_SUBNET_ROUTE_INTERVAL) => {}
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1304,7 +1713,23 @@ mod tests {
 
     #[test]
     fn test_system_config_path() {
-        #[cfg(all(unix, not(target_os = "android")))]
+        #[cfg(target_os = "linux")]
+        {
+            let dir = compile_time_config_dir().unwrap();
+            assert_eq!(
+                system_config_path("yggdrasil.toml"),
+                format!("{}/yggdrasil.toml", dir)
+            );
+            assert_eq!(
+                system_config_path("ygg_0615001.toml"),
+                format!("{}/ygg_0615001.toml", dir)
+            );
+            assert_eq!(
+                system_config_path("yggdrasil_02.9001.toml"),
+                format!("{}/yggdrasil_02.9001.toml", dir)
+            );
+        }
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
         {
             assert_eq!(
                 system_config_path("yggdrasil.toml"),
@@ -1318,6 +1743,25 @@ mod tests {
                 system_config_path("yggdrasil_02.9001.toml"),
                 "/etc/yggdrasil/yggdrasil_02.9001.toml"
             );
+        }
+        #[cfg(target_os = "android")]
+        {
+            match compile_time_config_dir() {
+                Some(dir) => {
+                    assert_eq!(
+                        system_config_path("yggdrasil.toml"),
+                        format!("{}/yggdrasil.toml", dir)
+                    );
+                    assert_eq!(
+                        system_config_path("ygg_0615001.toml"),
+                        format!("{}/ygg_0615001.toml", dir)
+                    );
+                }
+                None => {
+                    assert_eq!(system_config_path("yggdrasil.toml"), "yggdrasil.toml");
+                    assert_eq!(system_config_path("ygg_0615001.toml"), "ygg_0615001.toml");
+                }
+            }
         }
         #[cfg(windows)]
         {
@@ -1405,6 +1849,26 @@ mod tests {
         assert_eq!(expand_genconf_path(r"%%"), r"%%");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_program_data_dir_uses_env_not_shell32() {
+        let dir = windows_program_data_dir().expect("program data dir");
+        assert!(!dir.as_os_str().is_empty());
+        if let Some(from_env) = std::env::var_os("ProgramData") {
+            if !from_env.is_empty() {
+                assert_eq!(dir, std::path::PathBuf::from(from_env));
+                return;
+            }
+        }
+        if let Some(from_env) = std::env::var_os("ALLUSERSPROFILE") {
+            if !from_env.is_empty() {
+                assert_eq!(dir, std::path::PathBuf::from(from_env));
+                return;
+            }
+        }
+        assert_eq!(dir, std::path::PathBuf::from(r"C:\ProgramData"));
+    }
+    
     #[test]
     fn generate_from_base_reuses_key_and_ignores_other_fields() {
         let base_key = {
@@ -1438,6 +1902,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn generate_from_base_reads_private_key_from_include() {
+        let base_key = {
+            let generated = yggdrasil::config::Config::generate_config_text();
+            yggdrasil::config::Config::private_key_from_toml(&generated).unwrap()
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "ygg-base-include-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key_path = dir.join("key.toml");
+        let base_path = dir.join("base.toml");
+        std::fs::write(&key_path, format!("private_key = \"{base_key}\"\n")).unwrap();
+        std::fs::write(
+            &base_path,
+            "include = \"key.toml\"\npeers = [\"tcp://198.51.100.9:23456\"]\n",
+        )
+        .unwrap();
+
+        let text = generate_config_text_maybe_from_base(Some(base_path.to_str().unwrap())).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            text.contains(&format!("private_key = \"{base_key}\"")),
+            "private_key from the include file must be reused:\n{text}"
+        );
+        assert!(
+            !text.contains("tcp://198.51.100.9:23456"),
+            "peers from the base file must not be copied:\n{text}"
+        );
+    }
+    
     #[test]
     fn generate_from_missing_base_is_error() {
         let err = generate_config_text_maybe_from_base(Some("/no/such/ygg-base-file.toml"))
@@ -1506,5 +2007,49 @@ mod tests {
             !rewritten.contains("tcp://localhost:9001"),
             "historic default URI must not remain after rewrite:\n{rewritten}"
         );
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    #[test]
+    fn ip_rule_show_line_match() {
+        assert!(ip_rule_line_matches("9000:\tfrom all lookup 200", 9000, 200));
+        assert!(ip_rule_line_matches("9000:   from all lookup 200", 9000, 200));
+        assert!(!ip_rule_line_matches("9001: from all lookup 200", 9000, 200));
+        assert!(!ip_rule_line_matches("9000: from all lookup 201", 9000, 200));
+        assert!(!ip_rule_line_matches("9000: from 10.0.0.0/8 lookup 200", 9000, 200));
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    #[test]
+    fn local_subnet_gateway_iface_parse() {
+        let subnet = yggdrasil::address::Subnet([0x03, 0x00, 0x00, 0x10, 0x00, 0x20, 0x00, 0x30]);
+        let wanted = local_subnet_gateway(&subnet);
+        assert_eq!(wanted, "300:10:20:30::1".parse::<std::net::Ipv6Addr>().unwrap());
+        assert_eq!(subnet.to_string(), "300:10:20:30::/64");
+
+        let text = "\
+1: lo    inet6 300:10:20:30::1/128 scope host \n\
+2: br0    inet6 300:10:20:30::1/64 scope global \n\
+3: eth0    inet6 300:10:20:30::1/128 scope global \n\
+4: eth1    inet6 300:10:20:30::2/64 scope global \n\
+5: eth2    inet6 300:10:20:31::1/64 scope global \n\
+6: eth3    inet6 300:10:20:30::1/63 scope global \n\
+7: eth4    inet6 300:10:20:30::1/64 scope global tentative \n\
+8: mac0@eth5    inet6 300:10:20:30::1/96 scope global \n\
+2: br0    inet6 300:10:20:30::1/64 scope global \n";
+
+        assert_eq!(
+            local_subnet_gateway_ifaces(text, wanted),
+            vec!["br0".to_string(), "eth0".to_string(), "mac0".to_string()]
+        );
+
+        let one = "3: br0    inet6 300:10:20:30::1/64 scope global \n";
+        assert_eq!(local_subnet_gateway_ifaces(one, wanted), vec!["br0".to_string()]);
+
+        let none = "3: br0    inet6 300:10:20:30::2/64 scope global \n";
+        assert!(local_subnet_gateway_ifaces(none, wanted).is_empty());
+        
+        let only_lo = "1: lo    inet6 300:10:20:30::1/128 scope host \n";
+        assert!(local_subnet_gateway_ifaces(only_lo, wanted).is_empty());
     }
 }
