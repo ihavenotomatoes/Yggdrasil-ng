@@ -370,9 +370,10 @@ async fn keepalive_loop(
                     lru.keys()
                 };
                 for key in remote_keys {
-                    if direct_keys.contains(&key) {
-                        continue;
-                    }
+                    // Allow probe even for currently-direct keys that are in the LRU.
+                    // Direct shortcut still applies; the ack refreshes the reverse path
+                    // when coordinates match. Skipping them left the initiator side
+                    // (especially behind NAT) without a reliable path refresh.
                     keepalive_send_if_session(
                         &inner, &sessions, &signing_key, &key, true,
                     ).await;
