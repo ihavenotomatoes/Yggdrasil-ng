@@ -141,6 +141,7 @@ pub trait PacketConn: Send + Sync {
 mod tests {
     use super::*;
     use rand::rngs::OsRng;
+
     #[test]
     fn low_order_and_non_canonical_keys_rejected() {
         // Same vectors as Go's types/crypto_test.go.
@@ -162,6 +163,7 @@ mod tests {
             assert!(!is_public_key_valid(&pk), "key {} should not be valid", key);
         }
     }
+
     #[test]
     fn generated_keys_accepted() {
         for _ in 0..32 {
