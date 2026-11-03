@@ -1249,7 +1249,16 @@ impl Router {
             // A mismatch must not pin stale coordinates; the next send looks up.
             self.pathfinder.learn_path_from_traffic(&tr.source, &tr.from);
             self.pathfinder.refresh_if_coords_match(&tr.source, &tr.from);
-            vec![RouterAction::DeliverTraffic { traffic: tr }]
+            // Also notify upper layers (yggdrasil ipv6rwc key store) so that
+            // keepalive probes/acks keep addr_to_info alive. The encrypted
+            // layer swallows them and never delivers to TUN, so without this
+            // the mapping expires after KEY_STORE_TIMEOUT and the next
+            // application packet is buffered + looked up. Especially painful
+            // for the connection initiator behind NAT.
+            vec![
+                RouterAction::PathNotifyCallback { key: tr.source },
+                RouterAction::DeliverTraffic { traffic: tr },
+            ]
         } else {
             tracing::debug!("Broken path for traffic");
             // Path broken
